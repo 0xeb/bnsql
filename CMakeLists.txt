@@ -16,7 +16,7 @@ endif()
 # AI Agent Support (libagents - optional)
 # ============================================================================
 
-option(BNSQL_WITH_AI_AGENT "Build with AI agent support (libagents)" OFF)
+option(BNSQL_WITH_AI_AGENT "Build with AI agent support (libagents)" ON)
 
 if(BNSQL_WITH_AI_AGENT)
     message(STATUS "bnsql: Building with AI agent support via libagents")
