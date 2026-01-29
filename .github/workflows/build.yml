@@ -1,0 +1,104 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*", "V*"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: Linux
+            runner: ubuntu-latest
+          - os: macOS
+            runner: macos-latest
+          - os: Windows
+            runner: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/bin
+          cp build/bin/bnsql dist/bin/ 2>/dev/null || true
+          cp build/bin/libbinaryninjacore.so.1 dist/bin/ 2>/dev/null || true
+          ls -laR dist/
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist/bin
+          cp build/bin/bnsql dist/bin/ 2>/dev/null || true
+          cp build/bin/libbinaryninjacore.dylib dist/bin/ 2>/dev/null || true
+          ls -laR dist/
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/bin
+          cp build/bin/Release/bnsql.exe dist/bin/ 2>/dev/null || true
+          cp build/bin/Release/binaryninjacore.dll dist/bin/ 2>/dev/null || true
+          ls -laR dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bnsql-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: warn
+
+  publish-release:
+    name: Publish Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package release
+        run: |
+          cd artifacts
+          zip -r ../bnsql-linux.zip bnsql-Linux/ 2>/dev/null || true
+          zip -r ../bnsql-macos.zip bnsql-macOS/ 2>/dev/null || true
+          zip -r ../bnsql-windows.zip bnsql-Windows/ 2>/dev/null || true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bnsql-linux.zip
+            bnsql-macos.zip
+            bnsql-windows.zip
+          generate_release_notes: true

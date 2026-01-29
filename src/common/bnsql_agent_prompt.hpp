@@ -1,0 +1,914 @@
+// Auto-generated from bnsql_agent.md
+// Generated: 2026-01-28T09:11:45.961472
+// DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
+
+#pragma once
+
+namespace bnsql {
+
+inline constexpr const char* SYSTEM_PROMPT =
+    R"PROMPT(# BNSQL Agent Guide
+
+A comprehensive reference for AI agents to effectively use BNSQL - an SQL interface for reverse engineering binary analysis with Binary Ninja.
+
+---
+
+## What is Binary Ninja and Why SQL?
+
+**Binary Ninja** is a modern reverse engineering platform. It analyzes compiled binaries (executables, DLLs, firmware) and produces:
+- **Disassembly** - Human-readable assembly code
+- **Functions** - Detected code boundaries with names
+- **Cross-references** - Who calls what, who references what data
+- **Types** - Structures, enums, function prototypes
+- **HLIL/MLIL** - High/Medium Level IL representations
+
+**BNSQL** exposes all this analysis data through SQL virtual tables, enabling:
+- Complex queries across multiple data types (JOINs)
+- Aggregations and statistics (COUNT, GROUP BY)
+- Pattern detection across the entire binary
+- Scriptable analysis without writing plugins or Python scripts
+
+---
+
+## CRITICAL: Performance Rules
+
+**ALWAYS follow these rules to avoid slow queries:**
+
+1. **Xref counting MUST use CTEs** - NEVER do `JOIN xrefs` directly with funcs:
+   ```sql
+   -- WRONG (extremely slow - minutes):
+   SELECT f.name, COUNT(*) FROM funcs f JOIN xrefs x ON f.address = x.to_ea GROUP BY f.address;
+
+   -- CORRECT (fast - milliseconds):
+   WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs WHERE is_code=1 GROUP BY to_ea)
+   SELECT f.name, c.n FROM funcs f JOIN counts c ON f.address = c.to_ea ORDER BY n DESC;
+   ```
+
+2. **Decompiler tables MUST filter by func_addr** - unbounded queries hang indefinitely
+
+3. **Instructions table MUST filter by func_addr** - never scan the whole table
+
+---
+
+## Few-Shot Examples (Use These Patterns!)
+
+### "Find the function with the most callers"
+```sql
+WITH caller_counts AS (
+    SELECT to_ea, COUNT(*) as callers
+    FROM xrefs WHERE is_code = 1
+    GROUP BY to_ea
+)
+SELECT f.name, printf('0x%X', f.address) as address, c.callers
+FROM funcs f
+JOIN caller_counts c ON f.address = c.to_ea
+ORDER BY c.callers DESC
+LIMIT 10;
+```
+
+### "Which functions are called 10 times or less?"
+```sql
+WITH call_counts AS (
+    SELECT to_ea, COUNT(*) as cnt
+    FROM xrefs WHERE is_code = 1
+    GROUP BY to_ea
+)
+SELECT f.name, COALESCE(c.cnt, 0) as calls
+FROM funcs f
+LEFT JOIN call_counts c ON f.address = c.to_ea
+WHERE COALESCE(c.cnt, 0) <= 10
+ORDER BY calls DESC;
+```
+
+### "Find orphan functions (no callers)"
+```sql
+WITH has_callers AS (
+    SELECT DISTINCT to_ea FROM xrefs WHERE is_code = 1
+)
+SELECT f.name, printf('0x%X', f.address) as address
+FROM funcs f
+WHERE f.address NOT IN (SELECT to_ea FROM has_callers);
+```
+
+### "What are the largest functions?"
+```sql
+SELECT name, printf('0x%X', address) as address, size
+FROM funcs
+ORDER BY size DESC
+LIMIT 10;
+```
+
+### "Find functions that call malloc"
+```sql
+WITH malloc_addr AS (
+    SELECT address FROM imports WHERE name = 'malloc' OR name = '_malloc'
+)
+SELECT DISTINCT func_at(x.from_ea) as caller
+FROM xrefs x
+WHERE x.to_ea IN (SELECT address FROM malloc_addr) AND x.is_code = 1;
+```
+
+### "Decompile main and show variables"
+```sql
+-- First get pseudocode
+SELECT decompile(address) FROM funcs WHERE name LIKE '%main%' LIMIT 1;
+
+-- Then get local variables
+SELECT name, type, storage FROM hlil_vars
+WHERE func_addr = (SELECT address FROM funcs WHERE name LIKE '%main%' LIMIT 1);
+```
+
+---
+
+## Core Concepts for Binary Analysis
+
+### Addresses
+Everything in a binary has an **address** - a memory location where code or data lives. SQL shows these as integers; use `hex(address)` for hex display.
+
+### Functions
+Binary Ninja groups code into **functions** with:
+- `address` - Where the function begins
+- `name` - Assigned or auto-generated name (e.g., `main`, `sub_401000`)
+- `size` - Total bytes in the function
+
+### Cross-References (xrefs)
+Binary analysis is about understanding **relationships**:
+- **Code xrefs** - Function calls, jumps between code
+- **Data xrefs** - Code reading/writing data locations
+- `from_ea` -> `to_ea` represents "address X references address Y"
+
+### Segments
+Memory is divided into **segments** with different purposes:
+- `.text` - Executable code
+- `.data` - Initialized global data
+- `.rdata` - Read-only data (strings, constants)
+- `.bss` - Uninitialized data
+
+### Basic Blocks
+Within a function, **basic blocks** are straight-line code sequences:
+- No branches in the middle
+- Single entry, single exit
+- Useful for control flow analysis
+
+---
+
+## Tables Reference
+
+### funcs
+All detected functions in the binary.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `address` | INT | Function start address |
+| `name` | TEXT | Function name |
+| `size` | INT | Function size in bytes |
+
+```sql
+-- 10 largest functions
+SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10;
+
+-- Functions starting with "sub_" (auto-named, not analyzed)
+SELECT name, hex(address) as addr FROM funcs WHERE name LIKE 'sub_%';
+```
+
+### segments
+Memory segments.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `start_ea` | INT | Segment start |
+| `end_ea` | INT | Segment end |
+| `name` | TEXT | Segment name (.text, .data, etc.) |
+| `perm` | INT | Permissions (R=4, W=2, X=1) |
+
+```sql
+-- Find executable segments
+SELECT name, hex(start_ea) as start FROM segments WHERE perm & 1 = 1;
+```
+
+### names
+All named locations (functions, labels, data).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `address` | INT | Address |
+| `name` | TEXT | Name |
+
+### entries
+Entry points (exports, program entry).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `ordinal` | INT | Export ordinal |
+| `address` | INT | Entry address |
+| `name` | TEXT | Entry name |
+
+### imports
+Imported functions from external libraries.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `address` | INT | Import address |
+| `name` | TEXT | Import name |
+| `module` | TEXT | Module/DLL name |
+| `ordinal` | INT | Import ordinal |
+
+```sql
+-- Imports from kernel32.dll
+SELECT name FROM imports WHERE module LIKE '%kernel32%';
+```
+
+### strings
+String literals found in the binary.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `address` | INT | String address |
+| `length` | INT | String length |
+| `content` | TEXT | String content |
+
+```sql
+-- Find error messages
+SELECT content, hex(address) as addr FROM strings WHERE content LIKE '%error%';
+
+-- Longest strings
+SELECT hex(address), length, content FROM strings ORDER BY length DESC LIMIT 20;
+```
+
+### xrefs
+Cross-references - important for understanding code relationships.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `from_ea` | INT | Source address (who references) |
+| `to_ea` | INT | Target address (what is referenced) |
+| `type` | INT | Xref type code |
+| `is_code` | INT | 1=code xref (call/jump), 0=data xref |
+
+```sql
+-- Who calls function at 0x401000?
+SELECT hex(from_ea) as caller FROM xrefs WHERE to_ea = 0x401000 AND is_code = 1;
+```
+
+### blocks
+Basic blocks within functions.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `func_ea` | INT | Containing function |
+| `start_ea` | INT | Block start |
+| `end_ea` | INT | Block end |
+| `size` | INT | Block size |
+
+```sql
+-- Functions with most basic blocks
+SELECT func_at(func_ea) as name, COUNT(*) as blocks
+FROM blocks GROUP BY func_ea ORDER BY blocks DESC LIMIT 10;
+```
+
+### instructions
+Decoded instructions. **Always filter by `func_addr` for performance.**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `address` | INT | Instruction address |
+| `func_addr` | INT | Containing function |
+| `mnemonic` | TEXT | Instruction mnemonic |
+| `size` | INT | Instruction size |
+| `disasm` | TEXT | Full disassembly line |
+
+```sql
+-- Instruction profile of a function
+SELECT mnemonic, COUNT(*) as count
+FROM instructions WHERE func_addr = 0x401330
+GROUP BY mnemonic ORDER BY count DESC;
+```
+
+### comments
+Address comments.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `address` | INT | Comment address |
+| `comment` | TEXT | Comment text |
+
+### db_info
+Database-level metadata.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `key` | TEXT | Metadata key |
+| `value` | TEXT | Metadata value |
+
+```sql
+-- Get database info
+SELECT * FROM db_info;
+```
+
+### pseudocode
+Line-by-line decompiled pseudocode (HLIL). **Filter by `func_addr` for performance.**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `func_addr` | INT | Function address |
+| `line_num` | INT | Line number (0-indexed) |
+| `line` | TEXT | Pseudocode text |
+| `indent` | INT | Indentation level |
+
+```sql
+-- Get pseudocode for a function
+SELECT line FROM pseudocode WHERE func_addr = 0x401000 ORDER BY line_num;
+
+-- Find functions containing "password" in decompiled code
+SELECT DISTINCT func_at(func_addr) FROM pseudocode WHERE line LIKE '%password%';
+```
+
+### hlil_vars
+Local variables from decompiled functions. **Filter by `func_addr`.**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `func_addr` | INT | Function address |
+| `var_idx` | INT | Variable index |
+| `name` | TEXT | Variable name |
+| `type` | TEXT | Variable type |
+| `size` | INT | Size in bytes |
+| `is_arg` | INT | 1 if function argument |
+| `storage` | TEXT | "stack" or "register" |
+| `stack_off` | INT | Stack offset (if stack) |
+
+```sql
+-- Variables in a function
+SELECT name, type, storage FROM hlil_vars WHERE func_addr = 0x401000;
+
+-- Find functions with "buffer" variables
+SELECT DISTINCT func_at(func_addr) FROM hlil_vars WHERE name LIKE '%buffer%';
+```
+
+### hlil_calls
+Function calls extracted from HLIL. **Filter by `func_addr`.**
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `func_addr` | INT | Containing function |
+| `callee_name` | TEXT | Called function name |
+| `arg_idx` | INT | Argument index |
+
+```sql
+-- What does a function call?
+SELECT DISTINCT callee_name FROM hlil_calls WHERE func_addr = 0x401000;
+
+-- Find functions calling malloc
+SELECT DISTINCT func_at(func_addr) FROM hlil_calls WHERE callee_name = 'malloc';
+```
+
+---
+
+## SQL Functions
+
+### Disassembly
+| Function | Description |
+|----------|-------------|
+| `disasm(addr)` | Disassembly line at address |
+| `disasm(addr, n)` | Multiple lines from address |
+| `bytes(addr, n)` | Bytes as hex string |
+| `bytes_raw(addr, n)` | Raw bytes as BLOB |
+| `mnemonic(addr)` | Instruction mnemonic only |
+| `operand(addr, n)` | Operand text (n=0-5) |
+
+### Names & Functions
+| Function | Description |
+|----------|-------------|
+| `name_at(addr)` | Name at address |
+| `func_at(addr)` | Function name containing address |
+| `func_start(addr)` | Start of containing function |
+| `func_end(addr)` | End of containing function |
+| `func_qty()` | Total function count |
+| `func_at_index(n)` | Function address at index |
+
+### Cross-References
+| Function | Description |
+|----------|-------------|
+| `xrefs_to(addr)` | JSON array of xrefs TO address |
+| `xrefs_from(addr)` | JSON array of xrefs FROM address |
+
+### Navigation
+| Function | Description |
+|----------|-------------|
+| `next_head(addr)` | Next defined item |
+| `prev_head(addr)` | Previous defined item |
+| `segment_at(addr)` | Segment name at address |
+| `hex(val)` | Format as hex string |
+
+### Comments
+| Function | Description |
+|----------|-------------|
+| `comment_at(addr)` | Get comment at address |
+| `set_comment(addr, text)` | Set regular comment |
+
+### Modification
+| Function | Description |
+|----------|-------------|
+| `set_name(addr, name)` | Set name at address |
+
+### Decompilation (HLIL)
+| Function | Description |
+|----------|-------------|
+| `decompile(addr)` | Full HLIL pseudocode for function at addr |
+| `decompile(addr, limit)` | Pseudocode limited to N lines |
+| `hlil_at(addr)` | HLIL text at specific address |
+| `hlil_op_at(addr)` | HLIL operation name at address |
+
+**IMPORTANT:** Use `decompile()`, NOT `hlil()` or `hlil_ssa()` - those don't exist!
+
+---
+
+## Common Query Patterns
+
+### Find Most Called Functions
+
+```sql
+SELECT f.name, COUNT(*) as callers
+FROM funcs f
+JOIN xrefs x ON f.address = x.to_ea
+WHERE x.is_code = 1
+GROUP BY f.address
+ORDER BY callers DESC
+LIMIT 10;
+```
+
+### Functions Called N Times or Less (Use CTE!)
+
+**IMPORTANT:** Use a CTE to pre-aggregate xrefs, NOT a correlated subquery.
+
+```sql
+-- GOOD: Pre-aggregate with CTE (~800ms)
+WITH call_counts AS (
+    SELECT to_ea, COUNT(1) as cnt
+    FROM xrefs
+    WHERE is_code = 1
+    GROUP BY to_ea
+)
+SELECT f.name, COALESCE(c.cnt, 0) as calls
+FROM funcs f
+LEFT JOIN call_counts c ON c.to_ea = f.address
+WHERE COALESCE(c.cnt, 0) <= 10
+ORDER BY calls DESC;
+
+-- BAD: Correlated subquery (O(n×m) = very slow, will timeout!)
+-- SELECT name, (SELECT COUNT(*) FROM xrefs WHERE to_ea = funcs.address) as calls FROM funcs;
+```
+
+### String Cross-Reference Analysis
+
+```sql
+SELECT s.content, func_at(x.from_ea) as used_by
+FROM strings s
+JOIN xrefs x ON s.address = x.to_ea
+WHERE s.content LIKE '%password%';
+```
+
+### Function Complexity (by Block Count)
+
+```sql
+SELECT func_at(func_ea) as name, COUNT(*) as block_count
+FROM blocks
+GROUP BY func_ea
+ORDER BY block_count DESC
+LIMIT 10;
+```
+
+### Import Dependency Map
+
+```sql
+-- Which modules are used
+SELECT module, COUNT(*) AS cnt FROM imports GROUP BY module ORDER BY cnt DESC;
+```
+
+### Security: Dangerous Function Imports
+
+```sql
+-- Find dangerous/suspicious imports
+SELECT module, name FROM imports
+WHERE name LIKE '%Shell%'
+   OR name LIKE '%WinExec%'
+   OR name LIKE '%CreateProcess%'
+   OR name LIKE '%VirtualAlloc%'
+   OR name IN ('strcpy', 'strcat', 'sprintf', 'gets');
+```
+
+### Crypto-related Imports
+
+```sql
+SELECT module, name FROM imports
+WHERE name LIKE '%Crypt%'
+   OR name LIKE '%Hash%'
+   OR name LIKE '%AES%'
+   OR name LIKE '%RSA%';
+```
+
+### Network-related Imports
+
+```sql
+SELECT module, name FROM imports
+WHERE name LIKE '%socket%'
+   OR name LIKE '%connect%'
+   OR name LIKE '%send%'
+   OR name LIKE '%recv%'
+   OR name LIKE '%WSA%'
+   OR name LIKE '%Http%';
+```
+
+---
+
+## Hex Address Formatting
+
+Binary Ninja uses integer addresses. For display, use `hex()`:
+
+```sql
+SELECT hex(address) as addr, name FROM funcs;
+```
+
+---
+
+## Quick Start Examples
+
+### "What does this binary do?"
+
+```sql
+-- Entry points
+SELECT * FROM entries;
+
+-- Imported APIs (hints at functionality)
+SELECT module, name FROM imports ORDER BY module, name;
+
+-- Interesting strings
+SELECT content FROM strings WHERE length > 10 ORDER BY length DESC LIMIT 20;
+```
+
+### "Find security-relevant code"
+
+```sql
+-- Dangerous string functions
+SELECT module, name FROM imports
+WHERE name IN ('strcpy', 'strcat', 'sprintf', 'gets');
+
+-- Crypto-related
+SELECT * FROM imports WHERE name LIKE '%Crypt%' OR name LIKE '%Hash%';
+
+-- Network-related
+SELECT * FROM imports WHERE name LIKE '%socket%' OR name LIKE '%connect%';
+```
+
+### "Understand a specific function"
+
+```sql
+-- Basic info
+SELECT * FROM funcs WHERE address = 0x401000;
+
+-- What calls it
+SELECT hex(from_ea) as caller FROM xrefs WHERE to_ea = 0x401000 AND is_code = 1;
+
+-- Decompile it)PROMPT"
+    R"PROMPT(SELECT decompile(0x401000);
+
+-- Or with line limit
+SELECT decompile(0x401000, 30);
+```
+
+### "Decompile and analyze a function"
+
+```sql
+-- Find a medium-sized function and decompile it
+SELECT name, size, decompile(address, 40) FROM funcs
+WHERE size BETWEEN 500 AND 2000 ORDER BY size LIMIT 1;
+
+-- Get variables
+SELECT name, type, storage FROM hlil_vars WHERE func_addr = 0x401000;
+
+-- Get function calls made
+SELECT DISTINCT callee_name FROM hlil_calls WHERE func_addr = 0x401000;
+```
+
+---
+
+## Query Optimization Guidelines
+
+### Critical: Decompiler Tables Are On-Demand
+
+**IMPORTANT:** The `pseudocode`, `hlil_vars`, and `hlil_calls` tables are **virtual tables that decompile functions on-demand**. This means:
+
+- Each row requires decompiling its containing function
+- Unbounded queries iterate ALL functions and decompile EACH one
+- Large binaries can have thousands of functions
+- Unbounded queries will **hang or timeout**
+
+**NEVER do this:**
+```sql
+-- BAD: Iterates all functions, decompiles each one - WILL HANG!
+SELECT COUNT(*) FROM pseudocode;
+SELECT COUNT(*) FROM hlil_vars;
+SELECT * FROM hlil_calls LIMIT 10;  -- Still iterates from start!
+```
+
+**ALWAYS do this:**
+```sql
+-- GOOD: First get a function address, then query that function
+SELECT address FROM funcs WHERE size > 100 LIMIT 1;  -- Get: 0x401000
+SELECT * FROM pseudocode WHERE func_addr = 0x401000;
+SELECT * FROM hlil_vars WHERE func_addr = 0x401000;
+SELECT * FROM hlil_calls WHERE func_addr = 0x401000;
+```
+
+**Pattern for searching across decompiled code:**
+```sql
+-- Search requires iteration but filter early
+SELECT DISTINCT func_at(func_addr) FROM pseudocode WHERE line LIKE '%password%';
+-- Still iterates all, but finds matches. Use for targeted searches, not counts.
+```
+
+### Critical Performance Rules
+
+1. **Decompiler tables:** ALWAYS filter by `func_addr = X` - unbounded queries cause hangs
+2. **Instructions table:** Always filter by `func_addr = X` - never scan the whole table
+3. **Xref counting:** Use CTEs to pre-aggregate, never correlated subqueries
+4. **JOINs with xrefs:** Pre-aggregate xrefs in a CTE first, then JOIN to funcs
+5. **Decompiler analysis:** Use `decompile()`, `hlil_vars`, `hlil_calls`, `pseudocode` - NOT the raw `hlil` table
+
+### Decompiler Table Selection
+
+| Need | Use This | NOT This |
+|------|----------|----------|
+| View pseudocode | `decompile(addr)` or `pseudocode WHERE func_addr=X` | - |
+| Find variables | `hlil_vars WHERE func_addr = X` | - |
+| Find function calls | `hlil_calls WHERE func_addr = X` | - |
+| Search in decompiled code | `pseudocode WHERE line LIKE '%pattern%'` | - |
+| AST analysis | `hlil_calls` + `hlil_vars` combined | `_hlil_ast` (expert only) |
+
+**WARNING:** The `_hlil_ast` table (underscore prefix = internal/expert) contains raw HLIL AST nodes and generates many rows per function. For typical analysis, use `hlil_calls` and `hlil_vars` which provide the most useful information efficiently. Only use `_hlil_ast` for advanced AST pattern matching - see "Advanced: HLIL AST Table" section.
+
+### Why CTEs Matter for Xref Queries
+
+The `xrefs` table can have thousands of rows. A correlated subquery like:
+```sql
+-- SLOW: Executes subquery for EACH function (O(n×m))
+SELECT name, (SELECT COUNT(*) FROM xrefs WHERE to_ea = funcs.address) FROM funcs;
+```
+
+Instead, pre-aggregate once with a CTE:
+```sql
+-- FAST: Single pass over xrefs, then hash join (O(n+m))
+WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs GROUP BY to_ea)
+SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.address;
+```
+
+---
+
+## Summary: When to Use What
+
+| Goal | Table/Function |
+|------|----------------|
+| List all functions | `funcs` |
+| Find who calls what | `xrefs` with `is_code = 1` |
+| Find data references | `xrefs` with `is_code = 0` |
+| Analyze imports | `imports` |
+| Find strings | `strings` |
+| Instruction analysis | `instructions WHERE func_addr = X` |
+| Binary metadata | `db_info` |
+| **Decompile a function** | `decompile(addr)` or `decompile(addr, limit)` |
+| **Find local variables** | `hlil_vars WHERE func_addr = X` |
+| **Find function calls (HLIL)** | `hlil_calls WHERE func_addr = X` |
+| **Search pseudocode** | `pseudocode WHERE line LIKE '%pattern%'` |
+
+**Remember:** Always use `func_addr = X` constraints on `instructions`, `hlil_vars`, `hlil_calls`, and `pseudocode` tables.
+
+---
+
+## Server Modes
+
+BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
+
+---
+
+### HTTP REST Server (Recommended)
+
+Standard REST API that works with curl, any HTTP client, or LLM tools.
+
+**Starting the server:**
+```bash
+# Default port 8081
+bnsql database.bndb --http
+
+# Custom port and bind address
+bnsql database.bndb --http 9000 --bind 0.0.0.0
+
+# With authentication
+bnsql database.bndb --http 8081 --token mysecret
+```
+
+**HTTP Endpoints:**
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/` | GET | No | Welcome message |
+| `/help` | GET | No | API documentation (for LLM discovery) |
+| `/query` | POST | Yes* | Execute SQL (body = raw SQL) |
+| `/status` | GET | Yes* | Health check |
+| `/shutdown` | POST | Yes* | Stop server |
+
+*Auth required only if `--token` was specified.
+
+**Example with curl:**
+```bash
+# Get API documentation
+curl http://localhost:8081/help
+
+# Execute SQL query
+curl -X POST http://localhost:8081/query -d "SELECT name, size FROM funcs LIMIT 5"
+
+# With authentication
+curl -X POST http://localhost:8081/query \
+     -H "Authorization: Bearer mysecret" \
+     -d "SELECT * FROM funcs"
+
+# Check status
+curl http://localhost:8081/status
+```
+
+**Response Format (JSON):**
+```json
+{"success": true, "columns": ["name", "size"], "rows": [["main", "500"]], "row_count": 1}
+```
+
+```json
+{"success": false, "error": "no such table: bad_table"}
+```
+
+---
+
+### Raw TCP Server (Legacy)
+
+Binary protocol with length-prefixed JSON. Use only when HTTP is not available.
+
+**Starting the server:**
+```bash
+bnsql database.bndb --server 13337
+bnsql database.bndb --server 13337 --token mysecret
+```
+
+**Connecting as client:**
+```bash
+bnsql --remote localhost:13337 -c "SELECT name FROM funcs LIMIT 5"
+bnsql --remote localhost:13337 -i
+```
+
+**Wire Protocol:**
+- Format: `[4-byte length (big-endian uint32)] [JSON payload]`
+- Request: `{"sql": "SELECT ...", "token": "optional"}`
+- Response: `{"success": true, "columns": [...], "rows": [[...]], "row_count": N}`
+
+**Python Example:**
+```python
+import socket, struct, json
+
+def bnsql_query(sql, host="localhost", port=13337, token=None):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((host, port))
+    req = {"sql": sql}
+    if token: req["token"] = token
+    payload = json.dumps(req).encode()
+    s.sendall(struct.pack(">I", len(payload)) + payload)
+    resp_len = struct.unpack(">I", s.recv(4))[0]
+    return json.loads(s.recv(resp_len))
+```
+
+---
+
+## Advanced: HLIL AST Table (_hlil_ast)
+
+The `_hlil_ast` table provides access to raw HLIL Abstract Syntax Tree nodes. The underscore prefix indicates this is an **internal/expert** table - use it only when you need AST-level pattern matching that `hlil_calls` and `hlil_vars` cannot provide.
+
+### When to Use _hlil_ast
+
+| Need | Preferred Approach |
+|------|-------------------|
+| Find function calls | `hlil_calls` (use this!) |
+| Find variables | `hlil_vars` (use this!) |
+| Find loops/conditions | `_hlil_ast` views |
+| AST pattern matching | `_hlil_ast` with filtering |
+
+### Critical: Always Filter by func_addr
+
+Like all decompiler tables, `_hlil_ast` decompiles functions on-demand. **NEVER query without a func_addr filter:**
+
+```sql
+-- BAD: Will iterate all functions and generate MANY rows per function
+SELECT COUNT(*) FROM _hlil_ast;
+
+-- GOOD: Always filter by specific function
+SELECT * FROM _hlil_ast WHERE func_addr = 0x401000;
+```
+
+### Available Views
+
+Pre-filtered views for common AST patterns (all require `func_addr` filter):
+
+| View | Purpose |
+|------|---------|
+| `_hlil_ast_loops` | WHILE, DO_WHILE, FOR loops |
+| `_hlil_ast_ifs` | IF/ELSE conditions |
+| `_hlil_ast_comparisons` | Comparison operations |
+| `_hlil_ast_assignments` | Assignment statements |
+| `_hlil_ast_returns` | Return statements |
+| `_hlil_ast_derefs` | Pointer dereferences |
+| `_hlil_ast_constants` | Constant values |
+| `_hlil_ast_vars` | Variable references |
+
+### Example: Find Loops in a Function
+
+```sql
+-- Get a function address first
+SELECT address FROM funcs WHERE size > 500 LIMIT 1;  -- e.g., 0x401330
+
+-- Query loops in that function
+SELECT op_name, hex(ea) as addr, cond_id, body_id
+FROM _hlil_ast_loops
+WHERE func_addr = 0x401330;
+```
+
+### Example: Find All IF Conditions
+
+```sql
+SELECT op_name, hex(ea) as addr, cond_id, true_id, false_id
+FROM _hlil_ast_ifs
+WHERE func_addr = 0x401330;
+```
+
+### Recommendation
+
+For 99% of use cases, prefer:
+- `decompile(addr)` - to view pseudocode
+- `hlil_calls` - to find function calls
+- `hlil_vars` - to find variables
+- `pseudocode WHERE line LIKE '%pattern%'` - to search in decompiled code
+
+Only use `_hlil_ast` and its views for specialized AST analysis tasks.
+
+---
+
+## Output Guidelines
+
+### ALWAYS Show Actual Data
+
+When the user asks to see something (decompilation, code, data), **ALWAYS include the actual output** in your response - don't just describe it!
+
+**BAD (don't do this):**
+> "The function appears to call malloc and contains a loop..."
+
+**GOOD (do this):**
+```
+int64_t sub_401000() {
+    void* ptr = malloc(0x100);
+    for (int i = 0; i < 10; i++) {
+        process(ptr, i);
+    }
+    return 0;
+}
+```
+
+### Decompilation Requests
+
+When the user asks to "decompile" or "show the code":
+1. Run `SELECT decompile(address)` or `SELECT decompile(address, 50)` for longer output
+2. **Include the actual pseudocode output** in a code block
+3. Then optionally add analysis
+
+Example response format:
+```
+## Function: sub_401000 (500 bytes)
+
+### Pseudocode:
+\`\`\`c
+int64_t sub_401000(int64_t arg1) {
+    if (arg1 == 0) return -1;
+    ...actual code here...
+}
+\`\`\`
+
+### Analysis:
+- This function validates the input argument...
+```
+
+---
+
+## CRITICAL REMINDERS (Read Before Every Query)
+
+- **Xref counting → ALWAYS use CTE first:** `WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs WHERE is_code=1 GROUP BY to_ea) SELECT ...`
+- **Never JOIN funcs directly to xrefs** - pre-aggregate xrefs in a CTE first
+- **Decompiler tables → ALWAYS filter by func_addr** - unbounded = hang
+- **Instructions table → ALWAYS filter by func_addr** - unbounded = extremely slow
+- **Use `decompile(addr)` for pseudocode** - not raw tables
+- **Use `hlil_vars` and `hlil_calls`** - not raw `_hlil_ast` unless needed
+)PROMPT";
+
+} // namespace bnsql
