@@ -365,7 +365,54 @@ SELECT DISTINCT func_at(func_addr) FROM hlil_calls WHERE callee_name = 'malloc';
 | `bytes(addr, n)` | Bytes as hex string |
 | `bytes_raw(addr, n)` | Raw bytes as BLOB |
 | `mnemonic(addr)` | Instruction mnemonic only |
-| `operand(addr, n)` | Operand text (n=0-5) |
+
+### Binary Search
+| Function | Description |
+|----------|-------------|
+| `search_bytes(pattern)` | Find all matches, returns JSON array |
+| `search_bytes(pattern, start, end)` | Search within address range |
+| `search_first(pattern)` | First match address (or NULL) |
+
+**Pattern syntax (Binary Ninja native):**
+- `"48 8B 05"` - Exact bytes (hex, space-separated)
+- `"48 ?? 05"` - `??` = any byte wildcard
+- `"4?"` - `?` = any nibble (matches 40-4F)
+- `"[regex]"` - Regex patterns supported
+
+**Example:**
+```sql
+-- Find all matches for a pattern
+SELECT search_bytes('48 8B ?? 00');
+
+-- Parse JSON results
+SELECT json_extract(value, '$.address') as addr
+FROM json_each(search_bytes('48 89 ??'))
+LIMIT 10;
+
+-- First match only
+SELECT printf('0x%X', search_first('CC CC CC'));
+```
+
+**Optimization Pattern: Find functions using specific instruction**
+
+To answer "How many functions use a specific byte pattern?" efficiently:
+```sql
+-- Count unique functions containing RDTSC (opcode: 0F 31)
+SELECT COUNT(DISTINCT func_start(json_extract(value, '$.address'))) as count
+FROM json_each(search_bytes('0F 31'))
+WHERE func_start(json_extract(value, '$.address')) IS NOT NULL;
+
+-- List those functions with names
+SELECT DISTINCT
+    func_start(json_extract(value, '$.address')) as func_ea,
+    name_at(func_start(json_extract(value, '$.address'))) as func_name
+FROM json_each(search_bytes('0F 31'))
+WHERE func_start(json_extract(value, '$.address')) IS NOT NULL;
+```
+
+This is **much faster** than scanning all disassembly lines because:
+- `search_bytes()` uses native binary search
+- `func_start()` is O(1) lookup in function index
 
 ### Names & Functions
 | Function | Description |

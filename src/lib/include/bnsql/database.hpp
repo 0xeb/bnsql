@@ -35,6 +35,7 @@
 #include <bnsql/entities.hpp>
 #include <bnsql/functions.hpp>
 #include <bnsql/decompiler.hpp>
+#include <bnsql/search_bytes.hpp>
 
 namespace bnsql {
 
@@ -264,6 +265,9 @@ private:
 
         // Register SQL functions
         functions::register_sql_functions(db_);
+
+        // Register search functions
+        search::register_search_bytes(db_);
     }
 };
 
