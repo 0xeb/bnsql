@@ -296,6 +296,78 @@ Database-level metadata.
 SELECT * FROM db_info;
 ```
 
+---
+
+## Convenience Views
+
+Pre-built views for common xref analysis patterns. These simplify caller/callee queries.
+
+### callers
+Who calls each function. Use this instead of manual xref JOINs.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `func_addr` | INT | Target function address |
+| `caller_addr` | INT | Xref source address |
+| `caller_name` | TEXT | Calling function name |
+| `caller_func_addr` | INT | Calling function start |
+
+```sql
+-- Who calls function at 0x401000?
+SELECT caller_name, printf('0x%X', caller_addr) as from_addr
+FROM callers WHERE func_addr = 0x401000;
+
+-- Most called functions
+SELECT printf('0x%X', func_addr) as addr, COUNT(*) as callers
+FROM callers GROUP BY func_addr ORDER BY callers DESC LIMIT 10;
+```
+
+### callees
+What each function calls. Inverse of callers view.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `func_addr` | INT | Calling function address |
+| `func_name` | TEXT | Calling function name |
+| `callee_addr` | INT | Called address |
+| `callee_name` | TEXT | Called function/symbol name |
+
+```sql
+-- What does main call?
+SELECT callee_name, printf('0x%X', callee_addr) as addr
+FROM callees WHERE func_name LIKE '%main%';
+
+-- Functions making most calls
+SELECT func_name, COUNT(*) as call_count
+FROM callees GROUP BY func_addr ORDER BY call_count DESC LIMIT 10;
+```
+
+### string_refs
+Which functions reference which strings. Great for finding functions by string content.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `string_addr` | INT | String address |
+| `string_value` | TEXT | String content |
+| `string_length` | INT | String length |
+| `ref_addr` | INT | Reference address |
+| `func_addr` | INT | Referencing function |
+| `func_name` | TEXT | Function name |
+
+```sql
+-- Find functions using error strings
+SELECT func_name, string_value
+FROM string_refs
+WHERE string_value LIKE '%error%' OR string_value LIKE '%fail%';
+
+-- Functions with most string references
+SELECT func_name, COUNT(*) as string_count
+FROM string_refs WHERE func_name IS NOT NULL
+GROUP BY func_addr ORDER BY string_count DESC LIMIT 10;
+```
+
+---
+
 ### pseudocode
 Line-by-line decompiled pseudocode (HLIL). **Filter by `func_addr` for performance.**
 
@@ -365,7 +437,54 @@ SELECT DISTINCT func_at(func_addr) FROM hlil_calls WHERE callee_name = 'malloc';
 | `bytes(addr, n)` | Bytes as hex string |
 | `bytes_raw(addr, n)` | Raw bytes as BLOB |
 | `mnemonic(addr)` | Instruction mnemonic only |
-| `operand(addr, n)` | Operand text (n=0-5) |
+
+### Binary Search
+| Function | Description |
+|----------|-------------|
+| `search_bytes(pattern)` | Find all matches, returns JSON array |
+| `search_bytes(pattern, start, end)` | Search within address range |
+| `search_first(pattern)` | First match address (or NULL) |
+
+**Pattern syntax (Binary Ninja native):**
+- `"48 8B 05"` - Exact bytes (hex, space-separated)
+- `"48 ?? 05"` - `??` = any byte wildcard
+- `"4?"` - `?` = any nibble (matches 40-4F)
+- `"[regex]"` - Regex patterns supported
+
+**Example:**
+```sql
+-- Find all matches for a pattern
+SELECT search_bytes('48 8B ?? 00');
+
+-- Parse JSON results
+SELECT json_extract(value, '$.address') as addr
+FROM json_each(search_bytes('48 89 ??'))
+LIMIT 10;
+
+-- First match only
+SELECT printf('0x%X', search_first('CC CC CC'));
+```
+
+**Optimization Pattern: Find functions using specific instruction**
+
+To answer "How many functions use a specific byte pattern?" efficiently:
+```sql
+-- Count unique functions containing RDTSC (opcode: 0F 31)
+SELECT COUNT(DISTINCT func_start(json_extract(value, '$.address'))) as count
+FROM json_each(search_bytes('0F 31'))
+WHERE func_start(json_extract(value, '$.address')) IS NOT NULL;
+
+-- List those functions with names
+SELECT DISTINCT
+    func_start(json_extract(value, '$.address')) as func_ea,
+    name_at(func_start(json_extract(value, '$.address'))) as func_name
+FROM json_each(search_bytes('0F 31'))
+WHERE func_start(json_extract(value, '$.address')) IS NOT NULL;
+```
+
+This is **much faster** than scanning all disassembly lines because:
+- `search_bytes()` uses native binary search
+- `func_start()` is O(1) lookup in function index
 
 ### Names & Functions
 | Function | Description |

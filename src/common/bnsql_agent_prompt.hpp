@@ -1,5 +1,5 @@
 // Auto-generated from bnsql_agent.md
-// Generated: 2026-01-28T09:11:45.961472
+// Generated: 2026-01-29T11:43:39.749802
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -411,6 +411,11 @@ SELECT DISTINCT func_at(func_addr) FROM hlil_calls WHERE callee_name = 'malloc';
 |----------|-------------|
 | `set_name(addr, name)` | Set name at address |
 
+### Database
+| Function | Description |
+|----------|-------------|
+| `save()` | Save database to disk (after UPDATE/INSERT/DELETE) |
+
 ### Decompilation (HLIL)
 | Function | Description |
 |----------|-------------|
@@ -563,14 +568,14 @@ SELECT * FROM imports WHERE name LIKE '%socket%' OR name LIKE '%connect%';
 ### "Understand a specific function"
 
 ```sql
--- Basic info
-SELECT * FROM funcs WHERE address = 0x401000;
+-- Basic info)PROMPT"
+    R"PROMPT(SELECT * FROM funcs WHERE address = 0x401000;
 
 -- What calls it
 SELECT hex(from_ea) as caller FROM xrefs WHERE to_ea = 0x401000 AND is_code = 1;
 
--- Decompile it)PROMPT"
-    R"PROMPT(SELECT decompile(0x401000);
+-- Decompile it
+SELECT decompile(0x401000);
 
 -- Or with line limit
 SELECT decompile(0x401000, 30);
