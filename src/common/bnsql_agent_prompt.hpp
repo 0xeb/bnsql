@@ -1,5 +1,5 @@
 // Auto-generated from bnsql_agent.md
-// Generated: 2026-01-31T10:38:45.534734
+// Generated: 2026-01-31T11:09:53.578027
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -133,11 +133,42 @@ LIMIT 20;
 
 ### "Find functions that make many calls" (dispatcher/wrapper functions)
 ```sql
-SELECT func_name, COUNT(DISTINCT callee_addr) as unique_callees, COUNT(*) as total_calls
-FROM callees
-GROUP BY func_addr
-ORDER BY unique_callees DESC
-LIMIT 10;
+-- FAST: Use xrefs.from_func directly, avoid callees view for large result sets
+SELECT from_func, COUNT(DISTINCT to_ea) as unique_callees
+FROM xrefs WHERE is_code = 1 AND from_func != 0
+GROUP BY from_func ORDER BY unique_callees DESC LIMIT 10;
+```
+
+### "Find functions whose call tree terminates within 3 levels" (bounded call depth)
+```sql
+-- Use xrefs with from_func for speed, only join funcs at the end for names
+WITH
+cc AS (
+    SELECT from_func as func, COUNT(DISTINCT to_ea) as cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0
+    GROUP BY from_func
+),
+-- Level 0: functions calling 1-3 others
+l0 AS (SELECT func FROM cc WHERE cnt BETWEEN 1 AND 3),
+-- Level 1 callees and their counts
+l1_callees AS (SELECT DISTINCT x.to_ea as callee FROM xrefs x
+    WHERE x.from_func IN (SELECT func FROM l0) AND x.is_code = 1),
+l1_valid AS (SELECT lc.callee FROM l1_callees lc
+    LEFT JOIN cc c ON lc.callee = c.func WHERE COALESCE(c.cnt, 0) <= 3),
+-- Level 2
+l2_callees AS (SELECT DISTINCT x.to_ea as callee FROM xrefs x
+    WHERE x.from_func IN (SELECT callee FROM l1_valid) AND x.is_code = 1),
+l2_valid AS (SELECT lc.callee FROM l2_callees lc
+    LEFT JOIN cc c ON lc.callee = c.func WHERE COALESCE(c.cnt, 0) <= 3),
+-- Level 3 must be terminal (0 callees)
+l3_callees AS (SELECT DISTINCT x.to_ea as callee FROM xrefs x
+    WHERE x.from_func IN (SELECT callee FROM l2_valid) AND x.is_code = 1),
+l3_valid AS (SELECT lc.callee FROM l3_callees lc
+    LEFT JOIN cc c ON lc.callee = c.func WHERE COALESCE(c.cnt, 0) = 0)
+-- Output L0 functions with names
+SELECT f.name, printf('0x%X', l0.func) as addr, cc.cnt as callees
+FROM l0 JOIN cc ON l0.func = cc.func JOIN funcs f ON l0.func = f.address
+ORDER BY cc.cnt DESC LIMIT 20;
 ```
 
 ### "Decompile main and show variables"
@@ -274,12 +305,20 @@ Cross-references - important for understanding code relationships.
 |--------|------|-------------|
 | `from_ea` | INT | Source address (who references) |
 | `to_ea` | INT | Target address (what is referenced) |
+| `from_func` | INT | **Pre-computed:** Function containing from_ea (0 if none) |
 | `type` | INT | Xref type code |
 | `is_code` | INT | 1=code xref (call/jump), 0=data xref |
+
+**IMPORTANT:** Use `from_func` for call graph analysis - it's pre-computed at load time and avoids expensive range joins!
 
 ```sql
 -- Who calls function at 0x401000?
 SELECT hex(from_ea) as caller FROM xrefs WHERE to_ea = 0x401000 AND is_code = 1;
+
+-- Fast: count callees per function using from_func
+SELECT from_func, COUNT(DISTINCT to_ea) as num_callees
+FROM xrefs WHERE is_code = 1 AND from_func != 0
+GROUP BY from_func ORDER BY num_callees DESC LIMIT 10;
 ```
 
 ### blocks
@@ -449,8 +488,8 @@ Local variables from decompiled functions. **Filter by `func_addr`.**
 | `storage` | TEXT | "stack" or "register" |
 | `stack_off` | INT | Stack offset (if stack) |
 
-```sql
--- Variables in a function
+```sql)PROMPT"
+    R"PROMPT(-- Variables in a function
 SELECT name, type, storage FROM hlil_vars WHERE func_addr = 0x401000;
 
 -- Find functions with "buffer" variables
@@ -507,8 +546,8 @@ SELECT func_addr, callee_addr FROM callees;
 |----------|-------------|
 | `disasm(addr)` | Disassembly line at address |
 | `disasm(addr, n)` | Multiple lines from address |
-| `bytes(addr, n)` | Bytes as hex string |)PROMPT"
-    R"PROMPT(| `bytes_raw(addr, n)` | Raw bytes as BLOB |
+| `bytes(addr, n)` | Bytes as hex string |
+| `bytes_raw(addr, n)` | Raw bytes as BLOB |
 | `mnemonic(addr)` | Instruction mnemonic only |
 
 ### Binary Search
@@ -961,8 +1000,8 @@ import socket, struct, json
 
 def bnsql_query(sql, host="localhost", port=13337, token=None):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
-    req = {"sql": sql}
+    s.connect((host, port)))PROMPT"
+    R"PROMPT(    req = {"sql": sql}
     if token: req["token"] = token
     payload = json.dumps(req).encode()
     s.sendall(struct.pack(">I", len(payload)) + payload)
@@ -1020,8 +1059,8 @@ SELECT address FROM funcs WHERE size > 500 LIMIT 1;  -- e.g., 0x401330
 
 -- Query loops in that function
 SELECT op_name, hex(ea) as addr, cond_id, body_id
-FROM _hlil_ast_loops)PROMPT"
-    R"PROMPT(WHERE func_addr = 0x401330;
+FROM _hlil_ast_loops
+WHERE func_addr = 0x401330;
 ```
 
 ### Example: Find All IF Conditions
@@ -1104,10 +1143,12 @@ int64_t sub_401000(int64_t arg1) {
 
 | Task | SLOW (avoid) | FAST (use this) |
 |------|--------------|-----------------|
-| Count callers per function | `SELECT func_start(from_ea)... FROM xrefs` | `SELECT func_addr, COUNT(*) FROM callers GROUP BY func_addr` |
-| Count callees per function | `SELECT to_ea, func_start(from_ea) FROM xrefs` | `SELECT func_addr, COUNT(DISTINCT callee_addr) FROM callees GROUP BY func_addr` |
-| Find who calls X | `xrefs WHERE to_ea = X` (ok for single) | `callers WHERE func_addr = X` |
-| Find what X calls | `xrefs + func_start()` | `callees WHERE func_addr = X` |
+| Count callers per function | `func_start(from_ea)` on xrefs | `SELECT to_ea, COUNT(*) FROM xrefs WHERE is_code=1 GROUP BY to_ea` |
+| Count callees per function | `callees` view (has joins) | `SELECT from_func, COUNT(DISTINCT to_ea) FROM xrefs WHERE is_code=1 GROUP BY from_func` |
+| Find who calls X | OK: `xrefs WHERE to_ea = X` | OK for single lookups |
+| Find what X calls | `callees WHERE func_addr = X` | `xrefs WHERE from_func = X AND is_code = 1` |
+| Bulk call graph analysis | `callees`/`callers` views | Use `xrefs` with `from_func` directly |
+| Get names at the end | Join `funcs` in every CTE | Join `funcs` only in final SELECT |
 )PROMPT";
 
 } // namespace bnsql

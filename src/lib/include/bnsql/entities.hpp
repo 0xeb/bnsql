@@ -409,13 +409,14 @@ inline VTableDef define_strings() {
 
 // ============================================================================
 // XREFS Table - Cross-references
-// Schema: from_ea, to_ea, type, is_code
-// Compatible with idasql xrefs table
+// Schema: from_ea, to_ea, from_func, type, is_code
+// from_func is pre-computed at load time for fast caller/callee queries
 // ============================================================================
 
 struct XrefInfo {
     uint64_t from_ea;
     uint64_t to_ea;
+    uint64_t from_func;  // Pre-computed: function containing from_ea (0 if none)
     int type;
     bool is_code;
 };
@@ -432,6 +433,12 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
             auto bv = get_bv();
             if (!bv) return;
 
+            // Helper to get containing function address (0 if none)
+            auto get_func_addr = [&bv](uint64_t addr) -> uint64_t {
+                auto funcs = bv->GetAnalysisFunctionsContainingAddress(addr);
+                return funcs.empty() ? 0 : funcs[0]->GetStart();
+            };
+
             // Collect code references from all functions
             for (auto& func : bv->GetAnalysisFunctionList()) {
                 uint64_t func_addr = func->GetStart();
@@ -441,6 +448,7 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
                     XrefInfo xi;
                     xi.from_ea = ref.addr;
                     xi.to_ea = func_addr;
+                    xi.from_func = get_func_addr(ref.addr);
                     xi.type = 0; // Code call
                     xi.is_code = true;
                     cache.push_back(xi);
@@ -458,6 +466,7 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
                         XrefInfo xi;
                         xi.from_ea = ref.addr;
                         xi.to_ea = addr;
+                        xi.from_func = get_func_addr(ref.addr);
                         xi.type = 1; // Data reference
                         xi.is_code = false;
                         cache.push_back(xi);
@@ -477,6 +486,7 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
                         XrefInfo xi;
                         xi.from_ea = ref.addr;
                         xi.to_ea = import_addr;
+                        xi.from_func = get_func_addr(ref.addr);
                         xi.type = 2; // Import call
                         xi.is_code = true;
                         cache.push_back(xi);
@@ -489,6 +499,9 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
         })
         .column_int64("to_ea", [](const XrefInfo& r) -> int64_t {
             return static_cast<int64_t>(r.to_ea);
+        })
+        .column_int64("from_func", [](const XrefInfo& r) -> int64_t {
+            return r.from_func ? static_cast<int64_t>(r.from_func) : 0;
         })
         .column_int("type", [](const XrefInfo& r) -> int {
             return r.type;
@@ -886,36 +899,37 @@ struct TableRegistry {
 
     void create_helper_views(xsql::Database& db) {
         // callers view - who calls a function
+        // Uses pre-computed from_func for O(1) lookup instead of range scan
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS callers AS
             SELECT
                 x.to_ea as func_addr,
                 x.from_ea as caller_addr,
                 f.name as caller_name,
-                f.address as caller_func_addr
+                x.from_func as caller_func_addr
             FROM xrefs x
-            LEFT JOIN funcs f ON x.from_ea >= f.address
-                AND x.from_ea < f.address + f.size
+            LEFT JOIN funcs f ON x.from_func = f.address
             WHERE x.is_code = 1
         )");
 
         // callees view - what does a function call
+        // Uses pre-computed from_func for O(1) lookup instead of range scan
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS callees AS
             SELECT
-                f.address as func_addr,
+                x.from_func as func_addr,
                 f.name as func_name,
                 x.to_ea as callee_addr,
                 COALESCE(f2.name, n.name, printf('sub_%X', x.to_ea)) as callee_name
-            FROM funcs f
-            JOIN xrefs x ON x.from_ea >= f.address
-                AND x.from_ea < f.address + f.size
+            FROM xrefs x
+            LEFT JOIN funcs f ON x.from_func = f.address
             LEFT JOIN funcs f2 ON x.to_ea = f2.address
             LEFT JOIN names n ON x.to_ea = n.address
-            WHERE x.is_code = 1
+            WHERE x.is_code = 1 AND x.from_func != 0
         )");
 
         // string_refs view - which functions reference which strings
+        // Uses pre-computed from_func for O(1) lookup instead of range scan
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS string_refs AS
             SELECT
@@ -923,12 +937,11 @@ struct TableRegistry {
                 s.content as string_value,
                 s.length as string_length,
                 x.from_ea as ref_addr,
-                f.address as func_addr,
+                x.from_func as func_addr,
                 f.name as func_name
             FROM strings s
             JOIN xrefs x ON x.to_ea = s.address
-            LEFT JOIN funcs f ON x.from_ea >= f.address
-                AND x.from_ea < f.address + f.size
+            LEFT JOIN funcs f ON x.from_func = f.address
         )");
     }
 
