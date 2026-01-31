@@ -26,6 +26,7 @@
 #endif
 
 #include <bnsql/bnsql.hpp>
+#include <bnsql/config.hpp>
 #include <xsql/socket/client.hpp>
 #include <xsql/socket/server.hpp>
 #include "binaryninjaapi.h"
@@ -1077,6 +1078,15 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
+    // Check for BN_INSTALL_DIR before delay-loaded DLLs are triggered
+    if (!std::getenv(bnsql::ENV_BN_INSTALL_DIR)) {
+        std::cerr << "Error: " << bnsql::ENV_BN_INSTALL_DIR << " environment variable not set.\n\n"
+                  << "Please set it to your Binary Ninja installation directory:\n"
+                  << "  set " << bnsql::ENV_BN_INSTALL_DIR << "=C:\\Program Files\\Binary Ninja\n"
+                  << "  set PATH=%" << bnsql::ENV_BN_INSTALL_DIR << "%;%PATH%\n";
+        return 1;
+    }
+
     // Enable UTF-8 console output on Windows
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);

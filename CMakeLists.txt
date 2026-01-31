@@ -196,6 +196,15 @@ if(BNSQL_BUILD_CLI)
     set_target_properties(bnsql-cli PROPERTIES
         OUTPUT_NAME "bnsql"
     )
+
+    # Delay-load Binary Ninja DLLs on Windows
+    # Allows CLI to check for DLL presence before loading
+    if(WIN32 AND MSVC)
+        target_link_options(bnsql-cli PRIVATE
+            "/DELAYLOAD:binaryninjacore.dll"
+        )
+        target_link_libraries(bnsql-cli PRIVATE delayimp.lib)
+    endif()
 endif()
 
 # ============================================================================
