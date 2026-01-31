@@ -18,7 +18,11 @@
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 #endif
 
 #include <bnsql/bnsql.hpp>
@@ -306,7 +310,7 @@ static void run_remote_agent(xsql::socket::Client& client, bool verbose = false,
 
     std::string line;
     while (!agent.quit_requested()) {
-        std::cout << "agent> " << std::flush;
+        std::cout << "bnsql> " << std::flush;
         if (!std::getline(std::cin, line)) break;
 
         line = trim(line);
@@ -945,7 +949,7 @@ static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
 
         std::string line;
         while (!agent.quit_requested()) {
-            std::cout << "agent> " << std::flush;
+            std::cout << "bnsql> " << std::flush;
             if (!std::getline(std::cin, line)) break;
 
             line = trim(line);
@@ -1073,7 +1077,18 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
+    // Enable UTF-8 console output on Windows
     SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    // Enable virtual terminal processing for ANSI escape sequences
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hOut, &mode)) {
+            SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
 #endif
 
     std::string database, query, query_file, prompt, remote_spec, provider_override, auth_token, bind_addr;

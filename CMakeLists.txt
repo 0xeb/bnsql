@@ -163,6 +163,13 @@ if(BNSQL_BUILD_CLI)
         )
     endif()
 
+    # Add Windows manifest for UTF-8 support (Windows 10 1903+)
+    if(WIN32)
+        list(APPEND BNSQL_CLI_SOURCES
+            src/cli/bnsql.manifest
+        )
+    endif()
+
     add_executable(bnsql-cli ${BNSQL_CLI_SOURCES})
 
     target_link_libraries(bnsql-cli PRIVATE

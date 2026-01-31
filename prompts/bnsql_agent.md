@@ -39,6 +39,17 @@ A comprehensive reference for AI agents to effectively use BNSQL - an SQL interf
 
 3. **Instructions table MUST filter by func_addr** - never scan the whole table
 
+4. **NEVER use `func_start()` or `func_at()` in bulk xref queries** - these UDFs call Binary Ninja API for EACH row:
+   ```sql
+   -- WRONG (8000+ API calls - takes 10+ minutes):
+   SELECT func_start(from_ea) as caller, to_ea FROM xrefs WHERE is_code = 1;
+
+   -- CORRECT (use the callees view - pure SQL, milliseconds):
+   SELECT func_addr, callee_addr FROM callees;
+   ```
+
+5. **Use `callers`/`callees` views for call graph analysis** - they pre-compute function boundaries without UDF overhead
+
 ---
 
 ## Few-Shot Examples (Use These Patterns!)
@@ -97,6 +108,27 @@ WITH malloc_addr AS (
 SELECT DISTINCT func_at(x.from_ea) as caller
 FROM xrefs x
 WHERE x.to_ea IN (SELECT address FROM malloc_addr) AND x.is_code = 1;
+```
+
+### "Find functions that call at most 3 other functions" (leaf-like functions)
+```sql
+-- Use the callees view, NOT func_start() on xrefs!
+SELECT func_name, printf('0x%X', func_addr) as address,
+       COUNT(DISTINCT callee_addr) as num_callees
+FROM callees
+GROUP BY func_addr
+HAVING COUNT(DISTINCT callee_addr) BETWEEN 1 AND 3
+ORDER BY num_callees, func_name
+LIMIT 20;
+```
+
+### "Find functions that make many calls" (dispatcher/wrapper functions)
+```sql
+SELECT func_name, COUNT(DISTINCT callee_addr) as unique_callees, COUNT(*) as total_calls
+FROM callees
+GROUP BY func_addr
+ORDER BY unique_callees DESC
+LIMIT 10;
 ```
 
 ### "Decompile main and show variables"
@@ -323,7 +355,7 @@ FROM callers GROUP BY func_addr ORDER BY callers DESC LIMIT 10;
 ```
 
 ### callees
-What each function calls. Inverse of callers view.
+What each function calls. Inverse of callers view. **Use this instead of `func_start()` on xrefs!**
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -337,9 +369,17 @@ What each function calls. Inverse of callers view.
 SELECT callee_name, printf('0x%X', callee_addr) as addr
 FROM callees WHERE func_name LIKE '%main%';
 
--- Functions making most calls
+-- Functions making most calls (total call sites)
 SELECT func_name, COUNT(*) as call_count
 FROM callees GROUP BY func_addr ORDER BY call_count DESC LIMIT 10;
+
+-- Functions calling the most UNIQUE callees (fan-out)
+SELECT func_name, COUNT(DISTINCT callee_addr) as unique_callees
+FROM callees GROUP BY func_addr ORDER BY unique_callees DESC LIMIT 10;
+
+-- Functions that call exactly N unique functions (e.g., simple wrappers call 1)
+SELECT func_name, COUNT(DISTINCT callee_addr) as callees
+FROM callees GROUP BY func_addr HAVING callees = 1;
 ```
 
 ### string_refs
@@ -428,6 +468,30 @@ SELECT DISTINCT func_at(func_addr) FROM hlil_calls WHERE callee_name = 'malloc';
 ---
 
 ## SQL Functions
+
+### IMPORTANT: UDF Performance Costs
+
+Some SQL functions call the Binary Ninja API **once per row**. In bulk queries, this creates thousands of API calls:
+
+| Function | Cost | Use Case |
+|----------|------|----------|
+| `func_start(addr)` | **SLOW** - API call per row | Single address lookup only |
+| `func_at(addr)` | **SLOW** - API call per row | Single address lookup only |
+| `func_end(addr)` | **SLOW** - API call per row | Single address lookup only |
+| `decompile(addr)` | **VERY SLOW** - decompiles function | Single function only |
+| `disasm(addr)` | Moderate | Small result sets |
+| `hex(val)` | Fast | Pure SQL |
+| `printf(...)` | Fast | Pure SQL |
+
+**Rule:** For bulk call-graph analysis, use `callers`/`callees` views instead of `func_start()`/`func_at()` on xrefs:
+
+```sql
+-- WRONG: 8000 API calls on a binary with 8000 xrefs
+SELECT func_start(from_ea), to_ea FROM xrefs WHERE is_code = 1;
+
+-- CORRECT: Pure SQL join, milliseconds
+SELECT func_addr, callee_addr FROM callees;
+```
 
 ### Disassembly
 | Function | Description |
@@ -1020,7 +1084,18 @@ int64_t sub_401000(int64_t arg1) {
 
 - **Xref counting → ALWAYS use CTE first:** `WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs WHERE is_code=1 GROUP BY to_ea) SELECT ...`
 - **Never JOIN funcs directly to xrefs** - pre-aggregate xrefs in a CTE first
+- **Call graph analysis → Use `callers`/`callees` views** - NOT `func_start()` on xrefs
+- **NEVER use `func_start()`/`func_at()` in bulk xref queries** - each call = 1 API request = minutes of waiting
 - **Decompiler tables → ALWAYS filter by func_addr** - unbounded = hang
 - **Instructions table → ALWAYS filter by func_addr** - unbounded = extremely slow
 - **Use `decompile(addr)` for pseudocode** - not raw tables
 - **Use `hlil_vars` and `hlil_calls`** - not raw `_hlil_ast` unless needed
+
+### Quick Reference: Slow vs Fast Patterns
+
+| Task | SLOW (avoid) | FAST (use this) |
+|------|--------------|-----------------|
+| Count callers per function | `SELECT func_start(from_ea)... FROM xrefs` | `SELECT func_addr, COUNT(*) FROM callers GROUP BY func_addr` |
+| Count callees per function | `SELECT to_ea, func_start(from_ea) FROM xrefs` | `SELECT func_addr, COUNT(DISTINCT callee_addr) FROM callees GROUP BY func_addr` |
+| Find who calls X | `xrefs WHERE to_ea = X` (ok for single) | `callers WHERE func_addr = X` |
+| Find what X calls | `xrefs + func_start()` | `callees WHERE func_addr = X` |
