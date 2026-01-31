@@ -411,6 +411,9 @@ inline VTableDef define_strings() {
 // XREFS Table - Cross-references
 // Schema: from_ea, to_ea, from_func, type, is_code
 // from_func is pre-computed at load time for fast caller/callee queries
+//
+// Optimization: filter_eq("to_ea", ...) uses BN's GetCodeReferences(addr)
+// directly, bypassing cache for O(1) lookup. This is critical for JOINs.
 // ============================================================================
 
 struct XrefInfo {
@@ -419,6 +422,93 @@ struct XrefInfo {
     uint64_t from_func;  // Pre-computed: function containing from_ea (0 if none)
     int type;
     bool is_code;
+};
+
+/**
+ * Iterator for xrefs TO a specific address.
+ *
+ * Uses BN's GetCodeReferences(addr) directly instead of scanning a cache.
+ * This is O(1) in BN's internal xref database.
+ */
+class XrefsToIterator : public xsql::RowIterator {
+    Ref<BinaryView> bv_;
+    uint64_t target_;
+    std::vector<ReferenceSource> refs_;
+    size_t pos_ = 0;
+    bool started_ = false;
+
+    // Cached current row
+    XrefInfo current_;
+
+public:
+    explicit XrefsToIterator(int64_t target) : target_(static_cast<uint64_t>(target)) {
+        bv_ = get_bv();
+        if (bv_) {
+            refs_ = bv_->GetCodeReferences(target_);
+        }
+    }
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            pos_ = 0;
+        } else {
+            pos_++;
+        }
+
+        if (pos_ >= refs_.size()) {
+            return false;
+        }
+
+        // Build current row
+        const auto& ref = refs_[pos_];
+        current_.from_ea = ref.addr;
+        current_.to_ea = target_;
+        current_.type = 0;  // Code reference
+        current_.is_code = true;
+
+        // Compute from_func (containing function)
+        current_.from_func = 0;
+        if (bv_) {
+            auto funcs = bv_->GetAnalysisFunctionsContainingAddress(ref.addr);
+            if (!funcs.empty()) {
+                current_.from_func = funcs[0]->GetStart();
+            }
+        }
+
+        return true;
+    }
+
+    bool eof() const override {
+        return !started_ || pos_ >= refs_.size();
+    }
+
+    void column(sqlite3_context* ctx, int col) override {
+        switch (col) {
+            case 0: // from_ea
+                sqlite3_result_int64(ctx, static_cast<int64_t>(current_.from_ea));
+                break;
+            case 1: // to_ea
+                sqlite3_result_int64(ctx, static_cast<int64_t>(current_.to_ea));
+                break;
+            case 2: // from_func
+                sqlite3_result_int64(ctx, current_.from_func ? static_cast<int64_t>(current_.from_func) : 0);
+                break;
+            case 3: // type
+                sqlite3_result_int(ctx, current_.type);
+                break;
+            case 4: // is_code
+                sqlite3_result_int(ctx, current_.is_code ? 1 : 0);
+                break;
+            default:
+                sqlite3_result_null(ctx);
+                break;
+        }
+    }
+
+    int64_t rowid() const override {
+        return static_cast<int64_t>(pos_);
+    }
 };
 
 inline CachedTableDef<XrefInfo> define_xrefs() {
@@ -509,7 +599,12 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
         .column_int("is_code", [](const XrefInfo& r) -> int {
             return r.is_code ? 1 : 0;
         })
-        // Indexes for fast lookups in JOINs
+        // Direct source filter: bypass cache and query BN API directly
+        // Cost 0.5 ensures this is preferred over index_on (cost 1.0)
+        .filter_eq("to_ea", [](int64_t target) -> std::unique_ptr<xsql::RowIterator> {
+            return std::make_unique<XrefsToIterator>(target);
+        }, 0.5, 5.0)  // cost=0.5, estimated_rows=5
+        // Indexes for full-scan JOINs (fallback when filter_eq not applicable)
         .index_on("to_ea", [](const XrefInfo& r) -> int64_t {
             return static_cast<int64_t>(r.to_ea);
         })
