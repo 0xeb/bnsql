@@ -509,6 +509,13 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
         .column_int("is_code", [](const XrefInfo& r) -> int {
             return r.is_code ? 1 : 0;
         })
+        // Indexes for fast lookups in JOINs
+        .index_on("to_ea", [](const XrefInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.to_ea);
+        })
+        .index_on("from_func", [](const XrefInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.from_func);
+        })
         .build();
 }
 
