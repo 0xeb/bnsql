@@ -1,5 +1,5 @@
 // Auto-generated from bnsql_agent.md
-// Generated: 2026-01-31T14:13:31.981141
+// Generated: 2026-01-31T17:14:45.219595
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -750,6 +750,67 @@ WHERE name LIKE '%socket%'
 
 ---
 
+## Complex Analysis Patterns
+
+### Bridge Functions (High Connectivity)
+Functions that act as bridges between subsystems - called by many and calling many:
+
+```sql
+WITH caller_counts AS (
+    SELECT to_ea as func_addr, COUNT(DISTINCT from_func) as caller_cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0 GROUP BY to_ea
+),
+callee_counts AS (
+    SELECT from_func as func_addr, COUNT(DISTINCT to_ea) as callee_cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0 GROUP BY from_func
+)
+SELECT f.name, COALESCE(cr.caller_cnt, 0) as callers, COALESCE(ce.callee_cnt, 0) as callees
+FROM funcs f
+LEFT JOIN caller_counts cr ON cr.func_addr = f.address
+LEFT JOIN callee_counts ce ON ce.func_addr = f.address
+WHERE COALESCE(cr.caller_cnt, 0) >= 5 AND COALESCE(ce.callee_cnt, 0) >= 5
+ORDER BY (cr.caller_cnt * ce.callee_cnt) DESC LIMIT 20;
+```
+
+### Error Handler Detection
+Functions with many callers that reference error-related strings:
+
+```sql
+-- Find error strings first (fast)
+SELECT COUNT(*) FROM strings
+WHERE content LIKE '%error%' OR content LIKE '%fail%' OR content LIKE '%invalid%';
+
+-- Find functions referencing them
+-- NOTE: string_refs can be slow on large binaries (strings table not cached)
+-- For faster results, limit to specific string patterns:
+SELECT func_name, COUNT(*) as error_strings
+FROM string_refs
+WHERE string_value LIKE '%error%' OR string_value LIKE '%fail%'
+GROUP BY func_addr
+ORDER BY error_strings DESC LIMIT 15;
+```
+
+### Chokepoint Functions (Hook Targets)
+Functions that dominate paths to output operations:
+
+```sql
+WITH write_funcs AS (
+    SELECT address FROM imports
+    WHERE name LIKE '%write%' OR name LIKE '%send%' OR name LIKE '%fwrite%'
+),
+caller_coverage AS (
+    SELECT x.from_func as func_addr, COUNT(DISTINCT x.to_ea) as write_targets
+    FROM xrefs x
+    WHERE x.to_ea IN (SELECT address FROM write_funcs) AND x.from_func != 0
+    GROUP BY x.from_func
+)
+SELECT f.name, cc.write_targets
+FROM caller_coverage cc JOIN funcs f ON f.address = cc.func_addr
+ORDER BY cc.write_targets DESC LIMIT 10;
+```
+
+---
+
 ## Hex Address Formatting
 
 Binary Ninja uses integer addresses. For display, use `hex()`:
@@ -914,8 +975,8 @@ SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.a
 ---
 
 ## Server Modes
-
-BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
+)PROMPT"
+    R"PROMPT(BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
 
 ---
 
@@ -997,8 +1058,8 @@ bnsql --remote localhost:13337 -i
 - Response: `{"success": true, "columns": [...], "rows": [[...]], "row_count": N}`
 
 **Python Example:**
-```python)PROMPT"
-    R"PROMPT(import socket, struct, json
+```python
+import socket, struct, json
 
 def bnsql_query(sql, host="localhost", port=13337, token=None):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

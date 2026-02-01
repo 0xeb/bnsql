@@ -355,54 +355,76 @@ inline VTableDef define_entries() {
 // Compatible with idasql strings table (simplified)
 // ============================================================================
 
-inline VTableDef define_strings() {
-    return table("strings")
-        .count([]() {
+// ============================================================================
+// STRINGS Table - String literals in binary
+// Schema: address, length, type, type_name, content
+//
+// Cached for efficient JOINs with xrefs (e.g., string_refs view)
+// index_on("address") enables hash lookups when joining xrefs.to_ea
+// ============================================================================
+
+struct StringInfo {
+    uint64_t address;
+    size_t length;
+    int type;
+    std::string type_name;
+    std::string content;
+};
+
+inline CachedTableDef<StringInfo> define_strings() {
+    return cached_table<StringInfo>("strings")
+        .estimate_rows([]() -> size_t {
             auto bv = get_bv();
             return bv ? bv->GetStrings().size() : 0;
         })
-        .column_int64("address", [](size_t i) -> int64_t {
+        .cache_builder([](std::vector<StringInfo>& cache) {
             auto bv = get_bv();
-            if (!bv) return 0;
+            if (!bv) return;
+
             auto strs = bv->GetStrings();
-            if (i >= strs.size()) return 0;
-            return static_cast<int64_t>(strs[i].start);
-        })
-        .column_int("length", [](size_t i) -> int {
-            auto bv = get_bv();
-            if (!bv) return 0;
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return 0;
-            return static_cast<int>(strs[i].length);
-        })
-        .column_int("type", [](size_t i) -> int {
-            auto bv = get_bv();
-            if (!bv) return 0;
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return 0;
-            return static_cast<int>(strs[i].type);
-        })
-        .column_text("type_name", [](size_t i) -> std::string {
-            auto bv = get_bv();
-            if (!bv) return "";
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return "";
-            switch (strs[i].type) {
-                case AsciiString: return "ascii";
-                case Utf16String: return "utf16";
-                case Utf32String: return "utf32";
-                default: return "unknown";
+            cache.reserve(strs.size());
+
+            for (const auto& s : strs) {
+                StringInfo si;
+                si.address = s.start;
+                si.length = s.length;
+                si.type = static_cast<int>(s.type);
+
+                switch (s.type) {
+                    case AsciiString: si.type_name = "ascii"; break;
+                    case Utf16String: si.type_name = "utf16"; break;
+                    case Utf32String: si.type_name = "utf32"; break;
+                    default: si.type_name = "unknown"; break;
+                }
+
+                // Read string content from binary
+                DataBuffer buf = bv->ReadBuffer(s.start, s.length);
+                si.content = std::string(
+                    reinterpret_cast<const char*>(buf.GetData()),
+                    buf.GetLength()
+                );
+
+                cache.push_back(std::move(si));
             }
         })
-        .column_text("content", [](size_t i) -> std::string {
-            auto bv = get_bv();
-            if (!bv) return "";
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return "";
-            auto& s = strs[i];
-            // Read string content from binary
-            DataBuffer buf = bv->ReadBuffer(s.start, s.length);
-            return std::string(reinterpret_cast<const char*>(buf.GetData()), buf.GetLength());
+        .column_int64("address", [](const StringInfo& s) -> int64_t {
+            return static_cast<int64_t>(s.address);
+        })
+        .column_int("length", [](const StringInfo& s) -> int {
+            return static_cast<int>(s.length);
+        })
+        .column_int("type", [](const StringInfo& s) -> int {
+            return s.type;
+        })
+        .column_text("type_name", [](const StringInfo& s) -> std::string {
+            return s.type_name;
+        })
+        .column_text("content", [](const StringInfo& s) -> std::string {
+            return s.content;
+        })
+        // Index on address for efficient JOINs with xrefs.to_ea
+        .index_on("address", [](const StringInfo& s) -> int64_t {
+            return static_cast<int64_t>(s.address);
         })
         .build();
 }
@@ -956,7 +978,7 @@ struct TableRegistry {
     VTableDef segments;
     VTableDef names;
     VTableDef entries;
-    VTableDef strings;
+    CachedTableDef<StringInfo> strings;
     VTableDef comments;
     VTableDef db_info;
 
@@ -985,11 +1007,11 @@ struct TableRegistry {
         register_index_table(db, "segments", &segments);
         register_index_table(db, "names", &names);
         register_index_table(db, "entries", &entries);
-        register_index_table(db, "strings", &strings);
         register_index_table(db, "comments", &comments);
         register_index_table(db, "db_info", &db_info);
 
         // Cached tables
+        register_cached_table(db, "strings", &strings);
         register_cached_table(db, "xrefs", &xrefs);
         register_cached_table(db, "blocks", &blocks);
         register_cached_table(db, "imports", &imports);
