@@ -355,54 +355,76 @@ inline VTableDef define_entries() {
 // Compatible with idasql strings table (simplified)
 // ============================================================================
 
-inline VTableDef define_strings() {
-    return table("strings")
-        .count([]() {
+// ============================================================================
+// STRINGS Table - String literals in binary
+// Schema: address, length, type, type_name, content
+//
+// Cached for efficient JOINs with xrefs (e.g., string_refs view)
+// index_on("address") enables hash lookups when joining xrefs.to_ea
+// ============================================================================
+
+struct StringInfo {
+    uint64_t address;
+    size_t length;
+    int type;
+    std::string type_name;
+    std::string content;
+};
+
+inline CachedTableDef<StringInfo> define_strings() {
+    return cached_table<StringInfo>("strings")
+        .estimate_rows([]() -> size_t {
             auto bv = get_bv();
             return bv ? bv->GetStrings().size() : 0;
         })
-        .column_int64("address", [](size_t i) -> int64_t {
+        .cache_builder([](std::vector<StringInfo>& cache) {
             auto bv = get_bv();
-            if (!bv) return 0;
+            if (!bv) return;
+
             auto strs = bv->GetStrings();
-            if (i >= strs.size()) return 0;
-            return static_cast<int64_t>(strs[i].start);
-        })
-        .column_int("length", [](size_t i) -> int {
-            auto bv = get_bv();
-            if (!bv) return 0;
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return 0;
-            return static_cast<int>(strs[i].length);
-        })
-        .column_int("type", [](size_t i) -> int {
-            auto bv = get_bv();
-            if (!bv) return 0;
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return 0;
-            return static_cast<int>(strs[i].type);
-        })
-        .column_text("type_name", [](size_t i) -> std::string {
-            auto bv = get_bv();
-            if (!bv) return "";
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return "";
-            switch (strs[i].type) {
-                case AsciiString: return "ascii";
-                case Utf16String: return "utf16";
-                case Utf32String: return "utf32";
-                default: return "unknown";
+            cache.reserve(strs.size());
+
+            for (const auto& s : strs) {
+                StringInfo si;
+                si.address = s.start;
+                si.length = s.length;
+                si.type = static_cast<int>(s.type);
+
+                switch (s.type) {
+                    case AsciiString: si.type_name = "ascii"; break;
+                    case Utf16String: si.type_name = "utf16"; break;
+                    case Utf32String: si.type_name = "utf32"; break;
+                    default: si.type_name = "unknown"; break;
+                }
+
+                // Read string content from binary
+                DataBuffer buf = bv->ReadBuffer(s.start, s.length);
+                si.content = std::string(
+                    reinterpret_cast<const char*>(buf.GetData()),
+                    buf.GetLength()
+                );
+
+                cache.push_back(std::move(si));
             }
         })
-        .column_text("content", [](size_t i) -> std::string {
-            auto bv = get_bv();
-            if (!bv) return "";
-            auto strs = bv->GetStrings();
-            if (i >= strs.size()) return "";
-            auto& s = strs[i];
-            // Read string content from binary
-            DataBuffer buf = bv->ReadBuffer(s.start, s.length);
-            return std::string(reinterpret_cast<const char*>(buf.GetData()), buf.GetLength());
+        .column_int64("address", [](const StringInfo& s) -> int64_t {
+            return static_cast<int64_t>(s.address);
+        })
+        .column_int("length", [](const StringInfo& s) -> int {
+            return static_cast<int>(s.length);
+        })
+        .column_int("type", [](const StringInfo& s) -> int {
+            return s.type;
+        })
+        .column_text("type_name", [](const StringInfo& s) -> std::string {
+            return s.type_name;
+        })
+        .column_text("content", [](const StringInfo& s) -> std::string {
+            return s.content;
+        })
+        // Index on address for efficient JOINs with xrefs.to_ea
+        .index_on("address", [](const StringInfo& s) -> int64_t {
+            return static_cast<int64_t>(s.address);
         })
         .build();
 }
@@ -411,6 +433,9 @@ inline VTableDef define_strings() {
 // XREFS Table - Cross-references
 // Schema: from_ea, to_ea, from_func, type, is_code
 // from_func is pre-computed at load time for fast caller/callee queries
+//
+// Optimization: filter_eq("to_ea", ...) uses BN's GetCodeReferences(addr)
+// directly, bypassing cache for O(1) lookup. This is critical for JOINs.
 // ============================================================================
 
 struct XrefInfo {
@@ -419,6 +444,93 @@ struct XrefInfo {
     uint64_t from_func;  // Pre-computed: function containing from_ea (0 if none)
     int type;
     bool is_code;
+};
+
+/**
+ * Iterator for xrefs TO a specific address.
+ *
+ * Uses BN's GetCodeReferences(addr) directly instead of scanning a cache.
+ * This is O(1) in BN's internal xref database.
+ */
+class XrefsToIterator : public xsql::RowIterator {
+    Ref<BinaryView> bv_;
+    uint64_t target_;
+    std::vector<ReferenceSource> refs_;
+    size_t pos_ = 0;
+    bool started_ = false;
+
+    // Cached current row
+    XrefInfo current_;
+
+public:
+    explicit XrefsToIterator(int64_t target) : target_(static_cast<uint64_t>(target)) {
+        bv_ = get_bv();
+        if (bv_) {
+            refs_ = bv_->GetCodeReferences(target_);
+        }
+    }
+
+    bool next() override {
+        if (!started_) {
+            started_ = true;
+            pos_ = 0;
+        } else {
+            pos_++;
+        }
+
+        if (pos_ >= refs_.size()) {
+            return false;
+        }
+
+        // Build current row
+        const auto& ref = refs_[pos_];
+        current_.from_ea = ref.addr;
+        current_.to_ea = target_;
+        current_.type = 0;  // Code reference
+        current_.is_code = true;
+
+        // Compute from_func (containing function)
+        current_.from_func = 0;
+        if (bv_) {
+            auto funcs = bv_->GetAnalysisFunctionsContainingAddress(ref.addr);
+            if (!funcs.empty()) {
+                current_.from_func = funcs[0]->GetStart();
+            }
+        }
+
+        return true;
+    }
+
+    bool eof() const override {
+        return !started_ || pos_ >= refs_.size();
+    }
+
+    void column(sqlite3_context* ctx, int col) override {
+        switch (col) {
+            case 0: // from_ea
+                sqlite3_result_int64(ctx, static_cast<int64_t>(current_.from_ea));
+                break;
+            case 1: // to_ea
+                sqlite3_result_int64(ctx, static_cast<int64_t>(current_.to_ea));
+                break;
+            case 2: // from_func
+                sqlite3_result_int64(ctx, current_.from_func ? static_cast<int64_t>(current_.from_func) : 0);
+                break;
+            case 3: // type
+                sqlite3_result_int(ctx, current_.type);
+                break;
+            case 4: // is_code
+                sqlite3_result_int(ctx, current_.is_code ? 1 : 0);
+                break;
+            default:
+                sqlite3_result_null(ctx);
+                break;
+        }
+    }
+
+    int64_t rowid() const override {
+        return static_cast<int64_t>(pos_);
+    }
 };
 
 inline CachedTableDef<XrefInfo> define_xrefs() {
@@ -509,7 +621,12 @@ inline CachedTableDef<XrefInfo> define_xrefs() {
         .column_int("is_code", [](const XrefInfo& r) -> int {
             return r.is_code ? 1 : 0;
         })
-        // Indexes for fast lookups in JOINs
+        // Direct source filter: bypass cache and query BN API directly
+        // Cost 0.5 ensures this is preferred over index_on (cost 1.0)
+        .filter_eq("to_ea", [](int64_t target) -> std::unique_ptr<xsql::RowIterator> {
+            return std::make_unique<XrefsToIterator>(target);
+        }, 0.5, 5.0)  // cost=0.5, estimated_rows=5
+        // Indexes for full-scan JOINs (fallback when filter_eq not applicable)
         .index_on("to_ea", [](const XrefInfo& r) -> int64_t {
             return static_cast<int64_t>(r.to_ea);
         })
@@ -861,7 +978,7 @@ struct TableRegistry {
     VTableDef segments;
     VTableDef names;
     VTableDef entries;
-    VTableDef strings;
+    CachedTableDef<StringInfo> strings;
     VTableDef comments;
     VTableDef db_info;
 
@@ -890,11 +1007,11 @@ struct TableRegistry {
         register_index_table(db, "segments", &segments);
         register_index_table(db, "names", &names);
         register_index_table(db, "entries", &entries);
-        register_index_table(db, "strings", &strings);
         register_index_table(db, "comments", &comments);
         register_index_table(db, "db_info", &db_info);
 
         // Cached tables
+        register_cached_table(db, "strings", &strings);
         register_cached_table(db, "xrefs", &xrefs);
         register_cached_table(db, "blocks", &blocks);
         register_cached_table(db, "imports", &imports);

@@ -1,5 +1,5 @@
 // Auto-generated from bnsql_agent.md
-// Generated: 2026-01-31T11:09:53.578027
+// Generated: 2026-01-31T17:14:45.219595
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -34,12 +34,13 @@ A comprehensive reference for AI agents to effectively use BNSQL - an SQL interf
 
 **ALWAYS follow these rules to avoid slow queries:**
 
-1. **Xref counting MUST use CTEs** - NEVER do `JOIN xrefs` directly with funcs:
+1. **JOINs on xrefs.to_ea are optimized** - Direct equality lookups are fast:
    ```sql
-   -- WRONG (extremely slow - minutes):
-   SELECT f.name, COUNT(*) FROM funcs f JOIN xrefs x ON f.address = x.to_ea GROUP BY f.address;
+   -- FAST: Uses direct BN API lookup (GetCodeReferences)
+   SELECT f.name, x.from_ea FROM funcs f
+   JOIN xrefs x ON x.to_ea = f.address WHERE f.name LIKE 'curl%';
 
-   -- CORRECT (fast - milliseconds):
+   -- For bulk aggregation (GROUP BY all), CTEs are still efficient:
    WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs WHERE is_code=1 GROUP BY to_ea)
    SELECT f.name, c.n FROM funcs f JOIN counts c ON f.address = c.to_ea ORDER BY n DESC;
    ```
@@ -484,12 +485,12 @@ Local variables from decompiled functions. **Filter by `func_addr`.**
 | `name` | TEXT | Variable name |
 | `type` | TEXT | Variable type |
 | `size` | INT | Size in bytes |
-| `is_arg` | INT | 1 if function argument |
-| `storage` | TEXT | "stack" or "register" |
+| `is_arg` | INT | 1 if function argument |)PROMPT"
+    R"PROMPT(| `storage` | TEXT | "stack" or "register" |
 | `stack_off` | INT | Stack offset (if stack) |
 
-```sql)PROMPT"
-    R"PROMPT(-- Variables in a function
+```sql
+-- Variables in a function
 SELECT name, type, storage FROM hlil_vars WHERE func_addr = 0x401000;
 
 -- Find functions with "buffer" variables
@@ -655,9 +656,10 @@ This is **much faster** than scanning all disassembly lines because:
 ### Find Most Called Functions
 
 ```sql
+-- Direct JOIN is now efficient (uses filter_eq with GetCodeReferences)
 SELECT f.name, COUNT(*) as callers
 FROM funcs f
-JOIN xrefs x ON f.address = x.to_ea
+JOIN xrefs x ON x.to_ea = f.address
 WHERE x.is_code = 1
 GROUP BY f.address
 ORDER BY callers DESC
@@ -744,6 +746,67 @@ WHERE name LIKE '%socket%'
    OR name LIKE '%recv%'
    OR name LIKE '%WSA%'
    OR name LIKE '%Http%';
+```
+
+---
+
+## Complex Analysis Patterns
+
+### Bridge Functions (High Connectivity)
+Functions that act as bridges between subsystems - called by many and calling many:
+
+```sql
+WITH caller_counts AS (
+    SELECT to_ea as func_addr, COUNT(DISTINCT from_func) as caller_cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0 GROUP BY to_ea
+),
+callee_counts AS (
+    SELECT from_func as func_addr, COUNT(DISTINCT to_ea) as callee_cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0 GROUP BY from_func
+)
+SELECT f.name, COALESCE(cr.caller_cnt, 0) as callers, COALESCE(ce.callee_cnt, 0) as callees
+FROM funcs f
+LEFT JOIN caller_counts cr ON cr.func_addr = f.address
+LEFT JOIN callee_counts ce ON ce.func_addr = f.address
+WHERE COALESCE(cr.caller_cnt, 0) >= 5 AND COALESCE(ce.callee_cnt, 0) >= 5
+ORDER BY (cr.caller_cnt * ce.callee_cnt) DESC LIMIT 20;
+```
+
+### Error Handler Detection
+Functions with many callers that reference error-related strings:
+
+```sql
+-- Find error strings first (fast)
+SELECT COUNT(*) FROM strings
+WHERE content LIKE '%error%' OR content LIKE '%fail%' OR content LIKE '%invalid%';
+
+-- Find functions referencing them
+-- NOTE: string_refs can be slow on large binaries (strings table not cached)
+-- For faster results, limit to specific string patterns:
+SELECT func_name, COUNT(*) as error_strings
+FROM string_refs
+WHERE string_value LIKE '%error%' OR string_value LIKE '%fail%'
+GROUP BY func_addr
+ORDER BY error_strings DESC LIMIT 15;
+```
+
+### Chokepoint Functions (Hook Targets)
+Functions that dominate paths to output operations:
+
+```sql
+WITH write_funcs AS (
+    SELECT address FROM imports
+    WHERE name LIKE '%write%' OR name LIKE '%send%' OR name LIKE '%fwrite%'
+),
+caller_coverage AS (
+    SELECT x.from_func as func_addr, COUNT(DISTINCT x.to_ea) as write_targets
+    FROM xrefs x
+    WHERE x.to_ea IN (SELECT address FROM write_funcs) AND x.from_func != 0
+    GROUP BY x.from_func
+)
+SELECT f.name, cc.write_targets
+FROM caller_coverage cc JOIN funcs f ON f.address = cc.func_addr
+ORDER BY cc.write_targets DESC LIMIT 10;
 ```
 
 ---
@@ -912,8 +975,8 @@ SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.a
 ---
 
 ## Server Modes
-
-BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
+)PROMPT"
+    R"PROMPT(BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
 
 ---
 
@@ -1000,8 +1063,8 @@ import socket, struct, json
 
 def bnsql_query(sql, host="localhost", port=13337, token=None):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port)))PROMPT"
-    R"PROMPT(    req = {"sql": sql}
+    s.connect((host, port))
+    req = {"sql": sql}
     if token: req["token"] = token
     payload = json.dumps(req).encode()
     s.sendall(struct.pack(">I", len(payload)) + payload)
@@ -1130,10 +1193,10 @@ int64_t sub_401000(int64_t arg1) {
 
 ## CRITICAL REMINDERS (Read Before Every Query)
 
-- **Xref counting → ALWAYS use CTE first:** `WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs WHERE is_code=1 GROUP BY to_ea) SELECT ...`
-- **Never JOIN funcs directly to xrefs** - pre-aggregate xrefs in a CTE first
-- **Call graph analysis → Use `callers`/`callees` views** - NOT `func_start()` on xrefs
+- **JOINs on xrefs.to_ea are fast:** `JOIN xrefs x ON x.to_ea = f.address` uses direct BN API (GetCodeReferences)
+- **Xref GROUP BY → Use CTE for efficiency:** `WITH counts AS (SELECT to_ea, COUNT(*) as n FROM xrefs WHERE is_code=1 GROUP BY to_ea) SELECT ...`
 - **NEVER use `func_start()`/`func_at()` in bulk xref queries** - each call = 1 API request = minutes of waiting
+- **Call graph analysis → Use `from_func` column or `callers`/`callees` views** - NOT `func_start()` on xrefs
 - **Decompiler tables → ALWAYS filter by func_addr** - unbounded = hang
 - **Instructions table → ALWAYS filter by func_addr** - unbounded = extremely slow
 - **Use `decompile(addr)` for pseudocode** - not raw tables
@@ -1143,9 +1206,10 @@ int64_t sub_401000(int64_t arg1) {
 
 | Task | SLOW (avoid) | FAST (use this) |
 |------|--------------|-----------------|
+| Find callers of function X | N/A | `xrefs WHERE to_ea = X` (uses direct API) |
 | Count callers per function | `func_start(from_ea)` on xrefs | `SELECT to_ea, COUNT(*) FROM xrefs WHERE is_code=1 GROUP BY to_ea` |
 | Count callees per function | `callees` view (has joins) | `SELECT from_func, COUNT(DISTINCT to_ea) FROM xrefs WHERE is_code=1 GROUP BY from_func` |
-| Find who calls X | OK: `xrefs WHERE to_ea = X` | OK for single lookups |
+| JOIN funcs with xref callers | N/A | `JOIN xrefs x ON x.to_ea = f.address` (uses direct API per function) |
 | Find what X calls | `callees WHERE func_addr = X` | `xrefs WHERE from_func = X AND is_code = 1` |
 | Bulk call graph analysis | `callees`/`callers` views | Use `xrefs` with `from_func` directly |
 | Get names at the end | Join `funcs` in every CTE | Join `funcs` only in final SELECT |
