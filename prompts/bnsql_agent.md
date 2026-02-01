@@ -741,6 +741,77 @@ WHERE name LIKE '%socket%'
 
 ---
 
+## Complex Analysis Patterns
+
+### Bridge Functions (High Connectivity)
+Functions that act as bridges between subsystems - called by many and calling many:
+
+```sql
+WITH caller_counts AS (
+    SELECT to_ea as func_addr, COUNT(DISTINCT from_func) as caller_cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0 GROUP BY to_ea
+),
+callee_counts AS (
+    SELECT from_func as func_addr, COUNT(DISTINCT to_ea) as callee_cnt
+    FROM xrefs WHERE is_code = 1 AND from_func != 0 GROUP BY from_func
+)
+SELECT f.name, COALESCE(cr.caller_cnt, 0) as callers, COALESCE(ce.callee_cnt, 0) as callees
+FROM funcs f
+LEFT JOIN caller_counts cr ON cr.func_addr = f.address
+LEFT JOIN callee_counts ce ON ce.func_addr = f.address
+WHERE COALESCE(cr.caller_cnt, 0) >= 5 AND COALESCE(ce.callee_cnt, 0) >= 5
+ORDER BY (cr.caller_cnt * ce.callee_cnt) DESC LIMIT 20;
+```
+
+### Error Handler Detection
+Functions with many callers that reference error-related strings:
+
+```sql
+-- Optimized pattern: pre-filter strings, then use EXISTS on cached xrefs
+-- (Avoid string_refs view which iterates all strings)
+WITH error_addrs AS (
+    SELECT address FROM strings
+    WHERE content LIKE '%error%' OR content LIKE '%fail%' OR content LIKE '%invalid%'
+),
+funcs_with_errors AS (
+    SELECT DISTINCT x.from_func as func_addr
+    FROM xrefs x
+    WHERE x.from_func != 0
+      AND EXISTS (SELECT 1 FROM error_addrs e WHERE e.address = x.to_ea)
+),
+caller_counts AS (
+    SELECT to_ea as func_addr, COUNT(*) as caller_cnt
+    FROM xrefs WHERE is_code = 1 GROUP BY to_ea
+)
+SELECT f.name, COALESCE(cr.caller_cnt, 0) as callers
+FROM funcs_with_errors fwe
+JOIN funcs f ON f.address = fwe.func_addr
+LEFT JOIN caller_counts cr ON cr.func_addr = f.address
+WHERE COALESCE(cr.caller_cnt, 0) >= 5
+ORDER BY cr.caller_cnt DESC LIMIT 15;
+```
+
+### Chokepoint Functions (Hook Targets)
+Functions that dominate paths to output operations:
+
+```sql
+WITH write_funcs AS (
+    SELECT address FROM imports
+    WHERE name LIKE '%write%' OR name LIKE '%send%' OR name LIKE '%fwrite%'
+),
+caller_coverage AS (
+    SELECT x.from_func as func_addr, COUNT(DISTINCT x.to_ea) as write_targets
+    FROM xrefs x
+    WHERE x.to_ea IN (SELECT address FROM write_funcs) AND x.from_func != 0
+    GROUP BY x.from_func
+)
+SELECT f.name, cc.write_targets
+FROM caller_coverage cc JOIN funcs f ON f.address = cc.func_addr
+ORDER BY cc.write_targets DESC LIMIT 10;
+```
+
+---
+
 ## Hex Address Formatting
 
 Binary Ninja uses integer addresses. For display, use `hex()`:
