@@ -16,20 +16,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build (${{ matrix.os }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: Linux
-            runner: ubuntu-latest
-          - os: macOS
-            runner: macos-latest
-          - os: Windows
-            runner: windows-latest
-
+  # ============================================================================
+  # Build (CLI + Plugin)
+  # ============================================================================
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,68 +29,145 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        shell: bash
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
 
       - name: Build
-        shell: bash
         run: cmake --build build --config Release
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p dist/bin
-          cp build/bin/bnsql dist/bin/ 2>/dev/null || true
-          cp build/bin/libbinaryninjacore.so.1 dist/bin/ 2>/dev/null || true
-          ls -laR dist/
-
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          mkdir -p dist/bin
-          cp build/bin/bnsql dist/bin/ 2>/dev/null || true
-          cp build/bin/libbinaryninjacore.dylib dist/bin/ 2>/dev/null || true
-          ls -laR dist/
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p dist/bin
-          cp build/bin/Release/bnsql.exe dist/bin/ 2>/dev/null || true
-          cp build/bin/Release/binaryninjacore.dll dist/bin/ 2>/dev/null || true
-          ls -laR dist/
-
-      - name: Upload artifact
+      - name: Upload plugin
         uses: actions/upload-artifact@v4
         with:
-          name: bnsql-${{ matrix.os }}
-          path: dist/
-          if-no-files-found: warn
+          name: plugin-linux
+          path: build/lib/bnsql.so
 
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux
+          path: build/bin/bnsql
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-macos
+          path: build/lib/bnsql.dylib
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-macos
+          path: build/bin/bnsql
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -B build -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-windows
+          path: build/lib/Release/bnsql.dll
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-windows
+          path: build/bin/Release/bnsql.exe
+
+  # ============================================================================
+  # Release
+  # ============================================================================
   publish-release:
     name: Publish Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build]
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download plugins
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          pattern: plugin-*
+          path: plugins
+          merge-multiple: true
 
-      - name: Package release
+      - name: Download CLI (Linux)
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux
+          path: cli-linux
+
+      - name: Download CLI (macOS)
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-macos
+          path: cli-macos
+
+      - name: Download CLI (Windows)
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-windows
+          path: cli-windows
+
+      - name: Prepare release
         run: |
-          cd artifacts
-          zip -r ../bnsql-linux.zip bnsql-Linux/ 2>/dev/null || true
-          zip -r ../bnsql-macos.zip bnsql-macOS/ 2>/dev/null || true
-          zip -r ../bnsql-windows.zip bnsql-Windows/ 2>/dev/null || true
+          mkdir -p release/plugin
+          mkdir -p release/cli/{windows,linux,macos}
+          # Plugin (flat directory)
+          cp plugins/bnsql.dll release/plugin/ || true
+          cp plugins/bnsql.so release/plugin/ || true
+          cp plugins/bnsql.dylib release/plugin/ || true
+          # CLI (organized by platform)
+          cp cli-windows/bnsql.exe release/cli/windows/ || true
+          cp cli-linux/bnsql release/cli/linux/ || true
+          cp cli-macos/bnsql release/cli/macos/ || true
+          echo "=== Plugin ===" && ls -la release/plugin/
+          echo "=== CLI ===" && ls -laR release/cli/
+
+      - name: Create plugin zip
+        run: |
+          cd release/plugin
+          zip -9 ../bnsql_plugin-${{ github.ref_name }}.zip *
+
+      - name: Create CLI zip
+        run: |
+          cd release/cli
+          zip -r9 ../bnsql_cli-${{ github.ref_name }}.zip windows linux macos
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            bnsql-linux.zip
-            bnsql-macos.zip
-            bnsql-windows.zip
+          tag_name: ${{ github.ref_name }}
+          name: BNSQL ${{ github.ref_name }}
           generate_release_notes: true
+          files: |
+            release/bnsql_plugin-${{ github.ref_name }}.zip
+            release/bnsql_cli-${{ github.ref_name }}.zip
