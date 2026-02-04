@@ -30,32 +30,27 @@ MCPQueueResult MCPServer::queue_and_wait(MCPPendingCommand::Type type, const std
         return {false, "Error: MCP server is not running"};
     }
 
-    MCPPendingCommand cmd;
-    cmd.type = type;
-    cmd.input = input;
-    cmd.completed = false;
-
-    std::mutex done_mutex;
-    std::condition_variable done_cv;
-    cmd.done_mutex = &done_mutex;
-    cmd.done_cv = &done_cv;
+    auto cmd = std::make_shared<MCPPendingCommand>();
+    cmd->type = type;
+    cmd->input = input;
+    cmd->completed = false;
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
-        pending_commands_.push(&cmd);
+        pending_commands_.push(cmd);
     }
     queue_cv_.notify_one();
 
     {
-        std::unique_lock<std::mutex> lock(done_mutex);
-        done_cv.wait(lock, [&]() { return cmd.completed || !running_.load(); });
+        std::unique_lock<std::mutex> lock(cmd->done_mutex);
+        cmd->done_cv.wait(lock, [&]() { return cmd->completed || !running_.load(); });
     }
 
-    if (!cmd.completed) {
+    if (!cmd->completed) {
         return {false, "Error: MCP server stopped"};
     }
 
-    return {true, cmd.result};
+    return {true, cmd->result};
 }
 
 int MCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
@@ -215,7 +210,7 @@ void MCPServer::wait() {
             break;
         }
 
-        MCPPendingCommand* cmd = nullptr;
+        std::shared_ptr<MCPPendingCommand> cmd;
 
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
@@ -241,13 +236,11 @@ void MCPServer::wait() {
                 cmd->result = std::string("Error: ") + e.what();
             }
 
-            if (cmd->done_mutex && cmd->done_cv) {
-                {
-                    std::lock_guard<std::mutex> lock(*cmd->done_mutex);
-                    cmd->completed = true;
-                }
-                cmd->done_cv->notify_one();
+            {
+                std::lock_guard<std::mutex> lock(cmd->done_mutex);
+                cmd->completed = true;
             }
+            cmd->done_cv.notify_one();
         }
     }
 }
@@ -263,27 +256,25 @@ void MCPServer::stop() {
 }
 
 void MCPServer::complete_pending_commands(const std::string& result) {
-    std::queue<MCPPendingCommand*> pending;
+    std::queue<std::shared_ptr<MCPPendingCommand>> pending;
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         std::swap(pending, pending_commands_);
     }
 
     while (!pending.empty()) {
-        MCPPendingCommand* cmd = pending.front();
+        auto cmd = pending.front();
         pending.pop();
-        if (!cmd || !cmd->done_mutex || !cmd->done_cv) {
-            continue;
-        }
+        if (!cmd) continue;
 
         {
-            std::lock_guard<std::mutex> lock(*cmd->done_mutex);
+            std::lock_guard<std::mutex> lock(cmd->done_mutex);
             if (!cmd->completed) {
                 cmd->result = result;
                 cmd->completed = true;
             }
         }
-        cmd->done_cv->notify_one();
+        cmd->done_cv.notify_one();
     }
 }
 

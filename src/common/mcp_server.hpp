@@ -23,8 +23,8 @@ struct MCPPendingCommand {
     std::string input;
     std::string result;
     bool completed = false;
-    std::mutex* done_mutex = nullptr;
-    std::condition_variable* done_cv = nullptr;
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
 };
 
 struct MCPQueueResult {
@@ -77,7 +77,7 @@ private:
     // Command queue for cross-thread execution
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
-    std::queue<MCPPendingCommand*> pending_commands_;
+    std::queue<std::shared_ptr<MCPPendingCommand>> pending_commands_;
 
     // Callbacks stored for main thread execution
     QueryCallback query_cb_;

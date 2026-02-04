@@ -61,7 +61,7 @@ add_subdirectory(${BN_API_PATH} ${CMAKE_CURRENT_BINARY_DIR}/binaryninja-api)
 # HTTP Server Support (optional, uses cpp-httplib via libxsql thinclient)
 # ============================================================================
 
-option(BNSQL_WITH_HTTP "Build with HTTP REST server support" OFF)
+option(BNSQL_WITH_HTTP "Build with HTTP REST server support" ON)
 
 if(BNSQL_WITH_HTTP)
     message(STATUS "bnsql: Building with HTTP server support")
@@ -103,7 +103,7 @@ target_link_libraries(bnsql INTERFACE
 # bnsql plugin (Binary Ninja plugin)
 # ============================================================================
 
-option(BNSQL_BUILD_PLUGIN "Build bnsql Binary Ninja plugin" OFF)
+option(BNSQL_BUILD_PLUGIN "Build bnsql Binary Ninja plugin" ON)
 
 if(BNSQL_BUILD_PLUGIN)
     add_library(bnsql_plugin SHARED
@@ -113,6 +113,16 @@ if(BNSQL_BUILD_PLUGIN)
     target_link_libraries(bnsql_plugin PRIVATE
         bnsql::bnsql
     )
+
+    # Include common headers (for bnsql_http_routes.hpp, etc.)
+    target_include_directories(bnsql_plugin PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    )
+
+    # Add HTTP server support to plugin
+    if(BNSQL_WITH_HTTP)
+        target_compile_definitions(bnsql_plugin PRIVATE BNSQL_HAS_HTTP)
+    endif()
 
     # Set plugin output name
     set_target_properties(bnsql_plugin PROPERTIES
@@ -176,11 +186,15 @@ if(BNSQL_BUILD_CLI)
         bnsql::bnsql
     )
 
+    # Common headers (bnsql_commands.hpp, bnsql_http_routes.hpp, etc.)
+    target_include_directories(bnsql-cli PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    )
+
     # Add AI agent support
     if(BNSQL_WITH_AI_AGENT)
         add_dependencies(bnsql-cli bnsql_prompt_header)
         target_include_directories(bnsql-cli PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/common
             ${CMAKE_CURRENT_SOURCE_DIR}/external/libagents/include
             ${CMAKE_CURRENT_SOURCE_DIR}/external/libagents/external/fastmcpp/include
         )
@@ -211,7 +225,7 @@ endif()
 # Examples
 # ============================================================================
 
-option(BNSQL_BUILD_EXAMPLES "Build bnsql library examples" OFF)
+option(BNSQL_BUILD_EXAMPLES "Build bnsql library examples" ON)
 
 if(BNSQL_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/examples/CMakeLists.txt")
     add_subdirectory(examples)
