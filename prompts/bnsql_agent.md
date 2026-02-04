@@ -975,6 +975,24 @@ SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.a
 
 ---
 
+## REPL Commands
+
+When running in interactive mode (`bnsql database.bndb -i`), these dot-commands are available:
+
+| Command | Description |
+|---------|-------------|
+| `.tables` | List all virtual tables |
+| `.schema [table]` | Show table schema |
+| `.info` | Show database metadata |
+| `.quit` / `.exit` | Exit REPL |
+| `.help` | Show available commands |
+| `.http start` | Start HTTP server on random port |
+| `.http stop` | Stop HTTP server |
+| `.http status` | Show HTTP server status |
+| `.agent` | Start AI agent mode |
+
+---
+
 ## Server Modes
 
 BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.

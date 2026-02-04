@@ -30,6 +30,13 @@ struct CommandCallbacks {
     std::function<std::string(const std::string&)> get_schema;  // Return schema for table
     std::function<std::string()> get_info;        // Return database info
     std::function<std::string()> clear_session;   // Clear/reset session (agent, UI, etc.)
+
+#ifdef BNSQL_HAS_HTTP
+    // HTTP server callbacks (optional)
+    std::function<std::string()> http_status;     // Get HTTP server status
+    std::function<std::string()> http_start;      // Start HTTP server
+    std::function<std::string()> http_stop;       // Stop HTTP server
+#endif
 };
 
 /**
@@ -84,6 +91,14 @@ inline CommandResult handle_command(
                  "  .clear          Clear/reset session\n"
                  "  .quit / .exit   Exit\n"
                  "  .help           Show this help\n"
+#ifdef BNSQL_HAS_HTTP
+                 "\n"
+                 "HTTP Server:\n"
+                 "  .http           Show status or start if not running\n"
+                 "  .http start     Start HTTP server\n"
+                 "  .http stop      Stop HTTP server\n"
+                 "  .http help      Show HTTP help\n"
+#endif
                  "\n"
                  "SQL:\n"
                  "  SELECT * FROM funcs LIMIT 10;\n"
@@ -102,6 +117,62 @@ inline CommandResult handle_command(
                  "  What imports does this binary use?\n"
 #endif
                  ;
+        return CommandResult::HANDLED;
+    }
+
+    // .http commands (HTTP server control)
+    if (input.rfind(".http", 0) == 0) {
+#ifdef BNSQL_HAS_HTTP
+        std::string subargs = input.length() > 5 ? input.substr(5) : "";
+        // Trim leading whitespace
+        size_t start = subargs.find_first_not_of(" \t");
+        if (start != std::string::npos)
+            subargs = subargs.substr(start);
+
+        if (subargs.empty()) {
+            // .http - show status, start if not running
+            if (callbacks.http_status) {
+                output = callbacks.http_status();
+            } else {
+                output = "HTTP server not available";
+            }
+        }
+        else if (subargs == "start") {
+            if (callbacks.http_start) {
+                output = callbacks.http_start();
+            } else {
+                output = "HTTP server not available";
+            }
+        }
+        else if (subargs == "stop") {
+            if (callbacks.http_stop) {
+                output = callbacks.http_stop();
+            } else {
+                output = "HTTP server not available";
+            }
+        }
+        else if (subargs == "help") {
+            output = "HTTP Server Commands:\n"
+                     "  .http            Show status, start if not running\n"
+                     "  .http start      Start HTTP server on random port\n"
+                     "  .http stop       Stop HTTP server\n"
+                     "  .http help       Show this help\n"
+                     "\n"
+                     "Endpoints:\n"
+                     "  GET  /help       API documentation\n"
+                     "  POST /query      Execute SQL (body = raw SQL)\n"
+                     "  GET  /status     Health check\n"
+                     "  POST /shutdown   Stop server\n"
+                     "\n"
+                     "Example:\n"
+                     "  curl -X POST http://127.0.0.1:<port>/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
+        }
+        else {
+            output = "Unknown HTTP command: " + subargs + "\nUse '.http help' for available commands.";
+        }
+#else
+        output = "HTTP server not compiled in. Rebuild with -DBNSQL_WITH_HTTP=ON";
+#endif
         return CommandResult::HANDLED;
     }
 

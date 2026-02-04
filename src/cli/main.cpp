@@ -31,14 +31,16 @@
 #include <xsql/socket/server.hpp>
 #include "binaryninjaapi.h"
 
+#include "bnsql_commands.hpp"
+
 #ifdef BNSQL_HAS_AI_AGENT
 #include "ai_agent.hpp"
-#include "bnsql_commands.hpp"
 #include "mcp_server.hpp"
 #endif
 
 #ifdef BNSQL_HAS_HTTP
 #include <xsql/thinclient/server.hpp>
+#include "bnsql_http_routes.hpp"
 #endif
 
 #include <iostream>
@@ -232,12 +234,20 @@ static std::string remote_result_to_string(const xsql::socket::RemoteResult& qr)
     return ss.str();
 }
 
+// Global quit flag for signal-driven shutdown (MCP standalone, HTTP REPL, etc.)
+static std::atomic<bool> g_quit_requested{false};
+
+static void quit_signal_handler(int) {
+    g_quit_requested.store(true);
+}
+
 #ifdef BNSQL_HAS_AI_AGENT
 // Forward declarations for signal handling - shared by run_remote_agent and run_agent
 static bnsql::AIAgent* g_agent = nullptr;
 
 static void signal_handler(int sig) {
     (void)sig;
+    g_quit_requested.store(true);
     if (g_agent) {
         g_agent->request_quit();
     }
@@ -379,6 +389,7 @@ static void server_signal_handler(int) {
 
 #ifdef BNSQL_HAS_HTTP
 static xsql::thinclient::server* g_http_server = nullptr;
+static std::unique_ptr<xsql::thinclient::server> g_repl_http_server;
 
 static void http_signal_handler(int) {
     if (g_http_server) {
@@ -386,120 +397,59 @@ static void http_signal_handler(int) {
     }
 }
 
-// JSON escape helper
-static std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 10);
-    for (char ch : s) {
-        switch (ch) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(ch) < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
-                    out += buf;
-                } else {
-                    out += ch;
-                }
+// Wire HTTP callbacks for .http REPL command
+static void setup_http_callbacks(bnsql::CommandCallbacks& callbacks, bnsql::QueryEngine& qe) {
+    callbacks.http_start = [&qe]() -> std::string {
+        if (g_repl_http_server && g_repl_http_server->is_running()) {
+            return "HTTP server already running on port " + std::to_string(g_repl_http_server->port());
         }
-    }
-    return out;
+
+        xsql::thinclient::server_config cfg;
+        cfg.port = 0;  // Random port
+        cfg.bind_address = "127.0.0.1";
+        cfg.setup_routes = [&qe](httplib::Server& svr) {
+            bnsql::setup_http_routes(svr,
+                [&qe](const std::string& sql) { return qe.query(sql); },
+                "", 0);
+        };
+
+        g_repl_http_server = std::make_unique<xsql::thinclient::server>(cfg);
+        g_repl_http_server->run_async();
+
+        if (!g_repl_http_server->is_running()) {
+            g_repl_http_server.reset();
+            return "Failed to start HTTP server";
+        }
+
+        int port = g_repl_http_server->port();
+        return "HTTP server started on port " + std::to_string(port) + "\n"
+               "  curl http://127.0.0.1:" + std::to_string(port) + "/help\n"
+               "  curl -X POST http://127.0.0.1:" + std::to_string(port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"";
+    };
+
+    callbacks.http_stop = []() -> std::string {
+        if (!g_repl_http_server || !g_repl_http_server->is_running()) {
+            return "HTTP server is not running";
+        }
+        int port = g_repl_http_server->port();
+        g_repl_http_server->stop();
+        g_repl_http_server.reset();
+        return "HTTP server stopped (was on port " + std::to_string(port) + ")";
+    };
+
+    callbacks.http_status = [&callbacks]() -> std::string {
+        if (g_repl_http_server && g_repl_http_server->is_running()) {
+            int port = g_repl_http_server->port();
+            return "HTTP server is RUNNING on port " + std::to_string(port) + "\n"
+                   "  curl http://127.0.0.1:" + std::to_string(port) + "/help";
+        }
+        // Auto-start if not running
+        if (callbacks.http_start) {
+            return callbacks.http_start();
+        }
+        return "HTTP server is STOPPED";
+    };
 }
-
-// Build JSON response from query result
-static std::string query_result_to_json(const bnsql::QueryResult& result) {
-    std::ostringstream json;
-    json << "{";
-    json << "\"success\":" << (result.success ? "true" : "false");
-
-    if (result.success) {
-        json << ",\"columns\":[";
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            if (i > 0) json << ",";
-            json << "\"" << json_escape(result.columns[i]) << "\"";
-        }
-        json << "]";
-
-        json << ",\"rows\":[";
-        size_t row_idx = 0;
-        for (const auto& row : result) {
-            if (row_idx++ > 0) json << ",";
-            json << "[";
-            for (size_t c = 0; c < row.values.size(); c++) {
-                if (c > 0) json << ",";
-                json << "\"" << json_escape(row.values[c]) << "\"";
-            }
-            json << "]";
-        }
-        json << "]";
-        json << ",\"row_count\":" << result.rows.size();
-    } else {
-        json << ",\"error\":\"" << json_escape(result.error) << "\"";
-    }
-
-    json << "}";
-    return json.str();
-}
-
-static const char* BNSQL_HELP_TEXT = R"(BNSQL HTTP REST API
-===================
-
-SQL interface for Binary Ninja databases via HTTP.
-
-Endpoints:
-  GET  /         - Welcome message
-  GET  /help     - This documentation (for LLM discovery)
-  POST /query    - Execute SQL (body = raw SQL, response = JSON)
-  GET  /status   - Server health and function count
-  GET  /health   - Alias for /status
-  POST /shutdown - Stop server
-
-Tables:
-  funcs          - Functions (address, name, size)
-  strings        - String literals (address, content, length)
-  imports        - Imported functions (address, name, module)
-  xrefs          - Cross-references (from_ea, to_ea, is_code)
-  segments       - Memory segments (start_ea, end_ea, name, perm)
-  blocks         - Basic blocks (func_ea, start_ea, end_ea)
-  instructions   - Instructions (address, func_addr, mnemonic, disasm)
-  comments       - Address comments
-  names          - Named locations
-  entries        - Entry points and exports
-  db_info        - Database metadata
-  pseudocode     - Decompiled code lines (filter by func_addr!)
-  hlil_vars      - HLIL variables (filter by func_addr!)
-  hlil_calls     - HLIL function calls (filter by func_addr!)
-
-SQL Functions:
-  hex(addr)           - Format address as hex
-  disasm(addr)        - Disassembly at address
-  decompile(addr)     - Full pseudocode for function
-  func_at(addr)       - Function name at address
-  xrefs_to(addr)      - JSON array of xrefs to address
-  xrefs_from(addr)    - JSON array of xrefs from address
-
-Example Queries:
-  SELECT name, hex(address), size FROM funcs ORDER BY size DESC LIMIT 10;
-  SELECT content FROM strings WHERE content LIKE '%password%';
-  SELECT module, COUNT(*) FROM imports GROUP BY module;
-  SELECT decompile(address) FROM funcs WHERE name = 'main';
-
-Response Format:
-  Success: {"success": true, "columns": [...], "rows": [[...]], "row_count": N}
-  Error:   {"success": false, "error": "message"}
-
-Authentication (if enabled):
-  Header: Authorization: Bearer <token>
-  Or:     X-XSQL-Token: <token>
-
-Example:
-  curl http://localhost:8081/help
-  curl -X POST http://localhost:8081/query -d "SELECT name FROM funcs LIMIT 5"
-)";
 
 static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bind_addr, const std::string& auth_token) {
     xsql::thinclient::server_config cfg;
@@ -508,7 +458,6 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
     if (!auth_token.empty()) {
         cfg.auth_token = auth_token;
     }
-    // Allow non-loopback binds if explicitly requested (with warning)
     if (!bind_addr.empty() && bind_addr != "127.0.0.1" && bind_addr != "localhost") {
         cfg.allow_insecure_no_auth = auth_token.empty();
         std::cerr << "WARNING: Binding to non-loopback address " << bind_addr << "\n";
@@ -518,144 +467,15 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
         }
     }
 
-    // Mutex for query serialization (thread-safe)
-    std::mutex query_mutex;
-
-    // Set up all routes - this is where BNSQL defines its HTTP API
-    cfg.setup_routes = [&qe, &auth_token, &query_mutex, port](httplib::Server& svr) {
-        // GET / - Welcome message
-        svr.Get("/", [port](const httplib::Request&, httplib::Response& res) {
-            std::string welcome = "BNSQL HTTP Server\n\n"
-                "Endpoints:\n"
-                "  GET  /help     - API documentation\n"
-                "  POST /query    - Execute SQL query\n"
-                "  GET  /status   - Health check\n"
-                "  POST /shutdown - Stop server\n\n"
-                "Example:\n"
-                "  curl http://localhost:" + std::to_string(port) + "/help\n"
-                "  curl -X POST http://localhost:" + std::to_string(port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
-            res.set_content(welcome, "text/plain");
-        });
-
-        // GET /help - API documentation (public, no auth required)
-        svr.Get("/help", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(BNSQL_HELP_TEXT, "text/plain");
-        });
-
-        // POST /query - Execute SQL
-        svr.Post("/query", [&qe, &auth_token, &query_mutex](const httplib::Request& req, httplib::Response& res) {
-            // Check auth if configured
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) {
-                    token = req.get_header_value("X-XSQL-Token");
-                } else if (req.has_header("Authorization")) {
-                    const std::string auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) {
-                        token = auth.substr(7);
-                    }
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-
-            std::string sql = req.body;
-            if (sql.empty()) {
-                res.status = 400;
-                res.set_content("{\"success\":false,\"error\":\"Empty query\"}", "application/json");
-                return;
-            }
-
-            // Serialize queries
-            std::lock_guard<std::mutex> lock(query_mutex);
-            auto result = qe.query(sql);
-            res.set_content(query_result_to_json(result), "application/json");
-        });
-
-        // GET /status - Health check
-        svr.Get("/status", [&qe, &auth_token](const httplib::Request& req, httplib::Response& res) {
-            // Check auth if configured
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) {
-                    token = req.get_header_value("X-XSQL-Token");
-                } else if (req.has_header("Authorization")) {
-                    const std::string auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) {
-                        token = auth.substr(7);
-                    }
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-
-            auto result = qe.query("SELECT COUNT(*) FROM funcs");
-            std::string func_count = result.success && !result.empty() ? result.rows[0][0] : "?";
-            res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"bnsql\",\"functions\":" + func_count + "}", "application/json");
-        });
-
-        // GET /health - Alias for /status
-        svr.Get("/health", [&qe, &auth_token](const httplib::Request& req, httplib::Response& res) {
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) {
-                    token = req.get_header_value("X-XSQL-Token");
-                } else if (req.has_header("Authorization")) {
-                    const std::string auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) {
-                        token = auth.substr(7);
-                    }
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-            auto result = qe.query("SELECT COUNT(*) FROM funcs");
-            std::string func_count = result.success && !result.empty() ? result.rows[0][0] : "?";
-            res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"bnsql\",\"functions\":" + func_count + "}", "application/json");
-        });
-
-        // POST /shutdown - Graceful shutdown (requires auth)
-        svr.Post("/shutdown", [&svr, &auth_token](const httplib::Request& req, httplib::Response& res) {
-            // Always require auth for shutdown
-            if (!auth_token.empty()) {
-                std::string token;
-                if (req.has_header("X-XSQL-Token")) {
-                    token = req.get_header_value("X-XSQL-Token");
-                } else if (req.has_header("Authorization")) {
-                    const std::string auth = req.get_header_value("Authorization");
-                    if (auth.rfind("Bearer ", 0) == 0) {
-                        token = auth.substr(7);
-                    }
-                }
-                if (token != auth_token) {
-                    res.status = 401;
-                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
-                    return;
-                }
-            }
-
-            res.set_content("{\"success\":true,\"message\":\"Shutting down\"}", "application/json");
-            // Schedule stop after response is sent
-            std::thread([&svr] {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                svr.stop();
-            }).detach();
-        });
+    cfg.setup_routes = [&qe, &auth_token, port](httplib::Server& svr) {
+        bnsql::setup_http_routes(svr,
+            [&qe](const std::string& sql) { return qe.query(sql); },
+            auth_token, port);
     };
 
     xsql::thinclient::server http_server(cfg);
     g_http_server = &http_server;
 
-    // Install signal handler for Ctrl+C
     auto old_handler = std::signal(SIGINT, http_signal_handler);
 #ifdef _WIN32
     std::signal(SIGBREAK, http_signal_handler);
@@ -824,6 +644,33 @@ static void show_schema(bnsql::QueryEngine& qe, const std::string& table) {
 static void run_interactive(bnsql::QueryEngine& qe) {
     std::string line, query;
 
+    // Set up command callbacks for interactive mode
+    bnsql::CommandCallbacks callbacks;
+    callbacks.get_tables = [&qe]() -> std::string {
+        auto result = qe.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
+        std::stringstream ss;
+        ss << "Tables:\n";
+        for (const auto& row : result) {
+            if (row.size() > 0) ss << "  " << row[0] << "\n";
+        }
+        return ss.str();
+    };
+    callbacks.get_schema = [&qe](const std::string& table) -> std::string {
+        auto result = qe.query("PRAGMA table_info(" + table + ")");
+        if (!result.success || result.empty()) {
+            return "Unknown table: " + table;
+        }
+        std::stringstream ss;
+        for (const auto& row : result) {
+            if (row.size() >= 3) ss << "  " << row.values[1] << " " << row.values[2] << "\n";
+        }
+        return ss.str();
+    };
+
+#ifdef BNSQL_HAS_HTTP
+    setup_http_callbacks(callbacks, qe);
+#endif
+
     std::cout << "bnsql interactive mode. Type .help for help, .quit to exit.\n\n";
 
     while (true) {
@@ -835,15 +682,21 @@ static void run_interactive(bnsql::QueryEngine& qe) {
 
         // Dot commands (only when not accumulating)
         if (query.empty() && trimmed[0] == '.') {
-            std::string cmd = to_lower(trimmed);
-            if (cmd == ".quit" || cmd == ".exit" || cmd == ".q") break;
-            if (cmd == ".help" || cmd == ".h") { print_repl_help(); continue; }
-            if (cmd == ".tables") { show_tables(qe); continue; }
-            if (cmd.rfind(".schema", 0) == 0) {
-                show_schema(qe, trim(trimmed.substr(7)));
-                continue;
+            std::string output;
+            auto result = bnsql::handle_command(trimmed, callbacks, output);
+
+            switch (result) {
+                case bnsql::CommandResult::QUIT:
+                    goto exit_interactive;
+                case bnsql::CommandResult::HANDLED:
+                    if (!output.empty()) {
+                        std::cout << output;
+                        if (output.back() != '\n') std::cout << "\n";
+                    }
+                    continue;
+                case bnsql::CommandResult::NOT_HANDLED:
+                    break;
             }
-            std::cout << "Unknown command. Try .help\n";
             continue;
         }
 
@@ -856,6 +709,15 @@ static void run_interactive(bnsql::QueryEngine& qe) {
             std::cout << "\n";
         }
     }
+    exit_interactive:;
+
+#ifdef BNSQL_HAS_HTTP
+    // Stop HTTP server if it was started during this session
+    if (g_repl_http_server) {
+        g_repl_http_server->stop();
+        g_repl_http_server.reset();
+    }
+#endif
 }
 
 // ============================================================================
@@ -948,6 +810,10 @@ static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
             return "Session cleared (conversation history reset)";
         };
 
+#ifdef BNSQL_HAS_HTTP
+        setup_http_callbacks(callbacks, qe);
+#endif
+
         std::string line;
         while (!agent.quit_requested()) {
             std::cout << "bnsql> " << std::flush;
@@ -998,6 +864,13 @@ static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
     agent.stop();
     g_agent = nullptr;
     std::signal(SIGINT, old_handler);
+
+#ifdef BNSQL_HAS_HTTP
+    if (g_repl_http_server) {
+        g_repl_http_server->stop();
+        g_repl_http_server.reset();
+    }
+#endif
 }
 
 #else // !BNSQL_HAS_AI_AGENT
@@ -1361,8 +1234,24 @@ int main(int argc, char* argv[]) {
         std::cout << bnsql::format_mcp_info(database, func_count, url, true) << std::endl;
         std::cout << "Press Ctrl+C to stop MCP server." << std::endl;
 
+        // Install signal handler for clean shutdown
+        g_quit_requested.store(false);
+        auto old_handler = std::signal(SIGINT, quit_signal_handler);
+#ifdef _WIN32
+        auto old_break_handler = std::signal(SIGBREAK, quit_signal_handler);
+#endif
+        mcp_server.set_interrupt_check([]() {
+            return g_quit_requested.load();
+        });
+
         // Wait for shutdown (Ctrl+C)
         mcp_server.wait();
+
+        // Restore signal handlers
+        std::signal(SIGINT, old_handler);
+#ifdef _WIN32
+        std::signal(SIGBREAK, old_break_handler);
+#endif
         ai_agent.stop();
 
         std::cout << "MCP server stopped." << std::endl;

@@ -1,5 +1,5 @@
 // Auto-generated from bnsql_agent.md
-// Generated: 2026-01-31T17:14:45.219595
+// Generated: 2026-02-04T12:18:33.011814
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -776,18 +776,28 @@ ORDER BY (cr.caller_cnt * ce.callee_cnt) DESC LIMIT 20;
 Functions with many callers that reference error-related strings:
 
 ```sql
--- Find error strings first (fast)
-SELECT COUNT(*) FROM strings
-WHERE content LIKE '%error%' OR content LIKE '%fail%' OR content LIKE '%invalid%';
-
--- Find functions referencing them
--- NOTE: string_refs can be slow on large binaries (strings table not cached)
--- For faster results, limit to specific string patterns:
-SELECT func_name, COUNT(*) as error_strings
-FROM string_refs
-WHERE string_value LIKE '%error%' OR string_value LIKE '%fail%'
-GROUP BY func_addr
-ORDER BY error_strings DESC LIMIT 15;
+-- Optimized pattern: pre-filter strings, then use EXISTS on cached xrefs
+-- (Avoid string_refs view which iterates all strings)
+WITH error_addrs AS (
+    SELECT address FROM strings
+    WHERE content LIKE '%error%' OR content LIKE '%fail%' OR content LIKE '%invalid%'
+),
+funcs_with_errors AS (
+    SELECT DISTINCT x.from_func as func_addr
+    FROM xrefs x
+    WHERE x.from_func != 0
+      AND EXISTS (SELECT 1 FROM error_addrs e WHERE e.address = x.to_ea)
+),
+caller_counts AS (
+    SELECT to_ea as func_addr, COUNT(*) as caller_cnt
+    FROM xrefs WHERE is_code = 1 GROUP BY to_ea
+)
+SELECT f.name, COALESCE(cr.caller_cnt, 0) as callers
+FROM funcs_with_errors fwe
+JOIN funcs f ON f.address = fwe.func_addr
+LEFT JOIN caller_counts cr ON cr.func_addr = f.address
+WHERE COALESCE(cr.caller_cnt, 0) >= 5
+ORDER BY cr.caller_cnt DESC LIMIT 15;
 ```
 
 ### Chokepoint Functions (Hook Targets)
@@ -965,8 +975,8 @@ SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.a
 | Find strings | `strings` |
 | Instruction analysis | `instructions WHERE func_addr = X` |
 | Binary metadata | `db_info` |
-| **Decompile a function** | `decompile(addr)` or `decompile(addr, limit)` |
-| **Find local variables** | `hlil_vars WHERE func_addr = X` |
+| **Decompile a function** | `decompile(addr)` or `decompile(addr, limit)` |)PROMPT"
+    R"PROMPT(| **Find local variables** | `hlil_vars WHERE func_addr = X` |
 | **Find function calls (HLIL)** | `hlil_calls WHERE func_addr = X` |
 | **Search pseudocode** | `pseudocode WHERE line LIKE '%pattern%'` |
 
@@ -975,8 +985,8 @@ SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.a
 ---
 
 ## Server Modes
-)PROMPT"
-    R"PROMPT(BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
+
+BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
 
 ---
 

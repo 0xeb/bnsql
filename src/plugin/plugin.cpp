@@ -21,6 +21,10 @@
 
 #include <bnsql/bnsql.hpp>
 #include <xsql/socket/server.hpp>
+#ifdef BNSQL_HAS_HTTP
+#include <xsql/thinclient/server.hpp>
+#include "bnsql_http_routes.hpp"
+#endif
 #include "binaryninjaapi.h"
 
 #include <memory>
@@ -176,6 +180,104 @@ static void ServerStatus(BinaryView*) {
 }
 
 // ============================================================================
+// HTTP Server Commands
+// ============================================================================
+
+#ifdef BNSQL_HAS_HTTP
+static std::unique_ptr<xsql::thinclient::server> g_http_server;
+static std::mutex g_http_server_mutex;
+static Ref<BinaryView> g_http_server_bv;
+
+static void StartHTTPServer(BinaryView* bv) {
+    std::lock_guard<std::mutex> lock(g_http_server_mutex);
+    if (g_http_server && g_http_server->is_running()) {
+        std::string msg = "HTTP server already running on port " + std::to_string(g_http_server->port());
+        ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
+        return;
+    }
+
+    std::string port_str;
+    if (!GetTextLineInput(port_str, "HTTP Server Port", "Enter port (0 for random, default: 8080):")) return;
+
+    int port = 8080;
+    if (!port_str.empty()) {
+        try { port = std::stoi(port_str); if (port < 0 || port > 65535) throw 0; }
+        catch (...) { ShowMessageBox("Error", "Invalid port", OKButtonSet, ErrorIcon); return; }
+    }
+
+    g_http_server_bv = bv;
+
+    xsql::thinclient::server_config cfg;
+    cfg.port = port;
+    cfg.bind_address = "127.0.0.1";
+    cfg.setup_routes = [port](httplib::Server& svr) {
+        bnsql::setup_http_routes(svr,
+            [](const std::string& sql) -> bnsql::QueryResult {
+                if (!g_http_server_bv) {
+                    bnsql::QueryResult result;
+                    result.error = "No binary loaded";
+                    return result;
+                }
+                bnsql::QueryEngine qe(g_http_server_bv);
+                return qe.query(sql);
+            },
+            "", port);
+    };
+
+    g_http_server = std::make_unique<xsql::thinclient::server>(cfg);
+    g_http_server->run_async();
+
+    if (!g_http_server->is_running()) {
+        g_http_server.reset();
+        g_http_server_bv = nullptr;
+        ShowMessageBox("Error", "Failed to start HTTP server", OKButtonSet, ErrorIcon);
+        return;
+    }
+
+    int actual_port = g_http_server->port();
+    std::string msg = "HTTP server started on port " + std::to_string(actual_port) +
+        "\n\nEndpoints:\n"
+        "  GET  /help     - API documentation\n"
+        "  POST /query    - Execute SQL\n"
+        "  GET  /status   - Health check\n\n"
+        "Example:\n"
+        "  curl http://127.0.0.1:" + std::to_string(actual_port) + "/help\n"
+        "  curl -X POST http://127.0.0.1:" + std::to_string(actual_port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"";
+    LogInfo("[bnsql] HTTP server started on port %d", actual_port);
+    ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
+}
+
+static void StopHTTPServer(BinaryView*) {
+    std::lock_guard<std::mutex> lock(g_http_server_mutex);
+    if (!g_http_server || !g_http_server->is_running()) {
+        ShowMessageBox("BNSQL HTTP Server", "HTTP server is not running", OKButtonSet, InformationIcon);
+        return;
+    }
+    int port = g_http_server->port();
+    g_http_server->stop();
+    g_http_server.reset();
+    g_http_server_bv = nullptr;
+    LogInfo("[bnsql] HTTP server stopped");
+    ShowMessageBox("BNSQL HTTP Server", ("HTTP server stopped (was on port " + std::to_string(port) + ")").c_str(), OKButtonSet, InformationIcon);
+}
+
+static void HTTPServerStatus(BinaryView*) {
+    std::lock_guard<std::mutex> lock(g_http_server_mutex);
+    std::string msg;
+    if (g_http_server && g_http_server->is_running()) {
+        int port = g_http_server->port();
+        msg = "HTTP server is RUNNING on port " + std::to_string(port) +
+            "\n\nExample:\n"
+            "  curl http://127.0.0.1:" + std::to_string(port) + "/help\n"
+            "  curl -X POST http://127.0.0.1:" + std::to_string(port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"";
+    } else {
+        msg = "HTTP server is STOPPED\n\nUse Start HTTP Server to enable REST API access.";
+    }
+    ShowMessageBox("BNSQL HTTP Server Status", msg.c_str(), OKButtonSet, InformationIcon);
+}
+#endif // BNSQL_HAS_HTTP
+
+// ============================================================================
 // Plugin Registration
 // ============================================================================
 
@@ -194,6 +296,11 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     PluginCommand::Register("BNSQL\\Server\\Start Server...", "Start SQL server for remote connections", StartServer);
     PluginCommand::Register("BNSQL\\Server\\Stop Server", "Stop SQL server", StopServer);
     PluginCommand::Register("BNSQL\\Server\\Server Status", "Show server status", ServerStatus);
+#ifdef BNSQL_HAS_HTTP
+    PluginCommand::Register("BNSQL\\HTTP Server\\Start HTTP Server...", "Start HTTP REST API server", StartHTTPServer);
+    PluginCommand::Register("BNSQL\\HTTP Server\\Stop HTTP Server", "Stop HTTP server", StopHTTPServer);
+    PluginCommand::Register("BNSQL\\HTTP Server\\HTTP Server Status", "Show HTTP server status", HTTPServerStatus);
+#endif
 
     LogInfo("bnsql: Plugin initialized successfully");
     return true;
