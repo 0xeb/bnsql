@@ -92,7 +92,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: plugin-windows
-          path: build/lib/Release/bnsql.dll
+          path: build/bin/Release/bnsql.dll
 
       - name: Upload CLI
         uses: actions/upload-artifact@v4
