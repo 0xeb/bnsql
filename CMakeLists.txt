@@ -21,10 +21,10 @@ option(BNSQL_WITH_AI_AGENT "Build with AI agent support (libagents)" ON)
 if(BNSQL_WITH_AI_AGENT)
     message(STATUS "bnsql: Building with AI agent support via libagents")
 
-    # Add libagents as subdirectory (Claude only for now)
+    # Add libagents as subdirectory
     set(LIBAGENTS_BUILD_CLI OFF CACHE BOOL "" FORCE)
     set(LIBAGENTS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(LIBAGENTS_WITH_COPILOT OFF CACHE BOOL "" FORCE)
+    set(LIBAGENTS_BUILD_COPILOT ON CACHE BOOL "" FORCE)
     add_subdirectory(external/libagents)
 
     # Auto-regenerate prompt header if outdated
