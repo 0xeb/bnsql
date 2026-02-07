@@ -796,11 +796,39 @@ static void sql_save(sqlite3_context* ctx, int argc, sqlite3_value** /*argv*/) {
         return;
     }
 
-    bool success = bv->SaveAutoSnapshot();
-    if (success) {
+    auto file = bv->GetFile();
+    if (!file) {
+        sqlite3_result_error(ctx, "No FileMetadata for BinaryView", -1);
+        return;
+    }
+
+    // If not backed by a database yet, create one first
+    if (!file->IsBackedByDatabase()) {
+        std::string filename = file->GetFilename();
+        if (filename.empty()) {
+            sqlite3_result_error(ctx, "Cannot save: no filename associated with BinaryView", -1);
+            return;
+        }
+        // Derive .bndb path from current filename
+        std::string bndb_path = filename;
+        auto dot = bndb_path.rfind('.');
+        if (dot != std::string::npos)
+            bndb_path = bndb_path.substr(0, dot);
+        bndb_path += ".bndb";
+
+        if (!bv->CreateDatabase(bndb_path)) {
+            std::string err = "Failed to create database: " + bndb_path;
+            sqlite3_result_error(ctx, err.c_str(), -1);
+            return;
+        }
+    }
+
+    if (bv->SaveAutoSnapshot()) {
         sqlite3_result_text(ctx, "Database saved", -1, SQLITE_STATIC);
     } else {
-        sqlite3_result_error(ctx, "Failed to save database", -1);
+        std::string filename = file->GetFilename();
+        std::string err = "SaveAutoSnapshot failed for: " + filename;
+        sqlite3_result_error(ctx, err.c_str(), -1);
     }
 }
 
