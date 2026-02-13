@@ -503,6 +503,41 @@ cmake --build build --config Release
 </tr>
 </table>
 
+## Claude Code Plugin
+
+BNSQL is available as a Claude Code plugin, allowing Claude to query Binary Ninja databases directly within your coding workflow.
+
+### Prerequisites
+
+1. **Binary Ninja** installed with its DLL directory in your PATH
+2. **bnsql.exe** in your PATH
+3. Verify setup: `bnsql --version` should work from command line
+
+### Installation
+
+```bash
+# Add the marketplace (one-time)
+/plugin marketplace add 0xeb/anthropic-xsql-tools-plugin
+
+# Install bnsql plugin
+/plugin install bnsql@0xeb-tools
+```
+
+### Usage
+
+Once installed, the skill is automatically available:
+
+```
+"Using bnsql, count functions in malware.bndb"
+"Using bnsql, find strings containing 'error' in malware.bndb"
+```
+
+### Updating
+
+```bash
+/plugin update bnsql
+```
+
 ## Author
 
 Elias Bachaalany ([@0xeb](https://github.com/0xeb))
