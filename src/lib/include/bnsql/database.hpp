@@ -21,7 +21,6 @@
 
 #pragma once
 
-#include <sqlite3.h>
 #include <xsql/database.hpp>
 #include <string>
 #include <vector>

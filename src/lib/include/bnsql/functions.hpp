@@ -34,8 +34,8 @@
 
 #pragma once
 
-#include <sqlite3.h>
 #include <xsql/database.hpp>
+#include <xsql/functions.hpp>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -61,26 +61,26 @@ inline Ref<BinaryView> get_bv() {
 // Disassembly Functions
 // ============================================================================
 
-static void sql_disasm(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_disasm(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "disasm requires at least 1 argument (address)", -1);
+        ctx.result_error("disasm requires at least 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
     auto arch = bv->GetDefaultArchitecture();
     if (!arch) {
-        sqlite3_result_error(ctx, "No architecture", -1);
+        ctx.result_error("No architecture");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    int count = (argc >= 2) ? sqlite3_value_int(argv[1]) : 1;
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    int count = (argc >= 2) ? argv[1].as_int() : 1;
     if (count < 1) count = 1;
     if (count > 1000) count = 1000;
 
@@ -144,27 +144,27 @@ static void sql_disasm(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     }
 
     std::string str = result.str();
-    sqlite3_result_text(ctx, str.c_str(), -1, SQLITE_TRANSIENT);
+    ctx.result_text(str);
 }
 
 // ============================================================================
 // Bytes Functions
 // ============================================================================
 
-static void sql_bytes_hex(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_bytes_hex(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 2) {
-        sqlite3_result_error(ctx, "bytes requires 2 arguments (address, count)", -1);
+        ctx.result_error("bytes requires 2 arguments (address, count)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    size_t count = static_cast<size_t>(sqlite3_value_int(argv[1]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    size_t count = static_cast<size_t>(argv[1].as_int());
     if (count > 4096) count = 4096;
 
     DataBuffer buf = bv->ReadBuffer(ea, count);
@@ -178,69 +178,69 @@ static void sql_bytes_hex(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
     }
 
     std::string str = result.str();
-    sqlite3_result_text(ctx, str.c_str(), -1, SQLITE_TRANSIENT);
+    ctx.result_text(str);
 }
 
-static void sql_bytes_raw(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_bytes_raw(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 2) {
-        sqlite3_result_error(ctx, "bytes_raw requires 2 arguments (address, count)", -1);
+        ctx.result_error("bytes_raw requires 2 arguments (address, count)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    size_t count = static_cast<size_t>(sqlite3_value_int(argv[1]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    size_t count = static_cast<size_t>(argv[1].as_int());
     if (count > 4096) count = 4096;
 
     DataBuffer buf = bv->ReadBuffer(ea, count);
-    sqlite3_result_blob(ctx, buf.GetData(), static_cast<int>(buf.GetLength()), SQLITE_TRANSIENT);
+    ctx.result_blob(buf.GetData(), static_cast<size_t>(buf.GetLength()));
 }
 
 // ============================================================================
 // Name Functions
 // ============================================================================
 
-static void sql_name_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_name_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "name_at requires 1 argument (address)", -1);
+        ctx.result_error("name_at requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
     auto sym = bv->GetSymbolByAddress(ea);
 
     if (sym) {
         std::string name = sym->GetFullName();
-        sqlite3_result_text(ctx, name.c_str(), -1, SQLITE_TRANSIENT);
+        ctx.result_text(name);
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
-static void sql_func_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_func_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "func_at requires 1 argument (address)", -1);
+        ctx.result_error("func_at requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
 
     if (!funcs.empty()) {
@@ -251,53 +251,53 @@ static void sql_func_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
             snprintf(buf, sizeof(buf), "sub_%llx", (unsigned long long)funcs[0]->GetStart());
             name = buf;
         }
-        sqlite3_result_text(ctx, name.c_str(), -1, SQLITE_TRANSIENT);
+        ctx.result_text(name);
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
-static void sql_func_start(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_func_start(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "func_start requires 1 argument (address)", -1);
+        ctx.result_error("func_start requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
 
     if (!funcs.empty()) {
-        sqlite3_result_int64(ctx, static_cast<int64_t>(funcs[0]->GetStart()));
+        ctx.result_int64(static_cast<int64_t>(funcs[0]->GetStart()));
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
-static void sql_func_end(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_func_end(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "func_end requires 1 argument (address)", -1);
+        ctx.result_error("func_end requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
 
     if (!funcs.empty()) {
-        sqlite3_result_int64(ctx, static_cast<int64_t>(funcs[0]->GetHighestAddress()));
+        ctx.result_int64(static_cast<int64_t>(funcs[0]->GetHighestAddress()));
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
@@ -305,34 +305,34 @@ static void sql_func_end(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 // Function Index Functions (O(1) access)
 // ============================================================================
 
-static void sql_func_qty(sqlite3_context* ctx, int, sqlite3_value**) {
+static void sql_func_qty(xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_int64(ctx, 0);
+        ctx.result_int64(0);
         return;
     }
-    sqlite3_result_int64(ctx, static_cast<int64_t>(bv->GetAnalysisFunctionList().size()));
+    ctx.result_int64(static_cast<int64_t>(bv->GetAnalysisFunctionList().size()));
 }
 
-static void sql_func_at_index(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_func_at_index(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "func_at_index requires 1 argument (index)", -1);
+        ctx.result_error("func_at_index requires 1 argument (index)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
-    size_t idx = static_cast<size_t>(sqlite3_value_int64(argv[0]));
+    size_t idx = static_cast<size_t>(argv[0].as_int64());
     auto funcs = bv->GetAnalysisFunctionList();
 
     if (idx < funcs.size()) {
-        sqlite3_result_int64(ctx, static_cast<int64_t>(funcs[idx]->GetStart()));
+        ctx.result_int64(static_cast<int64_t>(funcs[idx]->GetStart()));
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
@@ -340,132 +340,132 @@ static void sql_func_at_index(sqlite3_context* ctx, int argc, sqlite3_value** ar
 // Name Modification Functions
 // ============================================================================
 
-static void sql_set_name(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_set_name(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 2) {
-        sqlite3_result_error(ctx, "set_name requires 2 arguments (address, name)", -1);
+        ctx.result_error("set_name requires 2 arguments (address, name)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    const char* name = (const char*)sqlite3_value_text(argv[1]);
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    const char* name = argv[1].as_c_str();
 
     if (!name) {
-        sqlite3_result_int(ctx, 0);
+        ctx.result_int(0);
         return;
     }
 
     auto sym = new Symbol(DataSymbol, name, ea);
     bv->DefineUserSymbol(sym);
-    sqlite3_result_int(ctx, 1);
+    ctx.result_int(1);
 }
 
 // ============================================================================
 // Segment Functions
 // ============================================================================
 
-static void sql_segment_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_segment_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "segment_at requires 1 argument (address)", -1);
+        ctx.result_error("segment_at requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     for (auto& seg : bv->GetSegments()) {
         if (ea >= seg->GetStart() && ea < seg->GetEnd()) {
             // Segments don't have names in BN, use address-based name
             char buf[32];
             snprintf(buf, sizeof(buf), "seg_%llx", (unsigned long long)seg->GetStart());
-            sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+            ctx.result_text(buf);
             return;
         }
     }
-    sqlite3_result_null(ctx);
+    ctx.result_null();
 }
 
 // ============================================================================
 // Comment Functions
 // ============================================================================
 
-static void sql_comment_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_comment_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "comment_at requires 1 argument (address)", -1);
+        ctx.result_error("comment_at requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
     std::string comment = bv->GetCommentForAddress(ea);
 
     if (!comment.empty()) {
-        sqlite3_result_text(ctx, comment.c_str(), -1, SQLITE_TRANSIENT);
+        ctx.result_text(comment);
     } else {
         // Try function comment
         auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
         if (!funcs.empty()) {
             comment = funcs[0]->GetCommentForAddress(ea);
             if (!comment.empty()) {
-                sqlite3_result_text(ctx, comment.c_str(), -1, SQLITE_TRANSIENT);
+                ctx.result_text(comment);
                 return;
             }
         }
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
-static void sql_set_comment(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_set_comment(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 2) {
-        sqlite3_result_error(ctx, "set_comment requires 2 arguments (address, text)", -1);
+        ctx.result_error("set_comment requires 2 arguments (address, text)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    const char* cmt = (const char*)sqlite3_value_text(argv[1]);
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    const char* cmt = argv[1].as_c_str();
 
     bv->SetCommentForAddress(ea, cmt ? cmt : "");
-    sqlite3_result_int(ctx, 1);
+    ctx.result_int(1);
 }
 
 // ============================================================================
 // Cross-Reference Functions
 // ============================================================================
 
-static void sql_xrefs_to(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_xrefs_to(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "xrefs_to requires 1 argument (address)", -1);
+        ctx.result_error("xrefs_to requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     std::ostringstream json;
     json << "[";
@@ -487,22 +487,22 @@ static void sql_xrefs_to(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 
     json << "]";
     std::string str = json.str();
-    sqlite3_result_text(ctx, str.c_str(), -1, SQLITE_TRANSIENT);
+    ctx.result_text(str);
 }
 
-static void sql_xrefs_from(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_xrefs_from(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "xrefs_from requires 1 argument (address)", -1);
+        ctx.result_error("xrefs_from requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     std::ostringstream json;
     json << "[";
@@ -533,73 +533,73 @@ static void sql_xrefs_from(sqlite3_context* ctx, int argc, sqlite3_value** argv)
 
     json << "]";
     std::string str = json.str();
-    sqlite3_result_text(ctx, str.c_str(), -1, SQLITE_TRANSIENT);
+    ctx.result_text(str);
 }
 
 // ============================================================================
 // Navigation Functions
 // ============================================================================
 
-static void sql_next_head(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_next_head(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "next_head requires 1 argument (address)", -1);
+        ctx.result_error("next_head requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
     auto arch = bv->GetDefaultArchitecture();
     if (!arch) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     // Get instruction length at current address
     size_t len = bv->GetInstructionLength(arch, ea);
     if (len > 0) {
-        sqlite3_result_int64(ctx, static_cast<int64_t>(ea + len));
+        ctx.result_int64(static_cast<int64_t>(ea + len));
     } else {
         // Try next valid offset
         uint64_t next = bv->GetNextValidOffset(ea);
         if (next > ea && next < bv->GetEnd()) {
-            sqlite3_result_int64(ctx, static_cast<int64_t>(next));
+            ctx.result_int64(static_cast<int64_t>(next));
         } else {
-            sqlite3_result_null(ctx);
+            ctx.result_null();
         }
     }
 }
 
-static void sql_prev_head(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_prev_head(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "prev_head requires 1 argument (address)", -1);
+        ctx.result_error("prev_head requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     // BN doesn't have GetPreviousValidOffset, use simple approach
     // Try to find previous instruction by scanning backwards
     if (ea <= bv->GetStart()) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
     // Simple heuristic: go back by max instruction size and scan forward
     auto arch = bv->GetDefaultArchitecture();
     if (!arch) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
@@ -618,41 +618,41 @@ static void sql_prev_head(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
     }
 
     if (prev_addr < ea && prev_addr >= bv->GetStart()) {
-        sqlite3_result_int64(ctx, static_cast<int64_t>(prev_addr));
+        ctx.result_int64(static_cast<int64_t>(prev_addr));
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
-static void sql_hex(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_hex(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "hex requires 1 argument (value)", -1);
+        ctx.result_error("hex requires 1 argument (value)");
         return;
     }
 
-    int64_t val = sqlite3_value_int64(argv[0]);
+    int64_t val = argv[0].as_int64();
     char buf[32];
     snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)val);
-    sqlite3_result_text(ctx, buf, -1, SQLITE_TRANSIENT);
+    ctx.result_text(buf);
 }
 
 // ============================================================================
 // Item Query Functions
 // ============================================================================
 
-static void sql_mnemonic(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_mnemonic(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "mnemonic requires 1 argument (address)", -1);
+        ctx.result_error("mnemonic requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     // Try function-based approach first
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
@@ -666,7 +666,7 @@ static void sql_mnemonic(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
                     if (line.addr == ea) {
                         for (auto& tok : line.tokens) {
                             if (tok.type == InstructionToken) {
-                                sqlite3_result_text(ctx, tok.text.c_str(), -1, SQLITE_TRANSIENT);
+                                ctx.result_text(tok.text);
                                 return;
                             }
                         }
@@ -680,7 +680,7 @@ static void sql_mnemonic(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     // Fallback to architecture-based
     auto arch = bv->GetDefaultArchitecture();
     if (!arch) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
@@ -690,12 +690,12 @@ static void sql_mnemonic(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     if (arch->GetInstructionText(static_cast<const uint8_t*>(buf.GetData()), ea, instrLen, tokens)) {
         for (auto& tok : tokens) {
             if (tok.type == InstructionToken) {
-                sqlite3_result_text(ctx, tok.text.c_str(), -1, SQLITE_TRANSIENT);
+                ctx.result_text(tok.text);
                 return;
             }
         }
     }
-    sqlite3_result_null(ctx);
+    ctx.result_null();
 }
 
 // Helper to extract operands from tokens
@@ -726,20 +726,20 @@ static std::vector<std::string> extract_operands(const std::vector<InstructionTe
     return operands;
 }
 
-static void sql_operand(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_operand(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 2) {
-        sqlite3_result_error(ctx, "operand requires 2 arguments (address, operand_num)", -1);
+        ctx.result_error("operand requires 2 arguments (address, operand_num)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    int n = sqlite3_value_int(argv[1]);
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    int n = argv[1].as_int();
 
     std::vector<std::string> operands;
 
@@ -766,7 +766,7 @@ static void sql_operand(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     if (operands.empty()) {
         auto arch = bv->GetDefaultArchitecture();
         if (!arch) {
-            sqlite3_result_null(ctx);
+            ctx.result_null();
             return;
         }
 
@@ -779,9 +779,9 @@ static void sql_operand(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     }
 
     if (n >= 0 && static_cast<size_t>(n) < operands.size()) {
-        sqlite3_result_text(ctx, operands[n].c_str(), -1, SQLITE_TRANSIENT);
+        ctx.result_text(operands[n]);
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
@@ -789,16 +789,16 @@ static void sql_operand(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
 // Database operations
 // ============================================================================
 
-static void sql_save(sqlite3_context* ctx, int argc, sqlite3_value** /*argv*/) {
+static void sql_save(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* /*argv*/) {
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
     auto file = bv->GetFile();
     if (!file) {
-        sqlite3_result_error(ctx, "No FileMetadata for BinaryView", -1);
+        ctx.result_error("No FileMetadata for BinaryView");
         return;
     }
 
@@ -806,7 +806,7 @@ static void sql_save(sqlite3_context* ctx, int argc, sqlite3_value** /*argv*/) {
     if (!file->IsBackedByDatabase()) {
         std::string filename = file->GetFilename();
         if (filename.empty()) {
-            sqlite3_result_error(ctx, "Cannot save: no filename associated with BinaryView", -1);
+            ctx.result_error("Cannot save: no filename associated with BinaryView");
             return;
         }
         // Derive .bndb path from current filename
@@ -818,17 +818,17 @@ static void sql_save(sqlite3_context* ctx, int argc, sqlite3_value** /*argv*/) {
 
         if (!bv->CreateDatabase(bndb_path)) {
             std::string err = "Failed to create database: " + bndb_path;
-            sqlite3_result_error(ctx, err.c_str(), -1);
+            ctx.result_error(err);
             return;
         }
     }
 
     if (bv->SaveAutoSnapshot()) {
-        sqlite3_result_text(ctx, "Database saved", -1, SQLITE_STATIC);
+        ctx.result_text_static("Database saved");
     } else {
         std::string filename = file->GetFilename();
         std::string err = "SaveAutoSnapshot failed for: " + filename;
-        sqlite3_result_error(ctx, err.c_str(), -1);
+        ctx.result_error(err);
     }
 }
 
@@ -838,46 +838,46 @@ static void sql_save(sqlite3_context* ctx, int argc, sqlite3_value** /*argv*/) {
 
 inline bool register_sql_functions(xsql::Database& db) {
     // Disassembly
-    sqlite3_create_function(db.handle(), "disasm", 1, SQLITE_UTF8, nullptr, sql_disasm, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "disasm", 2, SQLITE_UTF8, nullptr, sql_disasm, nullptr, nullptr);
+    db.register_function("disasm", 1, xsql::ScalarFn(sql_disasm));
+    db.register_function("disasm", 2, xsql::ScalarFn(sql_disasm));
 
     // Bytes
-    sqlite3_create_function(db.handle(), "bytes", 2, SQLITE_UTF8, nullptr, sql_bytes_hex, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "bytes_raw", 2, SQLITE_UTF8, nullptr, sql_bytes_raw, nullptr, nullptr);
+    db.register_function("bytes", 2, xsql::ScalarFn(sql_bytes_hex));
+    db.register_function("bytes_raw", 2, xsql::ScalarFn(sql_bytes_raw));
 
     // Names
-    sqlite3_create_function(db.handle(), "name_at", 1, SQLITE_UTF8, nullptr, sql_name_at, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "func_at", 1, SQLITE_UTF8, nullptr, sql_func_at, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "func_start", 1, SQLITE_UTF8, nullptr, sql_func_start, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "func_end", 1, SQLITE_UTF8, nullptr, sql_func_end, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "set_name", 2, SQLITE_UTF8, nullptr, sql_set_name, nullptr, nullptr);
+    db.register_function("name_at", 1, xsql::ScalarFn(sql_name_at));
+    db.register_function("func_at", 1, xsql::ScalarFn(sql_func_at));
+    db.register_function("func_start", 1, xsql::ScalarFn(sql_func_start));
+    db.register_function("func_end", 1, xsql::ScalarFn(sql_func_end));
+    db.register_function("set_name", 2, xsql::ScalarFn(sql_set_name));
 
     // Function index (O(1) access)
-    sqlite3_create_function(db.handle(), "func_qty", 0, SQLITE_UTF8, nullptr, sql_func_qty, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "func_at_index", 1, SQLITE_UTF8, nullptr, sql_func_at_index, nullptr, nullptr);
+    db.register_function("func_qty", 0, xsql::ScalarFn(sql_func_qty));
+    db.register_function("func_at_index", 1, xsql::ScalarFn(sql_func_at_index));
 
     // Segments
-    sqlite3_create_function(db.handle(), "segment_at", 1, SQLITE_UTF8, nullptr, sql_segment_at, nullptr, nullptr);
+    db.register_function("segment_at", 1, xsql::ScalarFn(sql_segment_at));
 
     // Comments
-    sqlite3_create_function(db.handle(), "comment_at", 1, SQLITE_UTF8, nullptr, sql_comment_at, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "set_comment", 2, SQLITE_UTF8, nullptr, sql_set_comment, nullptr, nullptr);
+    db.register_function("comment_at", 1, xsql::ScalarFn(sql_comment_at));
+    db.register_function("set_comment", 2, xsql::ScalarFn(sql_set_comment));
 
     // Cross-references
-    sqlite3_create_function(db.handle(), "xrefs_to", 1, SQLITE_UTF8, nullptr, sql_xrefs_to, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "xrefs_from", 1, SQLITE_UTF8, nullptr, sql_xrefs_from, nullptr, nullptr);
+    db.register_function("xrefs_to", 1, xsql::ScalarFn(sql_xrefs_to));
+    db.register_function("xrefs_from", 1, xsql::ScalarFn(sql_xrefs_from));
 
     // Navigation
-    sqlite3_create_function(db.handle(), "next_head", 1, SQLITE_UTF8, nullptr, sql_next_head, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "prev_head", 1, SQLITE_UTF8, nullptr, sql_prev_head, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "hex", 1, SQLITE_UTF8, nullptr, sql_hex, nullptr, nullptr);
+    db.register_function("next_head", 1, xsql::ScalarFn(sql_next_head));
+    db.register_function("prev_head", 1, xsql::ScalarFn(sql_prev_head));
+    db.register_function("hex", 1, xsql::ScalarFn(sql_hex));
 
     // Instruction functions
-    sqlite3_create_function(db.handle(), "mnemonic", 1, SQLITE_UTF8, nullptr, sql_mnemonic, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "operand", 2, SQLITE_UTF8, nullptr, sql_operand, nullptr, nullptr);
+    db.register_function("mnemonic", 1, xsql::ScalarFn(sql_mnemonic));
+    db.register_function("operand", 2, xsql::ScalarFn(sql_operand));
 
     // Database operations
-    sqlite3_create_function(db.handle(), "save", 0, SQLITE_UTF8, nullptr, sql_save, nullptr, nullptr);
+    db.register_function("save", 0, xsql::ScalarFn(sql_save));
 
     return true;
 }

@@ -25,8 +25,8 @@
 
 #pragma once
 
-#include <sqlite3.h>
 #include <xsql/database.hpp>
+#include <xsql/functions.hpp>
 #include <bnsql/vtable.hpp>
 #include <bnsql/entities.hpp>
 #include "binaryninjaapi.h"
@@ -148,150 +148,97 @@ private:
  * This is a generator table that lazily yields search results.
  * Pattern parsing is handled by a custom xFilter implementation.
  */
+namespace detail {
+
+inline void search_bytes_impl(xsql::FunctionContext& ctx, const char* pattern,
+                               uint64_t start, uint64_t end) {
+    auto bv = entities::get_bv();
+    if (!bv) {
+        ctx.result_error("No BinaryView context");
+        return;
+    }
+
+    std::ostringstream json;
+    json << "[";
+    bool first = true;
+
+    bv->Search(pattern,
+        [](size_t, size_t) { return true; },
+        [&](uint64_t addr, const DataBuffer& match) {
+            if (addr >= start && addr < end) {
+                if (!first) json << ",";
+                first = false;
+
+                json << "{\"address\":" << addr;
+
+                const uint8_t* data = static_cast<const uint8_t*>(match.GetData());
+                size_t len = match.GetLength();
+                json << ",\"matched_hex\":\"";
+                for (size_t i = 0; i < len; i++) {
+                    if (i > 0) json << " ";
+                    char buf[4];
+                    snprintf(buf, sizeof(buf), "%02x", data[i]);
+                    json << buf;
+                }
+                json << "\",\"size\":" << len << "}";
+            }
+            return true;
+        });
+
+    json << "]";
+    ctx.result_text(json.str());
+}
+
+} // namespace detail
+
+static void sql_search_bytes_1(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    if (argc < 1) { ctx.result_error("search_bytes requires pattern argument"); return; }
+    const char* pattern = argv[0].as_c_str();
+    if (!pattern) { ctx.result_error("Invalid pattern"); return; }
+
+    auto bv = entities::get_bv();
+    if (!bv) { ctx.result_error("No BinaryView context"); return; }
+
+    detail::search_bytes_impl(ctx, pattern, bv->GetStart(), bv->GetEnd());
+}
+
+static void sql_search_bytes_3(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    if (argc < 3) { ctx.result_error("search_bytes requires (pattern, start, end)"); return; }
+    const char* pattern = argv[0].as_c_str();
+    if (!pattern) { ctx.result_error("Invalid pattern"); return; }
+
+    uint64_t start = static_cast<uint64_t>(argv[1].as_int64());
+    uint64_t end = static_cast<uint64_t>(argv[2].as_int64());
+
+    detail::search_bytes_impl(ctx, pattern, start, end);
+}
+
+static void sql_search_first_1(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    if (argc < 1) { ctx.result_error("search_first requires pattern argument"); return; }
+    const char* pattern = argv[0].as_c_str();
+    if (!pattern) { ctx.result_error("Invalid pattern"); return; }
+
+    auto bv = entities::get_bv();
+    if (!bv) { ctx.result_error("No BinaryView context"); return; }
+
+    uint64_t found_addr = 0;
+    bool found = false;
+
+    bv->Search(pattern,
+        [](size_t, size_t) { return true; },
+        [&](uint64_t addr, const DataBuffer&) {
+            if (!found) { found_addr = addr; found = true; }
+            return !found;
+        });
+
+    if (found) ctx.result_int64(static_cast<int64_t>(found_addr));
+    else ctx.result_null();
+}
+
 inline bool register_search_bytes(xsql::Database& db) {
-    // search_bytes needs special handling for parameters, so we use
-    // a module-based approach with xFilter parsing arguments
-
-    // For now, register as a scalar function that returns JSON array
-    // (TVF with arguments requires more complex module setup)
-
-    sqlite3_create_function(db.handle(), "search_bytes", 1, SQLITE_UTF8, nullptr,
-        [](sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-            auto bv = entities::get_bv();
-            if (!bv) {
-                sqlite3_result_error(ctx, "No BinaryView context", -1);
-                return;
-            }
-
-            const char* pattern = (const char*)sqlite3_value_text(argv[0]);
-            if (!pattern) {
-                sqlite3_result_error(ctx, "Invalid pattern", -1);
-                return;
-            }
-
-            uint64_t start = bv->GetStart();
-            uint64_t end = bv->GetEnd();
-
-            // Collect matches
-            std::ostringstream json;
-            json << "[";
-            bool first = true;
-
-            bv->Search(pattern,
-                [](size_t, size_t) { return true; },
-                [&](uint64_t addr, const DataBuffer& match) {
-                    if (addr >= start && addr < end) {
-                        if (!first) json << ",";
-                        first = false;
-
-                        json << "{\"address\":" << addr;
-
-                        // Hex string
-                        const uint8_t* data = static_cast<const uint8_t*>(match.GetData());
-                        size_t len = match.GetLength();
-                        json << ",\"matched_hex\":\"";
-                        for (size_t i = 0; i < len; i++) {
-                            if (i > 0) json << " ";
-                            char buf[4];
-                            snprintf(buf, sizeof(buf), "%02x", data[i]);
-                            json << buf;
-                        }
-                        json << "\",\"size\":" << len << "}";
-                    }
-                    return true;
-                });
-
-            json << "]";
-            std::string result = json.str();
-            sqlite3_result_text(ctx, result.c_str(), -1, SQLITE_TRANSIENT);
-        }, nullptr, nullptr);
-
-    // 3-arg version with start/end range
-    sqlite3_create_function(db.handle(), "search_bytes", 3, SQLITE_UTF8, nullptr,
-        [](sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-            auto bv = entities::get_bv();
-            if (!bv) {
-                sqlite3_result_error(ctx, "No BinaryView context", -1);
-                return;
-            }
-
-            const char* pattern = (const char*)sqlite3_value_text(argv[0]);
-            if (!pattern) {
-                sqlite3_result_error(ctx, "Invalid pattern", -1);
-                return;
-            }
-
-            uint64_t start = static_cast<uint64_t>(sqlite3_value_int64(argv[1]));
-            uint64_t end = static_cast<uint64_t>(sqlite3_value_int64(argv[2]));
-
-            // Collect matches
-            std::ostringstream json;
-            json << "[";
-            bool first = true;
-
-            bv->Search(pattern,
-                [](size_t, size_t) { return true; },
-                [&](uint64_t addr, const DataBuffer& match) {
-                    if (addr >= start && addr < end) {
-                        if (!first) json << ",";
-                        first = false;
-
-                        json << "{\"address\":" << addr;
-
-                        const uint8_t* data = static_cast<const uint8_t*>(match.GetData());
-                        size_t len = match.GetLength();
-                        json << ",\"matched_hex\":\"";
-                        for (size_t i = 0; i < len; i++) {
-                            if (i > 0) json << " ";
-                            char buf[4];
-                            snprintf(buf, sizeof(buf), "%02x", data[i]);
-                            json << buf;
-                        }
-                        json << "\",\"size\":" << len << "}";
-                    }
-                    return true;
-                });
-
-            json << "]";
-            std::string result = json.str();
-            sqlite3_result_text(ctx, result.c_str(), -1, SQLITE_TRANSIENT);
-        }, nullptr, nullptr);
-
-    // search_first - returns just the first match address (scalar)
-    sqlite3_create_function(db.handle(), "search_first", 1, SQLITE_UTF8, nullptr,
-        [](sqlite3_context* ctx, int argc, sqlite3_value** argv) {
-            auto bv = entities::get_bv();
-            if (!bv) {
-                sqlite3_result_error(ctx, "No BinaryView context", -1);
-                return;
-            }
-
-            const char* pattern = (const char*)sqlite3_value_text(argv[0]);
-            if (!pattern) {
-                sqlite3_result_error(ctx, "Invalid pattern", -1);
-                return;
-            }
-
-            uint64_t found_addr = 0;
-            bool found = false;
-
-            bv->Search(pattern,
-                [](size_t, size_t) { return true; },
-                [&](uint64_t addr, const DataBuffer&) {
-                    if (!found) {
-                        found_addr = addr;
-                        found = true;
-                    }
-                    return !found;  // Stop after first match
-                });
-
-            if (found) {
-                sqlite3_result_int64(ctx, static_cast<int64_t>(found_addr));
-            } else {
-                sqlite3_result_null(ctx);
-            }
-        }, nullptr, nullptr);
-
+    db.register_function("search_bytes", 1, xsql::ScalarFn(sql_search_bytes_1));
+    db.register_function("search_bytes", 3, xsql::ScalarFn(sql_search_bytes_3));
+    db.register_function("search_first", 1, xsql::ScalarFn(sql_search_first_1));
     return true;
 }
 
