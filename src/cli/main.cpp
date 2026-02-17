@@ -481,19 +481,25 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
     std::signal(SIGBREAK, http_signal_handler);
 #endif
 
-    std::cout << "HTTP server listening on http://" << cfg.bind_address << ":" << port << "\n";
+    http_server.run_async();
+    int actual_port = http_server.port();
+
+    std::cout << "HTTP server listening on http://" << cfg.bind_address << ":" << actual_port << "\n";
     std::cout << "Endpoints:\n";
     std::cout << "  GET  /help     - API documentation\n";
     std::cout << "  POST /query    - Execute SQL (body = raw SQL)\n";
     std::cout << "  GET  /status   - Health check\n";
     std::cout << "  POST /shutdown - Stop server\n";
     std::cout << "\nExamples:\n";
-    std::cout << "  curl http://localhost:" << port << "/help\n";
-    std::cout << "  curl -X POST http://localhost:" << port << "/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
+    std::cout << "  curl http://localhost:" << actual_port << "/help\n";
+    std::cout << "  curl -X POST http://localhost:" << actual_port << "/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
     std::cout << "\nPress Ctrl+C to stop.\n\n";
     std::cout.flush();
 
-    http_server.run();  // Blocking
+    // Block until server stops (via signal or /shutdown)
+    while (http_server.is_running()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     std::signal(SIGINT, old_handler);
     g_http_server = nullptr;

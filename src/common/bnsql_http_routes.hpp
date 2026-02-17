@@ -11,6 +11,7 @@
 
 #include <bnsql/bnsql.hpp>
 #include <httplib.h>
+#include <xsql/thinclient/json_helpers.hpp>
 
 #include <functional>
 #include <mutex>
@@ -19,30 +20,6 @@
 #include <thread>
 
 namespace bnsql {
-
-// JSON escape helper
-inline std::string json_escape(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 10);
-    for (char ch : s) {
-        switch (ch) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(ch) < 0x20) {
-                    char buf[8];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(ch));
-                    out += buf;
-                } else {
-                    out += ch;
-                }
-        }
-    }
-    return out;
-}
 
 // Build JSON response from query result
 inline std::string query_result_to_json(const bnsql::QueryResult& result) {
@@ -54,7 +31,7 @@ inline std::string query_result_to_json(const bnsql::QueryResult& result) {
         json << ",\"columns\":[";
         for (size_t i = 0; i < result.columns.size(); i++) {
             if (i > 0) json << ",";
-            json << "\"" << json_escape(result.columns[i]) << "\"";
+            json << "\"" << xsql::thinclient::json_escape(result.columns[i]) << "\"";
         }
         json << "]";
 
@@ -65,14 +42,14 @@ inline std::string query_result_to_json(const bnsql::QueryResult& result) {
             json << "[";
             for (size_t c = 0; c < row.values.size(); c++) {
                 if (c > 0) json << ",";
-                json << "\"" << json_escape(row.values[c]) << "\"";
+                json << "\"" << xsql::thinclient::json_escape(row.values[c]) << "\"";
             }
             json << "]";
         }
         json << "]";
         json << ",\"row_count\":" << result.rows.size();
     } else {
-        json << ",\"error\":\"" << json_escape(result.error) << "\"";
+        json << ",\"error\":\"" << xsql::thinclient::json_escape(result.error) << "\"";
     }
 
     json << "}";
@@ -91,7 +68,6 @@ Endpoints:
   GET  /help     - This documentation (for LLM discovery)
   POST /query    - Execute SQL (body = raw SQL, response = JSON)
   GET  /status   - Server health and function count
-  GET  /health   - Alias for /status
   POST /shutdown - Stop server
 
 Tables:
@@ -212,14 +188,6 @@ inline void setup_http_routes(
 
     // GET /status - Health check
     svr.Get("/status", [query_fn_ptr, check_auth](const httplib::Request& req, httplib::Response& res) {
-        if (!check_auth(req, res)) return;
-        auto result = (*query_fn_ptr)("SELECT COUNT(*) FROM funcs");
-        std::string func_count = result.success && !result.empty() ? result.rows[0][0] : "?";
-        res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"bnsql\",\"functions\":" + func_count + "}", "application/json");
-    });
-
-    // GET /health - Alias for /status
-    svr.Get("/health", [query_fn_ptr, check_auth](const httplib::Request& req, httplib::Response& res) {
         if (!check_auth(req, res)) return;
         auto result = (*query_fn_ptr)("SELECT COUNT(*) FROM funcs");
         std::string func_count = result.success && !result.empty() ? result.rows[0][0] : "?";
