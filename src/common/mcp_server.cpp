@@ -96,17 +96,19 @@ int MCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
                     {"content", Json::array({
                         Json{{"type", "text"}, {"text", "Error: missing query"}}
                     })},
+                    {"structuredContent", Json{{"result", "Error: missing query"}, {"success", false}}},
                     {"isError", true}
                 };
             }
 
             auto result = queue_and_wait(MCPPendingCommand::Type::Query, query);
 
-            // MCP tools/call expects content array format
+            // MCP tools/call expects content array format + structuredContent for output schema
             return Json{
                 {"content", Json::array({
                     Json{{"type", "text"}, {"text", result.payload}}
                 })},
+                {"structuredContent", Json{{"result", result.payload}, {"success", result.success}}},
                 {"isError", !result.success}
             };
         }
@@ -146,6 +148,7 @@ int MCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
                         {"content", Json::array({
                             Json{{"type", "text"}, {"text", "Error: missing question"}}
                         })},
+                        {"structuredContent", Json{{"response", "Error: missing question"}, {"success", false}}},
                         {"isError", true}
                     };
                 }
@@ -156,6 +159,7 @@ int MCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
                     {"content", Json::array({
                         Json{{"type", "text"}, {"text", result.payload}}
                     })},
+                    {"structuredContent", Json{{"response", result.payload}, {"success", result.success}}},
                     {"isError", !result.success}
                 };
             }
