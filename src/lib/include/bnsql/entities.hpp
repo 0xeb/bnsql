@@ -505,25 +505,25 @@ public:
         return !started_ || pos_ >= refs_.size();
     }
 
-    void column(sqlite3_context* ctx, int col) override {
+    void column(xsql::FunctionContext& ctx, int col) override {
         switch (col) {
             case 0: // from_ea
-                sqlite3_result_int64(ctx, static_cast<int64_t>(current_.from_ea));
+                ctx.result_int64(static_cast<int64_t>(current_.from_ea));
                 break;
             case 1: // to_ea
-                sqlite3_result_int64(ctx, static_cast<int64_t>(current_.to_ea));
+                ctx.result_int64(static_cast<int64_t>(current_.to_ea));
                 break;
             case 2: // from_func
-                sqlite3_result_int64(ctx, current_.from_func ? static_cast<int64_t>(current_.from_func) : 0);
+                ctx.result_int64(current_.from_func ? static_cast<int64_t>(current_.from_func) : 0);
                 break;
             case 3: // type
-                sqlite3_result_int(ctx, current_.type);
+                ctx.result_int(current_.type);
                 break;
             case 4: // is_code
-                sqlite3_result_int(ctx, current_.is_code ? 1 : 0);
+                ctx.result_int(current_.is_code ? 1 : 0);
                 break;
             default:
-                sqlite3_result_null(ctx);
+                ctx.result_null();
                 break;
         }
     }

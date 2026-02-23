@@ -1055,44 +1055,6 @@ curl http://localhost:8081/status
 
 ---
 
-### Raw TCP Server (Legacy)
-
-Binary protocol with length-prefixed JSON. Use only when HTTP is not available.
-
-**Starting the server:**
-```bash
-bnsql database.bndb --server 13337
-bnsql database.bndb --server 13337 --token mysecret
-```
-
-**Connecting as client:**
-```bash
-bnsql --remote localhost:13337 -c "SELECT name FROM funcs LIMIT 5"
-bnsql --remote localhost:13337 -i
-```
-
-**Wire Protocol:**
-- Format: `[4-byte length (big-endian uint32)] [JSON payload]`
-- Request: `{"sql": "SELECT ...", "token": "optional"}`
-- Response: `{"success": true, "columns": [...], "rows": [[...]], "row_count": N}`
-
-**Python Example:**
-```python
-import socket, struct, json
-
-def bnsql_query(sql, host="localhost", port=13337, token=None):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
-    req = {"sql": sql}
-    if token: req["token"] = token
-    payload = json.dumps(req).encode()
-    s.sendall(struct.pack(">I", len(payload)) + payload)
-    resp_len = struct.unpack(">I", s.recv(4))[0]
-    return json.loads(s.recv(resp_len))
-```
-
----
-
 ## Advanced: HLIL AST Table (_hlil_ast)
 
 The `_hlil_ast` table provides access to raw HLIL Abstract Syntax Tree nodes. The underscore prefix indicates this is an **internal/expert** table - use it only when you need AST-level pattern matching that `hlil_calls` and `hlil_vars` cannot provide.

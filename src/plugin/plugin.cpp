@@ -6,7 +6,7 @@
  *
  * Registers bnsql functionality with Binary Ninja:
  *   - Menu commands for SQL queries
- *   - Socket server for remote queries
+ *   - HTTP server for remote queries
  *   - Plugin command integration
  */
 
@@ -20,7 +20,6 @@
 #endif
 
 #include <bnsql/bnsql.hpp>
-#include <xsql/socket/server.hpp>
 #ifdef BNSQL_HAS_HTTP
 #include <xsql/thinclient/server.hpp>
 #include "bnsql_http_routes.hpp"
@@ -32,15 +31,6 @@
 #include <atomic>
 
 using namespace BinaryNinja;
-
-// ============================================================================
-// Server State
-// ============================================================================
-
-static std::unique_ptr<xsql::socket::Server> g_server;
-static std::mutex g_server_mutex;
-static Ref<BinaryView> g_server_bv;
-static std::atomic<int> g_server_port{0};
 
 // ============================================================================
 // Plugin Commands
@@ -98,85 +88,6 @@ static void ListStrings(BinaryView* bv) {
     auto result = qe.query("SELECT hex(address), length, content FROM strings WHERE length > 4 ORDER BY length DESC LIMIT 100");
     if (!result.success) { LogError("Error: %s", result.error.c_str()); return; }
     LogInfo("%s", result.to_string().c_str());
-}
-
-// ============================================================================
-// Server Commands
-// ============================================================================
-
-static void StartServer(BinaryView* bv) {
-    std::lock_guard<std::mutex> lock(g_server_mutex);
-    if (g_server && g_server->is_running()) {
-        std::string msg = "Server already running on port " + std::to_string(g_server_port.load());
-        ShowMessageBox("BNSQL Server", msg.c_str(), OKButtonSet, InformationIcon);
-        return;
-    }
-
-    std::string port_str;
-    if (!GetTextLineInput(port_str, "Server Port", "Enter port (default: 13337):")) return;
-
-    int port = 13337;
-    if (!port_str.empty()) {
-        try { port = std::stoi(port_str); if (port < 1 || port > 65535) throw 0; }
-        catch (...) { ShowMessageBox("Error", "Invalid port", OKButtonSet, ErrorIcon); return; }
-    }
-
-    g_server_bv = bv;
-
-    xsql::socket::ServerConfig config;
-    config.port = port;
-    config.bind_address = "127.0.0.1";
-    config.verbose = true;
-
-    g_server = std::make_unique<xsql::socket::Server>(config);
-
-    g_server->set_query_handler([](const std::string& sql) -> xsql::socket::QueryResult {
-        if (!g_server_bv) return xsql::socket::QueryResult::fail("No binary loaded");
-        bnsql::QueryEngine qe(g_server_bv);
-        auto result = qe.query(sql);
-        xsql::socket::QueryResult qr;
-        qr.success = result.success;
-        qr.error = result.error;
-        qr.columns = result.columns;
-        for (const auto& row : result) qr.rows.push_back(row.values);
-        return qr;
-    });
-
-    g_server->set_log_func([](const std::string& msg) { LogInfo("[bnsql] %s", msg.c_str()); });
-
-    if (g_server->run_async(port)) {
-        g_server_port = port;
-        std::string msg = "Server started on port " + std::to_string(port) + "\n\nConnect with:\n  bnsql --remote localhost:" + std::to_string(port);
-        LogInfo("[bnsql] Server started on port %d", port);
-        ShowMessageBox("BNSQL Server", msg.c_str(), OKButtonSet, InformationIcon);
-    } else {
-        g_server.reset(); g_server_bv = nullptr;
-        ShowMessageBox("Error", "Failed to start server", OKButtonSet, ErrorIcon);
-    }
-}
-
-static void StopServer(BinaryView*) {
-    std::lock_guard<std::mutex> lock(g_server_mutex);
-    if (!g_server || !g_server->is_running()) {
-        ShowMessageBox("BNSQL Server", "Server is not running", OKButtonSet, InformationIcon);
-        return;
-    }
-    g_server->stop(); g_server.reset(); g_server_bv = nullptr;
-    int port = g_server_port.exchange(0);
-    LogInfo("[bnsql] Server stopped");
-    ShowMessageBox("BNSQL Server", ("Server stopped (was on port " + std::to_string(port) + ")").c_str(), OKButtonSet, InformationIcon);
-}
-
-static void ServerStatus(BinaryView*) {
-    std::lock_guard<std::mutex> lock(g_server_mutex);
-    std::string msg;
-    if (g_server && g_server->is_running()) {
-        int port = g_server_port.load();
-        msg = "Server is RUNNING on port " + std::to_string(port) + "\n\nConnect with:\n  bnsql --remote localhost:" + std::to_string(port);
-    } else {
-        msg = "Server is STOPPED\n\nUse Start Server to enable remote connections.";
-    }
-    ShowMessageBox("BNSQL Server Status", msg.c_str(), OKButtonSet, InformationIcon);
 }
 
 // ============================================================================
@@ -293,9 +204,6 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     PluginCommand::Register("BNSQL\\List Functions", "List functions via SQL", ListFunctions);
     PluginCommand::Register("BNSQL\\List Imports", "List imports via SQL", ListImports);
     PluginCommand::Register("BNSQL\\List Strings", "List strings via SQL", ListStrings);
-    PluginCommand::Register("BNSQL\\Server\\Start Server...", "Start SQL server for remote connections", StartServer);
-    PluginCommand::Register("BNSQL\\Server\\Stop Server", "Stop SQL server", StopServer);
-    PluginCommand::Register("BNSQL\\Server\\Server Status", "Show server status", ServerStatus);
 #ifdef BNSQL_HAS_HTTP
     PluginCommand::Register("BNSQL\\HTTP Server\\Start HTTP Server...", "Start HTTP REST API server", StartHTTPServer);
     PluginCommand::Register("BNSQL\\HTTP Server\\Stop HTTP Server", "Stop HTTP server", StopHTTPServer);

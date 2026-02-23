@@ -383,28 +383,6 @@ bnsql database.bndb --mcp 9999
 
 The server uses HTTP/SSE transport. For Claude Desktop or other MCP clients, add the server URL to your MCP configuration after starting bnsql.
 
-### Raw TCP Server (Legacy)
-
-Binary protocol with length-prefixed JSON:
-
-```bash
-# Start TCP server (default port 13337)
-bnsql database.bndb --server 13337
-
-# With authentication
-bnsql database.bndb --server 13337 --token mysecret
-```
-
-Connect using the bnsql client:
-
-```bash
-# Single query
-bnsql --remote localhost:13337 -c "SELECT name, size FROM funcs LIMIT 5"
-
-# Interactive mode
-bnsql --remote localhost:13337 -i
-```
-
 ### Building with HTTP Support
 
 HTTP mode requires the thinclient component:
@@ -414,7 +392,7 @@ cmake -B build -DBNSQL_WITH_HTTP=ON ...
 ```
 
 The server can also be started from the Binary Ninja plugin:
-- Menu: `BNSQL > Server > Start Server...`
+- Menu: `BNSQL > HTTP Server > Start HTTP Server...`
 
 ## Building
 

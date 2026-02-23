@@ -8,11 +8,11 @@
  *   bnsql database.bndb -c "SELECT * FROM funcs"          # Local query
  *   bnsql database.bndb -i                                # Local interactive
  *   bnsql database.bndb --agent                           # Agent mode (AI)
- *   bnsql --remote localhost:13337 -c "SELECT * FROM funcs"  # Remote query
- *   bnsql --remote localhost:13337 -i                     # Remote interactive
+ *   bnsql database.bndb --http [port]                     # HTTP server
+ *   bnsql database.bndb --mcp [port]                      # MCP server
  */
-
-// Socket includes MUST come before Windows.h
+ 
+// Windows compatibility
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -27,8 +27,6 @@
 
 #include <bnsql/bnsql.hpp>
 #include <bnsql/config.hpp>
-#include <xsql/socket/client.hpp>
-#include <xsql/socket/server.hpp>
 #include "binaryninjaapi.h"
 
 #include "bnsql_commands.hpp"
@@ -59,7 +57,6 @@
 using namespace BinaryNinja;
 
 static const char* g_version = "1.0.0";
-static const int DEFAULT_PORT = 13337;
 
 // ============================================================================
 // Utilities
@@ -139,101 +136,6 @@ public:
     size_t row_count() const { return rows_.size(); }
 };
 
-// ============================================================================
-// Remote Mode Helpers
-// ============================================================================
-
-static void print_remote_result(const xsql::socket::RemoteResult& qr) {
-    if (qr.rows.empty() && qr.columns.empty()) {
-        std::cout << "OK" << std::endl;
-        return;
-    }
-    TablePrinter tp;
-    tp.set_columns(qr.columns);
-    for (const auto& row : qr.rows) {
-        tp.add_row(row.values);
-    }
-    tp.print();
-}
-
-static void run_remote_interactive(xsql::socket::Client& client) {
-    std::string line, stmt;
-    std::cout << "bnsql remote mode. Type .help for help, .quit to exit." << std::endl << std::endl;
-
-    while (true) {
-        std::cout << (stmt.empty() ? "bnsql> " : "   ...> ") << std::flush;
-        if (!std::getline(std::cin, line)) break;
-
-        std::string trimmed = line;
-        while (!trimmed.empty() && (trimmed[0] == ' ' || trimmed[0] == '	'))
-            trimmed = trimmed.substr(1);
-        while (!trimmed.empty() && (trimmed.back() == ' ' || trimmed.back() == '	'))
-            trimmed.pop_back();
-
-        if (trimmed.empty()) continue;
-
-        if (stmt.empty() && trimmed[0] == '.') {
-            if (trimmed == ".quit" || trimmed == ".exit" || trimmed == ".q") break;
-            if (trimmed == ".tables") {
-                auto qr = client.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
-                if (qr.success) {
-                    std::cout << "Tables:" << std::endl;
-                    for (const auto& r : qr.rows) std::cout << "  " << r[0] << std::endl;
-                }
-                continue;
-            }
-            if (trimmed == ".help") {
-                std::cout << std::endl << "Commands: .tables, .quit, .help" << std::endl << std::endl;
-                continue;
-            }
-            std::cout << "Unknown command" << std::endl;
-            continue;
-        }
-
-        stmt += line + " ";
-        if (trimmed.back() == ';') {
-            auto qr = client.query(stmt);
-            if (qr.success) print_remote_result(qr);
-            else std::cerr << "Error: " << qr.error << std::endl;
-            stmt.clear();
-            std::cout << std::endl;
-        }
-    }
-}
-
-// Helper to convert RemoteResult to string for agent
-static std::string remote_result_to_string(const xsql::socket::RemoteResult& qr) {
-    if (!qr.success) {
-        return "Error: " + qr.error;
-    }
-    if (qr.rows.empty() && qr.columns.empty()) {
-        return "OK (no results)";
-    }
-    std::stringstream ss;
-    // Header
-    for (size_t i = 0; i < qr.columns.size(); ++i) {
-        if (i > 0) ss << " | ";
-        ss << qr.columns[i];
-    }
-    ss << "\n";
-    // Separator
-    for (size_t i = 0; i < qr.columns.size(); ++i) {
-        if (i > 0) ss << "-+-";
-        ss << std::string(qr.columns[i].size(), '-');
-    }
-    ss << "\n";
-    // Rows
-    for (const auto& row : qr.rows) {
-        for (size_t i = 0; i < row.values.size(); ++i) {
-            if (i > 0) ss << " | ";
-            ss << row.values[i];
-        }
-        ss << "\n";
-    }
-    ss << "(" << qr.rows.size() << " row" << (qr.rows.size() != 1 ? "s" : "") << ")";
-    return ss.str();
-}
-
 // Global quit flag for signal-driven shutdown (MCP standalone, HTTP REPL, etc.)
 static std::atomic<bool> g_quit_requested{false};
 
@@ -242,7 +144,7 @@ static void quit_signal_handler(int) {
 }
 
 #ifdef BNSQL_HAS_AI_AGENT
-// Forward declarations for signal handling - shared by run_remote_agent and run_agent
+// Signal handling for AI agent mode
 static bnsql::AIAgent* g_agent = nullptr;
 
 static void signal_handler(int sig) {
@@ -253,135 +155,7 @@ static void signal_handler(int sig) {
     }
 }
 
-static void run_remote_agent(xsql::socket::Client& client, bool verbose = false,
-                             const std::string& provider_override = "",
-                             int timeout_override = 0) {
-    // Create SQL executor that uses remote client
-    auto executor = [&client](const std::string& sql) -> std::string {
-        auto result = client.query(sql);
-        return remote_result_to_string(result);
-    };
-
-    // Load settings and apply overrides
-    bnsql::AgentSettings settings = bnsql::LoadAgentSettings();
-    if (!provider_override.empty()) {
-        try {
-            settings.default_provider = bnsql::ParseProviderType(provider_override);
-            if (verbose) {
-                std::cerr << "[AGENT] Provider override: " << provider_override << std::endl;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
-            return;
-        }
-    }
-
-    if (timeout_override > 0) {
-        settings.response_timeout_ms = timeout_override;
-        if (verbose) {
-            std::cerr << "[AGENT] Timeout override: " << timeout_override << " ms" << std::endl;
-        }
-    }
-
-    // Create and start agent with settings
-    bnsql::AIAgent agent(executor, settings, verbose);
-    g_agent = &agent;
-
-    // Install signal handler for Ctrl-C
-    auto old_handler = std::signal(SIGINT, signal_handler);
-
-    agent.start();
-
-    std::cout << "Remote Agent mode - Connected to server, AI runs locally." << std::endl;
-    std::cout << "Type SQL directly, or ask questions in natural language." << std::endl;
-    std::cout << "Commands: .help, .clear, .quit" << std::endl;
-    std::cout << std::endl;
-
-    // Set up command callbacks using remote client
-    bnsql::CommandCallbacks callbacks;
-    callbacks.get_tables = [&client]() -> std::string {
-        auto result = client.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
-        std::stringstream ss;
-        for (const auto& row : result.rows) {
-            if (!row.values.empty()) ss << row.values[0] << "\n";
-        }
-        return ss.str();
-    };
-    callbacks.get_schema = [&client](const std::string& table) -> std::string {
-        auto result = client.query("SELECT sql FROM sqlite_master WHERE name='" + table + "'");
-        if (!result.rows.empty() && !result.rows[0].values.empty()) {
-            return result.rows[0].values[0];
-        }
-        return "Table not found: " + table;
-    };
-    callbacks.clear_session = [&agent]() -> std::string {
-        agent.reset_session();
-        return "Session cleared (conversation history reset)";
-    };
-
-    std::string line;
-    while (!agent.quit_requested()) {
-        std::cout << "bnsql> " << std::flush;
-        if (!std::getline(std::cin, line)) break;
-
-        line = trim(line);
-        if (line.empty()) continue;
-
-        // Handle .sql command specially (switches to SQL-only remote mode)
-        if (to_lower(line) == ".sql") {
-            std::cout << "Switching to SQL mode..." << std::endl << std::endl;
-            agent.stop();
-            g_agent = nullptr;
-            std::signal(SIGINT, old_handler);
-            run_remote_interactive(client);
-            return;
-        }
-
-        // Use unified command handler
-        if (!line.empty() && line[0] == '.') {
-            std::string output;
-            auto result = bnsql::handle_command(line, callbacks, output);
-
-            switch (result) {
-                case bnsql::CommandResult::QUIT:
-                    goto exit_remote_agent;
-                case bnsql::CommandResult::HANDLED:
-                    if (!output.empty()) {
-                        std::cout << output;
-                        if (output.back() != '\n') std::cout << "\n";
-                    }
-                    continue;
-                case bnsql::CommandResult::NOT_HANDLED:
-                    break;
-            }
-        }
-
-        // Process query through AI agent
-        std::string response = agent.query(line);
-        if (!response.empty()) {
-            std::cout << response << std::endl;
-        }
-        std::cout << std::endl;
-    }
-    exit_remote_agent:;
-
-    agent.stop();
-    g_agent = nullptr;
-    std::signal(SIGINT, old_handler);
-}
 #endif // BNSQL_HAS_AI_AGENT
-
-// ============================================================================
-// Server Mode
-// ============================================================================
-
-static xsql::socket::Server* g_server = nullptr;
-
-static void server_signal_handler(int) {
-    if (g_server) {
-        g_server->stop();
-    }
-}
 
 // ============================================================================
 // HTTP Server Mode (REST API)
@@ -507,68 +281,6 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
     return 0;
 }
 #endif // BNSQL_HAS_HTTP
-
-// ============================================================================
-// Raw TCP Server Mode
-// ============================================================================
-
-static int run_server_mode(bnsql::QueryEngine& qe, int port, const std::string& auth_token) {
-    xsql::socket::Server server;
-    g_server = &server;
-
-    xsql::socket::ServerConfig cfg;
-    cfg.port = port;
-    cfg.verbose = false;  // We'll print our own messages
-    if (!auth_token.empty()) {
-        cfg.auth_token = auth_token;
-    }
-    server.set_config(cfg);
-
-    server.set_query_handler([&qe](const std::string& sql) -> xsql::socket::QueryResult {
-        auto result = qe.query(sql);
-
-        xsql::socket::QueryResult qr;
-        qr.success = result.success;
-        qr.error = result.error;
-        qr.columns = result.columns;
-        for (const auto& row : result) {
-            qr.rows.push_back(row.values);
-        }
-        return qr;
-    });
-
-    // Install signal handler for Ctrl+C
-    auto old_handler = std::signal(SIGINT, server_signal_handler);
-#ifdef _WIN32
-    std::signal(SIGBREAK, server_signal_handler);
-#endif
-
-    // Start server asynchronously to get actual port (useful when port=0)
-    if (!server.run_async(port)) {
-        std::cerr << "Failed to start server on port " << port << "\n";
-        std::signal(SIGINT, old_handler);
-        g_server = nullptr;
-        return 1;
-    }
-
-    int actual_port = server.port();
-    std::cout << "PORT=" << actual_port << "\n";  // Machine-readable for scripts
-    std::cerr << "bnsql server listening on port " << actual_port << "\n";
-    std::cerr << "Connect with: bnsql --remote localhost:" << actual_port << " -c \"SELECT * FROM funcs\"\n";
-    std::cerr << "Press Ctrl+C to stop.\n\n";
-    std::cerr.flush();
-    std::cout.flush();
-
-    // Wait for server to stop (Ctrl+C or external signal)
-    while (server.is_running()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-
-    std::cerr << "\nServer stopped.\n";
-    std::signal(SIGINT, old_handler);
-    g_server = nullptr;
-    return 0;
-}
 
 // ============================================================================
 // Query Execution Helper
@@ -731,7 +443,7 @@ static void run_interactive(bnsql::QueryEngine& qe) {
 // ============================================================================
 
 #ifdef BNSQL_HAS_AI_AGENT
-// Note: g_agent and signal_handler are defined earlier with run_remote_agent
+// g_agent and signal_handler are defined above.
 
 static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
                       bool verbose = false, const std::string& provider_override = "",
@@ -894,17 +606,6 @@ static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
     run_interactive(qe);
 }
 
-static void run_remote_agent(xsql::socket::Client& client, bool verbose = false,
-                             const std::string& provider_override = "",
-                             int timeout_override = 0) {
-    (void)verbose;
-    (void)provider_override;
-    (void)timeout_override;
-    std::cerr << "Error: Agent mode requires building with -DBNSQL_WITH_AI_AGENT=ON" << std::endl;
-    std::cerr << "Falling back to interactive SQL mode..." << std::endl << std::endl;
-    run_remote_interactive(client);
-}
-
 #endif // BNSQL_HAS_AI_AGENT
 
 // ============================================================================
@@ -919,11 +620,8 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " <database.bndb> -f <file.sql>          Execute SQL file" << std::endl;
     std::cout << "  " << prog << " <database.bndb> --agent                Agent mode (AI-powered)" << std::endl;
     std::cout << "  " << prog << " <database.bndb> --prompt <text>        One-shot agent query" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> --server [port]        Start TCP server (default: " << DEFAULT_PORT << ")" << std::endl;
     std::cout << "  " << prog << " <database.bndb> --http [port]          Start HTTP REST server (default: 8080)" << std::endl;
     std::cout << "  " << prog << " <database.bndb> --mcp [port]           Start MCP server (default: 9998)" << std::endl;
-    std::cout << "  " << prog << " --remote <host:port>                   Connect to remote TCP server" << std::endl;
-    std::cout << "  " << prog << " --remote <host:port> --agent           Remote agent mode (AI client, SQL server)" << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
     std::cout << "  -s, --source <path>    Binary Ninja database (.bndb)" << std::endl;
@@ -935,12 +633,10 @@ static void print_usage(const char* prog) {
     std::cout << "  --provider <name>      AI provider: claude or copilot" << std::endl;
     std::cout << "  --timeout <ms>         Response timeout in milliseconds" << std::endl;
     std::cout << "  --config [path] [val]  View/set agent configuration" << std::endl;
-    std::cout << "  --server [port]        Start TCP server on port (default: " << DEFAULT_PORT << ")" << std::endl;
     std::cout << "  --http [port]          Start HTTP REST server (default: 8080)" << std::endl;
     std::cout << "  --mcp [port]           Start MCP server for Claude Desktop, etc. (default: 9998)" << std::endl;
     std::cout << "  --bind <addr>          Bind address for server (default: 127.0.0.1)" << std::endl;
-    std::cout << "  --token <token>        Auth token for server/http mode" << std::endl;
-    std::cout << "  --remote <host:port>   Connect to BNSQL TCP server" << std::endl;
+    std::cout << "  --token <token>        Auth token for HTTP/MCP mode" << std::endl;
     std::cout << "  --verbose              Verbose output (agent mode)" << std::endl;
     std::cout << "  -q, --quiet            Suppress banner" << std::endl;
     std::cout << "  -h, --help             Show this help" << std::endl;
@@ -980,9 +676,9 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    std::string database, query, query_file, prompt, remote_spec, provider_override, auth_token, bind_addr;
-    int timeout_override = 0, server_port = DEFAULT_PORT, http_port = 8080, mcp_port = 9998;
-    bool interactive = false, agent = false, quiet = false, verbose = false, server_mode = false, http_mode = false, mcp_mode = false;
+    std::string database, query, query_file, prompt, provider_override, auth_token, bind_addr;
+    int timeout_override = 0, http_port = 8080, mcp_port = 9998;
+    bool interactive = false, agent = false, quiet = false, verbose = false, http_mode = false, mcp_mode = false;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -1007,21 +703,6 @@ int main(int argc, char* argv[]) {
             } catch (...) {
                 std::cerr << "Error: Invalid timeout value (must be positive integer in milliseconds)" << std::endl;
                 return 1;
-            }
-            continue;
-        }
-        if (arg == "--remote" && i + 1 < argc) { remote_spec = argv[++i]; continue; }
-        if (arg == "--server") {
-            server_mode = true;
-            // Optional port argument
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
-                try {
-                    server_port = std::stoi(argv[++i]);
-                    if (server_port < 0 || server_port > 65535) throw std::runtime_error("invalid");
-                } catch (...) {
-                    std::cerr << "Error: Invalid server port" << std::endl;
-                    return 1;
-                }
             }
             continue;
         }
@@ -1078,54 +759,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Validate mutual exclusivity
-    int mode_count = (server_mode ? 1 : 0) + (http_mode ? 1 : 0) + (mcp_mode ? 1 : 0) + (!remote_spec.empty() ? 1 : 0);
+    int mode_count = (http_mode ? 1 : 0) + (mcp_mode ? 1 : 0);
     if (mode_count > 1) {
-        std::cerr << "Error: Cannot use multiple modes (--server, --http, --mcp, --remote)\n";
+        std::cerr << "Error: Cannot use multiple modes (--http, --mcp)\n";
         return 1;
-    }
-
-    // Remote mode - connect to server instead of loading database
-    if (!remote_spec.empty()) {
-        std::string host = "127.0.0.1";
-        int port = 13337;
-        auto colon = remote_spec.find(':');
-        if (colon != std::string::npos) {
-            host = remote_spec.substr(0, colon);
-            try {
-                port = std::stoi(remote_spec.substr(colon + 1));
-                if (port < 1 || port > 65535) throw std::runtime_error("invalid");
-            } catch (...) {
-                std::cerr << "Error: Invalid port in --remote" << std::endl;
-                return 1;
-            }
-        } else {
-            host = remote_spec;
-        }
-
-        if (!quiet) std::cerr << "Connecting to " << host << ":" << port << "..." << std::endl;
-        xsql::socket::Client client;
-        if (!client.connect(host, port)) {
-            std::cerr << "Error: " << client.error() << std::endl;
-            return 1;
-        }
-        if (!quiet) std::cerr << "Connected." << std::endl << std::endl;
-
-        if (!query.empty()) {
-            auto qr = client.query(query);
-            if (qr.success) print_remote_result(qr);
-            else { std::cerr << "Error: " << qr.error << std::endl; return 1; }
-        } else if (agent) {
-            // Agent mode with remote SQL execution
-            run_remote_agent(client, verbose, provider_override, timeout_override);
-        } else {
-            run_remote_interactive(client);
-        }
-        return 0;
     }
 
     // Require database
     if (database.empty()) {
-        std::cerr << "Error: No database specified. Use -s <database.bndb> or --remote <host:port>\n\n";
+        std::cerr << "Error: No database specified. Use -s <database.bndb>\n\n";
         print_usage(argv[0]);
         return 1;
     }
@@ -1170,10 +812,6 @@ int main(int argc, char* argv[]) {
     }
 
     // Execute based on mode
-    if (server_mode) {
-        return run_server_mode(qe, server_port, auth_token);
-    }
-
 #ifdef BNSQL_HAS_HTTP
     if (http_mode) {
         return run_http_mode(qe, http_port, bind_addr, auth_token);

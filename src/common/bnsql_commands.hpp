@@ -4,6 +4,8 @@
 #include <string>
 #include <sstream>
 
+#include <xsql/thinclient/clipboard.hpp>
+
 #ifdef BNSQL_HAS_AI_AGENT
 #include "agent_settings.hpp"
 #endif
@@ -140,6 +142,13 @@ inline CommandResult handle_command(
         else if (subargs == "start") {
             if (callbacks.http_start) {
                 output = callbacks.http_start();
+                std::string host;
+                int actual_port = 0;
+                if (xsql::thinclient::extract_http_start_endpoint(output, host, actual_port)) {
+                    const std::string clipboard_text =
+                        xsql::thinclient::build_http_clipboard_payload("bnsql", host, actual_port);
+                    (void)xsql::thinclient::try_copy_text_to_clipboard_windows(clipboard_text);
+                }
             } else {
                 output = "HTTP server not available";
             }

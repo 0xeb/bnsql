@@ -73,7 +73,7 @@ endif()
 # ============================================================================
 
 if(TARGET xsql::xsql)
-    message(STATUS "bnsql: Using xsql::xsql from parent project")
+    message(STATUS "bnsql: Using existing xsql::xsql target")
 elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
     message(STATUS "bnsql: Added libxsql from external/libxsql submodule")

@@ -1,5 +1,5 @@
 // Auto-generated from bnsql_agent.md
-// Generated: 2026-02-04T12:18:33.011814
+// Generated: 2026-02-19T06:01:27.729375
 // DO NOT EDIT - regenerate with: python scripts/embed_prompt.py
 
 #pragma once
@@ -984,6 +984,24 @@ SELECT f.name, COALESCE(c.n, 0) FROM funcs f LEFT JOIN counts c ON c.to_ea = f.a
 
 ---
 
+## REPL Commands
+
+When running in interactive mode (`bnsql database.bndb -i`), these dot-commands are available:
+
+| Command | Description |
+|---------|-------------|
+| `.tables` | List all virtual tables |
+| `.schema [table]` | Show table schema |
+| `.info` | Show database metadata |
+| `.quit` / `.exit` | Exit REPL |
+| `.help` | Show available commands |
+| `.http start` | Start HTTP server on random port |
+| `.http stop` | Stop HTTP server |
+| `.http status` | Show HTTP server status |
+| `.agent` | Start AI agent mode |
+
+---
+
 ## Server Modes
 
 BNSQL supports two server protocols for remote queries: **HTTP REST** (recommended) and raw TCP.
@@ -1042,44 +1060,6 @@ curl http://localhost:8081/status
 
 ```json
 {"success": false, "error": "no such table: bad_table"}
-```
-
----
-
-### Raw TCP Server (Legacy)
-
-Binary protocol with length-prefixed JSON. Use only when HTTP is not available.
-
-**Starting the server:**
-```bash
-bnsql database.bndb --server 13337
-bnsql database.bndb --server 13337 --token mysecret
-```
-
-**Connecting as client:**
-```bash
-bnsql --remote localhost:13337 -c "SELECT name FROM funcs LIMIT 5"
-bnsql --remote localhost:13337 -i
-```
-
-**Wire Protocol:**
-- Format: `[4-byte length (big-endian uint32)] [JSON payload]`
-- Request: `{"sql": "SELECT ...", "token": "optional"}`
-- Response: `{"success": true, "columns": [...], "rows": [[...]], "row_count": N}`
-
-**Python Example:**
-```python
-import socket, struct, json
-
-def bnsql_query(sql, host="localhost", port=13337, token=None):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.connect((host, port))
-    req = {"sql": sql}
-    if token: req["token"] = token
-    payload = json.dumps(req).encode()
-    s.sendall(struct.pack(">I", len(payload)) + payload)
-    resp_len = struct.unpack(">I", s.recv(4))[0]
-    return json.loads(s.recv(resp_len))
 ```
 
 ---

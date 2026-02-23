@@ -73,6 +73,10 @@ endif()
 # ============================================================================
 
 function(add_bnsql_example name)
+    if(TARGET bnsql_${name})
+        return()
+    endif()
+
     add_executable(bnsql_${name} ${name}.cpp)
     target_link_libraries(bnsql_${name} PRIVATE ${BNSQL_EXAMPLE_LIB})
 
