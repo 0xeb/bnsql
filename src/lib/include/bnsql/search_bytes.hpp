@@ -86,8 +86,8 @@ public:
         return current_;
     }
 
-    sqlite3_int64 rowid() const override {
-        return static_cast<sqlite3_int64>(row_num_);
+    int64_t rowid() const override {
+        return static_cast<int64_t>(row_num_);
     }
 
 private:
