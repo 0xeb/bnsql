@@ -10,15 +10,12 @@
 
 namespace bnsql {
 
-// Callbacks for handling requests
-// QueryCallback: Direct SQL execution
-// AskCallback: Natural language query (requires AI agent)
+// Callback for SQL query execution
 using QueryCallback = std::function<std::string(const std::string& sql)>;
-using AskCallback = std::function<std::string(const std::string& question)>;
 
 // Internal command structure for cross-thread execution
 struct MCPPendingCommand {
-    enum class Type { Query, Ask };
+    enum class Type { Query };
     Type type;
     std::string input;
     std::string result;
@@ -41,16 +38,15 @@ public:
     MCPServer(const MCPServer&) = delete;
     MCPServer& operator=(const MCPServer&) = delete;
 
-    // Start MCP server on given port with callbacks
+    // Start MCP server on given port with query callback
     // Returns actual port used (may differ if auto-assigned)
     // Callbacks will be called on the main thread (in wait())
     // bind_addr: "127.0.0.1" for localhost only, "0.0.0.0" for all interfaces
-    // If ask_cb is nullptr, the agent_ask tool will not be registered
-    int start(int port, QueryCallback query_cb, AskCallback ask_cb = nullptr,
+    int start(int port, QueryCallback query_cb,
               const std::string& bind_addr = "127.0.0.1");
 
     // Block until server stops, processing commands on the calling thread
-    // This is where query_cb and ask_cb get called
+    // This is where query_cb gets called
     void wait();
 
     // Stop the server
@@ -79,9 +75,8 @@ private:
     std::condition_variable queue_cv_;
     std::queue<std::shared_ptr<MCPPendingCommand>> pending_commands_;
 
-    // Callbacks stored for main thread execution
+    // Callback stored for main thread execution
     QueryCallback query_cb_;
-    AskCallback ask_cb_;
 
     // Forward declaration - impl hides fastmcpp
     class Impl;
@@ -94,8 +89,7 @@ private:
 std::string format_mcp_info(
     const std::string& database_name,
     size_t function_count,
-    const std::string& url,
-    bool has_agent
+    const std::string& url
 );
 
 } // namespace bnsql

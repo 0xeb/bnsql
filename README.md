@@ -2,15 +2,15 @@
 
 > **Status:** Pre-release Alpha | **Platform:** Windows only (for now)
 
-**SQL interface for Binary Ninja** - Query your reverse engineering database using SQL and natural language.
+**SQL interface for Binary Ninja** - Query your reverse engineering database using SQL.
 
 ## Features
 
 - **SQL Queries** - Full SQLite syntax for complex analysis
-- **Natural Language** - AI-powered agent understands questions in plain English
 - **11 Virtual Tables** - Functions, strings, imports, xrefs, segments, and more
 - **20+ SQL Functions** - `disasm()`, `hex()`, `func_at()`, `xrefs_to()`, etc.
 - **Decompilation** - `decompile()` function, `pseudocode`, `hlil_vars`, `hlil_calls` tables for HLIL analysis
+- **MCP Server** - Model Context Protocol for AI tool integration
 - **Fast Startup** - ~5s for pre-analyzed databases (skips re-analysis)
 - **Plugin + CLI** - Use inside Binary Ninja or from command line
 
@@ -33,10 +33,8 @@ bnsql database.bndb
 # Single query
 bnsql database.bndb -c "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
 
-# Natural language (AI agent)
-bnsql database.bndb --prompt "what are the 5 largest functions?"
-bnsql database.bndb --prompt "which functions are called no more than 10 times?"
-bnsql database.bndb --prompt "find strings containing 'password'"
+# MCP server for AI tool integration
+bnsql database.bndb --mcp
 ```
 
 ### For LLM/AI Agent Integration
@@ -52,114 +50,6 @@ curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs LIMIT 
 ```
 
 See [Server Modes](#server-modes) for full HTTP API documentation, authentication, and MCP protocol support.
-
-## Natural Language Examples
-
-Ask questions in plain English:
-
-| Question | What it does |
-|----------|--------------|
-| "what are the 5 largest functions?" | Sorts functions by size |
-| "which functions are called no more than 10 times?" | Counts xrefs to each function |
-| "show me strings containing 'error'" | Searches string table |
-| "which modules does this binary import from?" | Groups imports by DLL |
-| "find crypto-related imports" | Filters for Crypt/Hash/AES patterns |
-| "what does this binary do?" | Summarizes entry points, imports, strings |
-
-### Call Graph Visualization
-
-Complex queries with visual output:
-
-```
-bnsql database.bndb --prompt "Find the busiest function. Show its callers (1 level, max 15) and callees (5 levels deep). Visualize as a tree."
-```
-
-Output:
-```
-╔═══════════════════════════╗
-║      sub_140013350        ║
-║     (377 calls)           ║
-║    BUSIEST FUNCTION       ║
-╚═══════════════════════════╝
-            │
-    ┌───────┴───────┐
-    ▼               ▼
- CALLERS         CALLEES
- (7 funcs)       (3 levels)
-    │               │
-    ▼               ▼
-sub_1400012d0   sub_14001d0d8
-sub_140004bf0       │
-sub_14001b0a0       ▼
-...             sub_14001ddc0
-                    │
-                    ▼
-                  free
-                 (leaf)
-```
-
-The agent analyzes xrefs, builds the call hierarchy, and renders ASCII visualization.
-
-### Security Audit
-
-```
-bnsql database.bndb --prompt "What dangerous APIs does this binary use? Rate the risk."
-```
-
-Output:
-```
-## Dangerous/Suspicious API Analysis
-
-### Summary: Low Risk Binary
-
-| Category | API | Module | Risk Level |
-|----------|-----|--------|------------|
-| Anti-Debugging | IsDebuggerPresent | KERNEL32 | Medium |
-| Process Termination | TerminateProcess | KERNEL32 | Medium |
-
-### What's NOT Present (Good Signs):
-
-| Category | Missing APIs |
-|----------|--------------|
-| Shell Execution | No ShellExecute, WinExec, CreateProcess |
-| Code Injection | No VirtualAlloc, WriteProcessMemory |
-| Networking | No sockets, HTTP, or internet APIs |
-
-Verdict: This binary does not appear to contain dangerous API usage patterns.
-```
-
-### Decompilation Analysis
-
-```
-bnsql database.bndb --prompt "Decompile main and explain what it does step by step"
-```
-
-Output:
-```
-## Main Function Analysis (5,682 bytes)
-
-int32_t main(int32_t argc, char** argv, char** envp)
-{
-    if (argc != 2) {
-        printf("Usage: %s <path_to_bndb_or_binary>
-", *argv);
-        return 1;
-    }
-
-    BNSetBundledPluginDirectory(pluginPath);
-    BNInitPlugins(true);
-
-    Ref<BinaryView> bv = BNOpenExistingDatabase(argv[1]);
-    // ... enumerate functions, strings, imports ...
-}
-
-| Step | Action | Code Pattern |
-|------|--------|--------------|
-| 1 | Validate args | if (argc != 2) -> print usage |
-| 2 | Init BN runtime | BNInitPlugins |
-| 3 | Load binary | Try .bndb first, fall back to raw |
-| 4 | Enumerate | Print functions, strings, imports |
-```
 
 ## SQL Examples
 
@@ -238,75 +128,19 @@ bnsql database.bndb -c "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10
 # Execute SQL file
 bnsql database.bndb -f queries.sql
 
-# Interactive agent mode (natural language)
-bnsql database.bndb --agent
-
-# One-shot natural language query
-bnsql database.bndb --prompt "Find the largest functions and show their callers"
-```
-
-### Prerequisites for AI Features
-
-The natural language features require one of these CLI tools installed and authenticated:
-
-| Provider | CLI Tool | Install | Login |
-|----------|----------|---------|-------|
-| Claude (default) | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` | Run `claude`, then `/login` |
-| GitHub Copilot | [Copilot CLI](https://github.com/features/copilot/cli/) | `npm install -g @github/copilot` | Run `copilot`, then `/login` |
-
-**Important:** You must be logged in before using AI features.
-
-### AI Provider Settings
-
-Switch between AI providers and configure BYOK (Bring Your Own Key):
-
-```bash
-# Use Claude (default)
-bnsql database.bndb --provider claude --prompt "What does this binary do?"
-
-# Use GitHub Copilot
-bnsql database.bndb --provider copilot --prompt "Find suspicious API calls"
-
-# View all settings
-bnsql --config
-
-# Set default provider
-bnsql --config agent.provider copilot
-
-# Set response timeout (milliseconds)
-bnsql --config agent.timeout 120000
-```
-
-### BYOK Configuration
-
-Use your own API key instead of Claude Code or Copilot CLI:
-
-```bash
-# Enable BYOK for Claude
-bnsql --config agent.byok.claude.enabled true
-bnsql --config agent.byok.claude.key sk-ant-api03-...
-
-# Enable BYOK for Copilot with Azure OpenAI
-bnsql --config agent.byok.copilot.enabled true
-bnsql --config agent.byok.copilot.key your-api-key
-bnsql --config agent.byok.copilot.endpoint https://your-resource.openai.azure.com
-bnsql --config agent.byok.copilot.model gpt-4
-bnsql --config agent.byok.copilot.type azure
+# MCP server for AI tool integration
+bnsql database.bndb --mcp
 ```
 
 ### Interactive Commands
 
-In agent mode, use dot commands:
-
 ```
-agent> .help               Show help
-agent> .agent provider     Show/set provider
-agent> .agent byok         Show BYOK status
-agent> .tables             List tables
-agent> .schema funcs       Show table schema
-agent> .clear              Clear conversation
-agent> .sql                Switch to SQL mode
-agent> .quit               Exit
+bnsql> .help               Show help
+bnsql> .tables             List tables
+bnsql> .schema funcs       Show table schema
+bnsql> .clear              Clear session
+bnsql> .http start         Start HTTP server
+bnsql> .quit               Exit
 ```
 
 ## Server Modes
@@ -376,8 +210,7 @@ bnsql database.bndb --mcp 9999
 
 | Tool | Description |
 |------|-------------|
-| `query` | Execute SQL query, returns JSON results |
-| `ask` | Natural language query (uses AI agent) |
+| `sql_query` | Execute SQL query, returns results |
 
 **Usage:** Start the MCP server, then configure your MCP client to connect to `http://localhost:9998/sse`.
 
@@ -398,19 +231,9 @@ The server can also be started from the Binary Ninja plugin:
 
 ```bash
 cmake -B build -DBUILD_WITH_BNSQL=ON \
-      -DBN_INSTALL_DIR=/path/to/binaryninja \
-      -DBNSQL_WITH_AI_AGENT=ON
+      -DBN_INSTALL_DIR=/path/to/binaryninja
 cmake --build build --config Release
-
-# Optional: build the Binary Ninja UI plugin
-cmake -B build -DBNSQL_BUILD_PLUGIN=ON ...
 ```
-
-## AI Agent Prompt
-
-For standalone AI agents (Claude, etc.), use the comprehensive agent prompt:
-
-- [`prompts/bnsql_agent.md`](prompts/bnsql_agent.md) - Complete reference for tables, functions, and query patterns
 
 
 ## Performance Tips
@@ -468,15 +291,14 @@ cmake --build build --config Release
 
 <table>
 <tr>
-<td><a href="assets/bnsql_interactive_agent.jpg"><img src="assets/bnsql_interactive_agent.jpg" width="400"/></a></td>
 <td><a href="assets/bnsql_hlil.jpg"><img src="assets/bnsql_hlil.jpg" width="400"/></a></td>
-</tr>
-<tr>
 <td><a href="assets/bnsql_imports.jpg"><img src="assets/bnsql_imports.jpg" width="400"/></a></td>
-<td><a href="assets/bnsql_main_calls.jpg"><img src="assets/bnsql_main_calls.jpg" width="400"/></a></td>
 </tr>
 <tr>
+<td><a href="assets/bnsql_main_calls.jpg"><img src="assets/bnsql_main_calls.jpg" width="400"/></a></td>
 <td><a href="assets/bnsql_getversion.jpg"><img src="assets/bnsql_getversion.jpg" width="400"/></a></td>
+</tr>
+<tr>
 <td><a href="assets/bnsql_busy.jpg"><img src="assets/bnsql_busy.jpg" width="400"/></a></td>
 </tr>
 </table>

@@ -24,6 +24,7 @@
 
 #include <bnsql/vtable.hpp>
 #include <bnsql/entities.hpp>
+#include <bnsql/persistence.hpp>
 #include <xsql/database.hpp>
 
 #include "binaryninjaapi.h"
@@ -33,6 +34,8 @@
 #include <vector>
 #include <unordered_map>
 #include <sstream>
+#include <algorithm>
+#include <cctype>
 
 namespace bnsql {
 namespace decompiler {
@@ -201,6 +204,9 @@ struct PseudocodeLine {
     int line_num;
     std::string line;
     int indent;
+    uint64_t ea = 0;
+    std::string comment;
+    std::string comment_placement;  // "line" or "none"
 };
 
 /**
@@ -248,6 +254,7 @@ struct HLILVar {
     int var_idx;
     std::string name;
     std::string type;
+    std::string comment;
     size_t size;
     bool is_arg;
     int arg_idx;
@@ -255,6 +262,10 @@ struct HLILVar {
     std::string storage;  // "stack", "register", "split"
     int64_t stack_off;
     std::string reg;
+
+    // Internal identity fields used for safe UPDATE operations.
+    BNVariableSourceType source_type = RegisterVariableSourceType;
+    int64_t storage_id = 0;
 };
 
 /**
@@ -282,17 +293,22 @@ inline Ref<BinaryView> get_bv() {
     return entities::get_bv();
 }
 
-/**
- * Get HLIL for a function
- */
-inline Ref<HighLevelILFunction> get_hlil(uint64_t func_addr) {
+inline Ref<Function> get_function(uint64_t func_addr) {
     auto bv = get_bv();
     if (!bv) return nullptr;
 
     auto funcs = bv->GetAnalysisFunctionsForAddress(func_addr);
     if (funcs.empty()) return nullptr;
+    return funcs[0];
+}
 
-    return funcs[0]->GetHighLevelIL();
+/**
+ * Get HLIL for a function
+ */
+inline Ref<HighLevelILFunction> get_hlil(uint64_t func_addr) {
+    auto func = get_function(func_addr);
+    if (!func) return nullptr;
+    return func->GetHighLevelIL();
 }
 
 /**
@@ -312,6 +328,141 @@ inline std::string text_line_to_string(const std::vector<InstructionTextToken>& 
 inline std::string type_to_string(const Confidence<Ref<Type>>& type) {
     if (!type || !type.GetValue()) return "";
     return type->GetString();
+}
+
+inline std::string comment_for_address(const Ref<BinaryView>& bv, uint64_t ea) {
+    if (!bv || ea == 0) return "";
+
+    auto comment = bv->GetCommentForAddress(ea);
+    if (!comment.empty()) return comment;
+
+    auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
+    if (!funcs.empty()) {
+        comment = funcs[0]->GetCommentForAddress(ea);
+        if (!comment.empty()) return comment;
+    }
+
+    return "";
+}
+
+inline std::string hlil_var_comment_key(const HLILVar& row) {
+    std::ostringstream key;
+    key << "bnsql.hlil_vars.comment."
+        << row.func_addr << "."
+        << static_cast<int>(row.source_type) << "."
+        << row.storage_id << "."
+        << row.var_idx;
+    return key.str();
+}
+
+inline std::string get_hlil_var_comment(const Ref<BinaryView>& bv, const HLILVar& row) {
+    if (!bv) return "";
+    auto metadata = bv->QueryMetadata(hlil_var_comment_key(row));
+    if (!metadata || !metadata->IsString()) return "";
+    return metadata->GetString();
+}
+
+inline bool set_hlil_var_comment(const Ref<BinaryView>& bv, const HLILVar& row, const std::string& comment) {
+    if (!bv) return false;
+    std::string key = hlil_var_comment_key(row);
+    if (comment.empty()) {
+        bv->RemoveMetadata(key);
+    } else {
+        bv->StoreMetadata(key, new Metadata(comment));
+    }
+    return true;
+}
+
+inline bool resolve_hlil_var_target(const HLILVar& row, Ref<Function>& func_out, Variable& var_out) {
+    auto func = get_function(row.func_addr);
+    if (!func) return false;
+
+    auto vars = func->GetVariables();
+
+    // Primary match: full internal identity.
+    for (const auto& [var, info] : vars) {
+        (void)info;
+        if (var.type == row.source_type &&
+            var.storage == row.storage_id &&
+            static_cast<int>(var.index) == row.var_idx) {
+            func_out = func;
+            var_out = var;
+            return true;
+        }
+    }
+
+    // Fallback match: by var_idx if identity changed after re-analysis.
+    for (const auto& [var, info] : vars) {
+        (void)info;
+        if (static_cast<int>(var.index) == row.var_idx) {
+            func_out = func;
+            var_out = var;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+inline bool parse_type_decl(
+    const Ref<BinaryView>& bv,
+    const std::string& decl,
+    const std::string& fallback_name,
+    Ref<Type>& out_type)
+{
+    if (!bv || decl.empty()) return false;
+
+    auto try_parse = [&](const std::string& text) -> bool {
+        QualifiedNameAndType parsed;
+        std::string errors;
+        if (!bv->ParseTypeString(text, parsed, errors)) return false;
+        if (!parsed.type) return false;
+        out_type = parsed.type;
+        return true;
+    };
+
+    if (try_parse(decl)) return true;
+
+    // Some parsers expect a complete declaration with an identifier.
+    if (!fallback_name.empty()) {
+        if (try_parse(decl + " " + fallback_name)) return true;
+        if (try_parse(decl + " " + fallback_name + ";")) return true;
+    }
+
+    if (try_parse(decl + ";")) return true;
+
+    return false;
+}
+
+inline bool parse_function_type_decl(
+    const Ref<BinaryView>& bv,
+    const std::string& decl,
+    const std::string& fallback_name,
+    Ref<Type>& out_type)
+{
+    if (!bv || decl.empty()) return false;
+
+    auto try_parse = [&](const std::string& text) -> bool {
+        QualifiedNameAndType parsed;
+        std::string errors;
+        if (!bv->ParseTypeString(text, parsed, errors)) return false;
+        if (!parsed.type || parsed.type->GetClass() != FunctionTypeClass) return false;
+        out_type = parsed.type;
+        return true;
+    };
+
+    if (try_parse(decl)) return true;
+    if (try_parse(decl + ";")) return true;
+
+    // If the user provided something like "int(void)", inject function name.
+    auto lparen = decl.find('(');
+    if (lparen != std::string::npos && !fallback_name.empty()) {
+        std::string with_name = decl.substr(0, lparen) + " " + fallback_name + decl.substr(lparen);
+        if (try_parse(with_name)) return true;
+        if (try_parse(with_name + ";")) return true;
+    }
+
+    return false;
 }
 
 // ============================================================================
@@ -335,6 +486,7 @@ inline void collect_pseudocode(std::vector<PseudocodeLine>& out, uint64_t func_a
     // Use GetRootExpr and walk to get text representation
     auto root = lines->GetRootExpr();
     auto textLines = lines->GetExprText(root.exprIndex, true, nullptr);
+    auto bv = get_bv();
 
     int line_num = 0;
     for (const auto& line : textLines) {
@@ -343,6 +495,9 @@ inline void collect_pseudocode(std::vector<PseudocodeLine>& out, uint64_t func_a
         pl.line_num = line_num++;
         pl.line = text_line_to_string(line.tokens);
         pl.indent = 0;  // DisassemblyTextLine doesn't have indent field
+        pl.ea = line.addr;
+        pl.comment = comment_for_address(bv, pl.ea);
+        pl.comment_placement = pl.comment.empty() ? "none" : "line";
         out.push_back(std::move(pl));
     }
 }
@@ -529,6 +684,8 @@ inline void collect_hlil_vars(std::vector<HLILVar>& out, uint64_t func_addr) {
         hv.func_addr = func_addr;
         hv.var_idx = static_cast<int>(variable.index);
         hv.name = varInfo.name;
+        hv.source_type = variable.type;
+        hv.storage_id = variable.storage;
 
         hv.type = type_to_string(varInfo.type);
         hv.size = !varInfo.type ? 0 : varInfo.type->GetWidth();
@@ -558,8 +715,31 @@ inline void collect_hlil_vars(std::vector<HLILVar>& out, uint64_t func_addr) {
                 break;
         }
 
+        hv.comment = get_hlil_var_comment(bv, hv);
+
         out.push_back(std::move(hv));
     }
+}
+
+inline bool lookup_hlil_var_by_rowid(HLILVar& out, int64_t rowid) {
+    if (rowid < 0) return false;
+
+    auto bv = get_bv();
+    if (!bv) return false;
+
+    int64_t current = 0;
+    for (auto& func : bv->GetAnalysisFunctionList()) {
+        std::vector<HLILVar> vars;
+        collect_hlil_vars(vars, func->GetStart());
+        for (auto& var : vars) {
+            if (current == rowid) {
+                out = std::move(var);
+                return true;
+            }
+            current++;
+        }
+    }
+    return false;
 }
 
 /**
@@ -679,6 +859,62 @@ inline CachedTableDef<PseudocodeLine> define_pseudocode() {
         })
         .column_int("indent", [](const PseudocodeLine& r) -> int {
             return r.indent;
+        })
+        .column_int64("ea", [](const PseudocodeLine& r) -> int64_t {
+            return static_cast<int64_t>(r.ea);
+        })
+        .column_text_rw("comment",
+            [](const PseudocodeLine& r) -> std::string {
+                return r.comment;
+            },
+            [](PseudocodeLine& r, const char* text) -> bool {
+                auto bv = get_bv();
+                if (!bv || r.ea == 0) return false;
+
+                std::string comment = text ? text : "";
+                bv->SetCommentForAddress(r.ea, comment);
+                r.comment = comment;
+                r.comment_placement = comment.empty() ? "none" : "line";
+                return true;
+            })
+        .column_text_rw("comment_placement",
+            [](const PseudocodeLine& r) -> std::string {
+                return r.comment_placement;
+            },
+            [](PseudocodeLine& r, const char* placement) -> bool {
+                auto bv = get_bv();
+                if (!bv || r.ea == 0) return false;
+
+                std::string mode = placement ? placement : "";
+                std::transform(mode.begin(), mode.end(), mode.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+                if (mode == "none" || mode.empty()) {
+                    bv->SetCommentForAddress(r.ea, "");
+                    r.comment.clear();
+                    r.comment_placement = "none";
+                    return true;
+                }
+
+                if (mode == "line") {
+                    r.comment_placement = r.comment.empty() ? "none" : "line";
+                    return true;
+                }
+
+                return false;
+            })
+        .deletable([](PseudocodeLine& r) -> bool {
+            auto bv = get_bv();
+            if (!bv || r.ea == 0) return false;
+
+            bv->SetCommentForAddress(r.ea, "");
+            for (auto& func : bv->GetAnalysisFunctionsContainingAddress(r.ea)) {
+                func->SetCommentForAddress(r.ea, "");
+            }
+
+            r.comment.clear();
+            r.comment_placement = "none";
+            return true;
         })
         .build();
 }
@@ -825,18 +1061,159 @@ inline CachedTableDef<HLILVar> define_hlil_vars() {
                 collect_hlil_vars(cache, func->GetStart());
             }
         })
+        .row_lookup([](HLILVar& row, int64_t rowid) -> bool {
+            return lookup_hlil_var_by_rowid(row, rowid);
+        })
         .column_int64("func_addr", [](const HLILVar& r) -> int64_t {
             return static_cast<int64_t>(r.func_addr);
         })
         .column_int("var_idx", [](const HLILVar& r) -> int {
             return r.var_idx;
         })
-        .column_text("name", [](const HLILVar& r) -> std::string {
-            return r.name;
-        })
-        .column_text("type", [](const HLILVar& r) -> std::string {
-            return r.type;
-        })
+        .column_text_rw("name",
+            [](const HLILVar& r) -> std::string {
+                return r.name;
+            },
+            [](HLILVar& r, const char* text) -> bool {
+                std::string new_name = text ? text : "";
+                if (new_name.empty()) {
+                    xsql::set_vtab_error("Variable name cannot be empty");
+                    return false;
+                }
+
+                Ref<Function> func;
+                Variable var;
+                if (!resolve_hlil_var_target(r, func, var)) {
+                    xsql::set_vtab_error("Failed to resolve variable target for: " + r.name);
+                    return false;
+                }
+
+                auto vars = func->GetVariables();
+                auto it = vars.find(var);
+                if (it == vars.end()) {
+                    xsql::set_vtab_error("Variable not found in function variable map: " + r.name);
+                    return false;
+                }
+                if (!it->second.type || !it->second.type.GetValue()) {
+                    xsql::set_vtab_error("Variable has no type information: " + r.name);
+                    return false;
+                }
+                // Use the correct BN API depending on variable source type.
+                // Delete-before-create is needed because CreateUserVariable won't
+                // override an existing user variable's name.
+                if (var.type == StackVariableSourceType) {
+                    if (func->IsVariableUserDefinded(var))
+                        func->DeleteUserStackVariable(var.storage);
+                    func->CreateUserStackVariable(var.storage, it->second.type, new_name);
+                } else {
+                    if (func->IsVariableUserDefinded(var))
+                        func->DeleteUserVariable(var);
+                    func->CreateUserVariable(var, it->second.type, new_name, true);
+                }
+
+                // NOTE: No Reanalyze() here — batch renames must complete before
+                // re-analysis, otherwise earlier renames get undone. Use
+                // SELECT decompile(addr, 0, 1) after all renames to trigger refresh.
+
+                auto updated_type = func->GetVariableType(var);
+                r.name = new_name;
+                r.type = type_to_string(updated_type);
+                if (updated_type.GetValue()) {
+                    r.size = updated_type->GetWidth();
+                }
+                return true;
+            })
+        .column_text_rw("type",
+            [](const HLILVar& r) -> std::string {
+                return r.type;
+            },
+            [](HLILVar& r, const char* text) -> bool {
+                Ref<Function> func;
+                Variable var;
+                if (!resolve_hlil_var_target(r, func, var)) {
+                    xsql::set_vtab_error("Failed to resolve variable target for: " + r.name);
+                    return false;
+                }
+
+                auto vars = func->GetVariables();
+                auto it = vars.find(var);
+                if (it == vars.end()) {
+                    xsql::set_vtab_error("Variable not found in function variable map: " + r.name);
+                    return false;
+                }
+
+                std::string new_decl = text ? text : "";
+                if (new_decl.empty()) {
+                    // Treat empty type as "clear user override".
+                    func->DeleteUserVariable(var);
+
+                    auto refreshed = func->GetVariables();
+                    auto rit = refreshed.find(var);
+                    if (rit != refreshed.end()) {
+                        r.name = rit->second.name;
+                        r.type = type_to_string(rit->second.type);
+                        r.size = rit->second.type.GetValue()
+                                     ? rit->second.type->GetWidth()
+                                     : 0;
+                    } else {
+                        r.type.clear();
+                        r.size = 0;
+                    }
+                    return true;
+                }
+
+                auto bv = get_bv();
+                if (!bv) return false;
+
+                std::string keep_name = r.name.empty() ? it->second.name : r.name;
+                if (keep_name.empty()) {
+                    keep_name = "var_" + std::to_string(r.var_idx);
+                }
+
+                Ref<Type> parsed_type;
+                if (!parse_type_decl(bv, new_decl, keep_name, parsed_type) || !parsed_type) {
+                    xsql::set_vtab_error("Failed to parse type: " + new_decl);
+                    return false;
+                }
+
+                if (var.type == StackVariableSourceType) {
+                    if (func->IsVariableUserDefinded(var))
+                        func->DeleteUserStackVariable(var.storage);
+                    func->CreateUserStackVariable(var.storage, Confidence<Ref<Type>>(parsed_type), keep_name);
+                } else {
+                    func->CreateUserVariable(var, Confidence<Ref<Type>>(parsed_type), keep_name, true);
+                }
+
+                auto updated_type = func->GetVariableType(var);
+                r.name = func->GetVariableName(var);
+                r.type = type_to_string(updated_type);
+                r.size = updated_type.GetValue()
+                             ? updated_type->GetWidth()
+                             : parsed_type->GetWidth();
+                return true;
+            })
+        .column_text_rw("comment",
+            [](const HLILVar& r) -> std::string {
+                return r.comment;
+            },
+            [](HLILVar& r, const char* text) -> bool {
+                Ref<Function> func;
+                Variable var;
+                if (!resolve_hlil_var_target(r, func, var)) return false;
+
+                // Refresh identity in case analysis changed variable internals.
+                r.source_type = var.type;
+                r.storage_id = var.storage;
+                r.var_idx = static_cast<int>(var.index);
+
+                auto bv = get_bv();
+                if (!bv) return false;
+
+                std::string new_comment = text ? text : "";
+                if (!set_hlil_var_comment(bv, r, new_comment)) return false;
+                r.comment = new_comment;
+                return true;
+            })
         .column_int64("size", [](const HLILVar& r) -> int64_t {
             return static_cast<int64_t>(r.size);
         })
@@ -857,6 +1234,23 @@ inline CachedTableDef<HLILVar> define_hlil_vars() {
         })
         .column_text("reg", [](const HLILVar& r) -> std::string {
             return r.reg;
+        })
+        .deletable([](HLILVar& r) -> bool {
+            Ref<Function> func;
+            Variable var;
+            if (!resolve_hlil_var_target(r, func, var)) {
+                xsql::set_vtab_error("Failed to resolve variable target for delete: " + r.name);
+                return false;
+            }
+
+            func->DeleteUserVariable(var);
+            return true;
+        })
+        .after_modify([](const std::string&) {
+            // Invalidate decompiler caches after hlil_vars mutations.
+            // Called AFTER xUpdate completes and hlil_vars cache is already invalidated,
+            // so this is safe (no use-after-free on the shared cache).
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
         })
         .build();
 }
@@ -922,6 +1316,7 @@ inline CachedTableDef<HLILCall> define_hlil_calls() {
 /**
  * decompile(addr) - Get pseudocode for function at address
  * decompile(addr, limit) - Get pseudocode with line limit
+ * decompile(addr, limit, refresh) - Get pseudocode; refresh=1 forces re-decompilation
  */
 static void sql_decompile(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     if (argc < 1) {
@@ -938,11 +1333,24 @@ static void sql_decompile(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
     uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
     int limit = (argc >= 2) ? sqlite3_value_int(argv[1]) : 10000;
     if (limit <= 0) limit = 10000;
+    bool refresh = (argc >= 3) ? (sqlite3_value_int(argv[2]) != 0) : false;
 
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
     if (funcs.empty()) {
         sqlite3_result_null(ctx);
         return;
+    }
+
+    if (refresh) {
+        funcs[0]->Reanalyze(BNFunctionUpdateType::UserFunctionUpdate);
+        bv->UpdateAnalysisAndWait();
+        if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+        // Re-fetch function list after re-analysis
+        funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
+        if (funcs.empty()) {
+            sqlite3_result_null(ctx);
+            return;
+        }
     }
 
     auto hlil = funcs[0]->GetHighLevelIL();
@@ -1070,6 +1478,8 @@ inline bool register_decompiler_functions(xsql::Database& db) {
                            sql_decompile, nullptr, nullptr);
     sqlite3_create_function(db.handle(), "decompile", 2, SQLITE_UTF8, nullptr,
                            sql_decompile, nullptr, nullptr);
+    sqlite3_create_function(db.handle(), "decompile", 3, SQLITE_UTF8, nullptr,
+                           sql_decompile, nullptr, nullptr);
     sqlite3_create_function(db.handle(), "hlil_at", 1, SQLITE_UTF8, nullptr,
                            sql_hlil_at, nullptr, nullptr);
     sqlite3_create_function(db.handle(), "hlil_op_at", 1, SQLITE_UTF8, nullptr,
@@ -1094,7 +1504,23 @@ struct DecompilerTableRegistry {
         , hlil_calls(define_hlil_calls())
     {}
 
+    ~DecompilerTableRegistry() {
+        if (persistence::on_decompiler_invalidate_owner == this) {
+            persistence::on_decompiler_invalidate = nullptr;
+            persistence::on_decompiler_invalidate_owner = nullptr;
+        }
+    }
+
     void register_all(xsql::Database& db) {
+        // Wire up decompiler cache invalidation so entity mutations can trigger it.
+        persistence::on_decompiler_invalidate = [this]() {
+            pseudocode.invalidate_cache();
+            hlil_vars.invalidate_cache();
+            hlil_calls.invalidate_cache();
+            hlil_ast.invalidate_cache();
+        };
+        persistence::on_decompiler_invalidate_owner = this;
+
         // Register cached tables
         db.register_cached_table("bn_pseudocode", &pseudocode);
         db.create_table("pseudocode", "bn_pseudocode");
@@ -1131,6 +1557,18 @@ private:
                 COUNT(*) FILTER (WHERE arg_idx >= 0) AS arg_count
             FROM hlil_calls
             GROUP BY func_addr, call_expr_id, call_ea, callee_addr, callee_name
+        )", nullptr, nullptr);
+
+        // disasm_calls - Call sites with callee info (idasql parity)
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS disasm_calls AS
+            SELECT DISTINCT
+                func_addr,
+                call_ea AS ea,
+                callee_addr,
+                callee_name
+            FROM hlil_calls
+            WHERE callee_name != ''
         )", nullptr, nullptr);
 
         // Advanced views on _hlil_ast (underscore prefix = internal/expert)
@@ -1188,6 +1626,47 @@ private:
             CREATE VIEW IF NOT EXISTS _hlil_ast_vars AS
             SELECT func_addr, expr_id, ea, var_idx, var_name, var_is_arg, type
             FROM _hlil_ast WHERE var_idx >= 0
+        )", nullptr, nullptr);
+
+        // Public BN-native HLIL views for common structured analysis patterns.
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS hlil_v_loops AS
+            SELECT func_addr, expr_id, ea, op_name, cond_id, body_id, init_id, update_id
+            FROM _hlil_ast_loops
+        )", nullptr, nullptr);
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS hlil_v_ifs AS
+            SELECT func_addr, expr_id, ea, cond_id, true_id, false_id
+            FROM _hlil_ast_ifs
+        )", nullptr, nullptr);
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS hlil_v_comparisons AS
+            SELECT func_addr, expr_id, ea, op_name, left_id, right_id
+            FROM _hlil_ast_comparisons
+        )", nullptr, nullptr);
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS hlil_v_assignments AS
+            SELECT func_addr, expr_id, ea, op_name, left_id, right_id, var_name
+            FROM _hlil_ast_assignments
+        )", nullptr, nullptr);
+
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS hlil_v_returns AS
+            SELECT
+                r.func_addr,
+                r.expr_id AS return_expr_stmt_id,
+                r.ea,
+                r.return_expr_id,
+                e.op_name AS return_op,
+                e.const_val AS return_const,
+                e.var_name AS return_var_name
+            FROM _hlil_ast_returns r
+            LEFT JOIN _hlil_ast e
+                ON e.func_addr = r.func_addr
+               AND e.expr_id = r.return_expr_id
         )", nullptr, nullptr);
     }
 };

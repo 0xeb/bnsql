@@ -42,8 +42,16 @@
  *   - hlil_vars: Local variables (func_addr, var_idx, name, type, is_arg, storage, ...)
  *   - hlil_calls: Function calls with args (func_addr, callee_name, arg_idx, arg_const, ...)
  *
+ * Type intelligence tables:
+ *   - types: All defined types (id, name, kind, size, is_struct, is_enum, ...)
+ *   - type_members: Struct/union member fields (type_id, member_name, offset, member_type)
+ *   - type_enum_values: Enum constant values (type_id, value_name, value)
+ *   - func_signatures: Function parameter/return types (func_addr, arg_index, arg_type)
+ *   - patches: Patched bytes (address, original_byte, patched_byte, status)
+ *
  * Decompiler views:
  *   - hlil_v_calls: All function calls
+ *   - disasm_calls: Call sites with callee info
  *   - hlil_v_loops: While/for/do-while loops
  *   - hlil_v_ifs: Conditional statements
  *   - hlil_v_comparisons: All comparisons
@@ -52,6 +60,11 @@
  *   - hlil_v_derefs: Pointer dereferences
  *   - hlil_v_constants: All constants
  *   - hlil_v_vars_used: Variable usage
+ *
+ * Other views:
+ *   - function_chunks: Function address ranges (aggregated from blocks)
+ *   - types_v_structs: Struct types only
+ *   - types_v_enums: Enum types only
  *
  * Decompiler SQL functions:
  *   - decompile(addr): Get pseudocode for function
@@ -66,4 +79,5 @@
 #include "entities.hpp"
 #include "functions.hpp"
 #include "decompiler.hpp"
+#include "types.hpp"
 #include "database.hpp"

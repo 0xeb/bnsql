@@ -19,8 +19,9 @@
  *   - xrefs_from(address)       - Get xrefs from address (JSON array)
  *   - segment_at(address)       - Get segment name containing address
  *   - comment_at(address)       - Get comment at address
- *   - set_comment(address, text) - Set comment at address
+ *   - set_comment(address, text) - Set address comment
  *   - set_name(address, name)   - Set name at address
+ *   - entities_search(pattern, limit, offset) - Search unified entities (JSON array)
  *
  * Navigation:
  *   - next_head(address)        - Get next defined head
@@ -40,9 +41,12 @@
 #include <sstream>
 #include <iomanip>
 #include <vector>
+#include <algorithm>
+#include <cctype>
 
 #include "binaryninjaapi.h"
 #include <bnsql/entities.hpp>
+#include <bnsql/persistence.hpp>
 
 namespace bnsql {
 namespace functions {
@@ -55,6 +59,54 @@ using namespace BinaryNinja;
 
 inline Ref<BinaryView> get_bv() {
     return entities::get_bv();
+}
+
+inline Ref<Function> get_function_for_address(const Ref<BinaryView>& bv, uint64_t ea) {
+    if (!bv) return nullptr;
+
+    auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
+    if (!funcs.empty()) return funcs[0];
+
+    funcs = bv->GetAnalysisFunctionsForAddress(ea);
+    if (!funcs.empty()) return funcs[0];
+
+    return nullptr;
+}
+
+inline std::string to_ascii_lower(std::string in) {
+    std::transform(in.begin(), in.end(), in.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return in;
+}
+
+inline std::string json_escape_ascii(const std::string& in) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(in.size() + 8);
+    for (unsigned char c : in) {
+        switch (c) {
+            case '\"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    // Escape control characters as \u00XX
+                    out += "\\u00";
+                    out += kHex[(c >> 4) & 0x0f];
+                    out += kHex[c & 0x0f];
+                } else {
+                    // Pass through printable ASCII and UTF-8 bytes (JSON allows raw UTF-8)
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return out;
 }
 
 // ============================================================================
@@ -413,21 +465,34 @@ static void sql_comment_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionA
 
     uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
     std::string comment = bv->GetCommentForAddress(ea);
-
     if (!comment.empty()) {
         ctx.result_text(comment);
-    } else {
-        // Try function comment
-        auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
-        if (!funcs.empty()) {
-            comment = funcs[0]->GetCommentForAddress(ea);
-            if (!comment.empty()) {
-                ctx.result_text(comment);
-                return;
-            }
-        }
-        ctx.result_null();
+        return;
     }
+
+    auto func = get_function_for_address(bv, ea);
+    if (!func) {
+        ctx.result_null();
+        return;
+    }
+
+    comment = func->GetCommentForAddress(ea);
+    if (!comment.empty()) {
+        ctx.result_text(comment);
+        return;
+    }
+
+    // BN function comments are function-level metadata, not tied to an address.
+    // We expose them at the function start address for address-centric workflows.
+    if (ea == func->GetStart()) {
+        comment = func->GetComment();
+        if (!comment.empty()) {
+            ctx.result_text(comment);
+            return;
+        }
+    }
+
+    ctx.result_null();
 }
 
 static void sql_set_comment(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
@@ -790,46 +855,197 @@ static void sql_operand(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg*
 // ============================================================================
 
 static void sql_save(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* /*argv*/) {
+    (void)argc;
+    std::string saved_path;
+    std::string save_error;
+    if (!persistence::save_binary_view(get_bv(), &save_error, &saved_path)) {
+        ctx.result_error(save_error);
+        return;
+    }
+    if (saved_path.empty()) {
+        ctx.result_text_static("Database saved");
+        return;
+    }
+    ctx.result_text("Database saved: " + saved_path);
+}
+
+static void sql_entities_search(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    if (argc < 1) {
+        ctx.result_error("entities_search requires at least 1 argument (pattern)");
+        return;
+    }
+
     auto bv = get_bv();
     if (!bv) {
         ctx.result_error("No BinaryView context");
         return;
     }
 
-    auto file = bv->GetFile();
-    if (!file) {
-        ctx.result_error("No FileMetadata for BinaryView");
+    const char* pattern_cstr = argv[0].as_c_str();
+    if (!pattern_cstr || pattern_cstr[0] == '\0') {
+        ctx.result_text_static("[]");
         return;
     }
 
-    // If not backed by a database yet, create one first
-    if (!file->IsBackedByDatabase()) {
-        std::string filename = file->GetFilename();
-        if (filename.empty()) {
-            ctx.result_error("Cannot save: no filename associated with BinaryView");
-            return;
-        }
-        // Derive .bndb path from current filename
-        std::string bndb_path = filename;
-        auto dot = bndb_path.rfind('.');
-        if (dot != std::string::npos)
-            bndb_path = bndb_path.substr(0, dot);
-        bndb_path += ".bndb";
+    int limit_in = (argc >= 2) ? argv[1].as_int() : 50;
+    int offset_in = (argc >= 3) ? argv[2].as_int() : 0;
+    if (limit_in < 0) limit_in = 0;
+    if (offset_in < 0) offset_in = 0;
 
-        if (!bv->CreateDatabase(bndb_path)) {
-            std::string err = "Failed to create database: " + bndb_path;
-            ctx.result_error(err);
-            return;
-        }
+    size_t limit = static_cast<size_t>(limit_in);
+    size_t offset = static_cast<size_t>(offset_in);
+    if (limit > 500) limit = 500;
+    if (limit == 0) {
+        ctx.result_text_static("[]");
+        return;
     }
 
-    if (bv->SaveAutoSnapshot()) {
-        ctx.result_text_static("Database saved");
-    } else {
-        std::string filename = file->GetFilename();
-        std::string err = "SaveAutoSnapshot failed for: " + filename;
-        ctx.result_error(err);
+    struct EntityMatch {
+        std::string name;
+        std::string kind;
+        uint64_t address = 0;
+        std::string parent_name;
+        std::string qualified_name;
+        std::string source;
+    };
+
+    std::vector<EntityMatch> matches;
+    const std::string pattern = to_ascii_lower(std::string(pattern_cstr));
+
+    auto matches_text = [&](const std::string& value) -> bool {
+        return to_ascii_lower(value).find(pattern) != std::string::npos;
+    };
+
+    const size_t max_matches = offset + limit;
+    auto maybe_add = [&](EntityMatch&& e) {
+        if (matches.size() >= max_matches) return;
+        if (matches_text(e.name) || matches_text(e.parent_name) || matches_text(e.qualified_name)) {
+            matches.push_back(std::move(e));
+        }
+    };
+
+    for (auto& f : bv->GetAnalysisFunctionList()) {
+        auto sym = f->GetSymbol();
+        std::string name = sym ? sym->GetFullName() : ("sub_" + std::to_string(f->GetStart()));
+        EntityMatch e;
+        e.name = name;
+        e.kind = "function";
+        e.address = f->GetStart();
+        e.parent_name = "";
+        e.qualified_name = name;
+        e.source = "analysis.functions";
+        maybe_add(std::move(e));
     }
+
+    auto symbols = bv->GetSymbols();
+    std::sort(symbols.begin(), symbols.end(), [](const Ref<Symbol>& a, const Ref<Symbol>& b) {
+        if (a->GetAddress() != b->GetAddress()) return a->GetAddress() < b->GetAddress();
+        return a->GetFullName() < b->GetFullName();
+    });
+    for (const auto& sym : symbols) {
+        EntityMatch e;
+        e.name = sym->GetFullName();
+        e.kind = "symbol";
+        e.address = sym->GetAddress();
+        e.parent_name = "";
+        e.qualified_name = e.name;
+        e.source = "analysis.symbols";
+        maybe_add(std::move(e));
+    }
+
+    for (const auto& seg : bv->GetSegments()) {
+        EntityMatch e;
+        char seg_name[32];
+        snprintf(seg_name, sizeof(seg_name), "seg_%llx", (unsigned long long)seg->GetStart());
+        e.name = seg_name;
+        e.kind = "segment";
+        e.address = seg->GetStart();
+        e.parent_name = "";
+        e.qualified_name = e.name;
+        e.source = "analysis.segments";
+        maybe_add(std::move(e));
+    }
+
+    for (const auto& sym : symbols) {
+        if (sym->GetType() != ImportedFunctionSymbol &&
+            sym->GetType() != ImportAddressSymbol &&
+            sym->GetType() != ImportedDataSymbol) {
+            continue;
+        }
+        std::string module = sym->GetNameSpace().GetString();
+        if (module.empty()) module = "unknown";
+
+        EntityMatch e;
+        e.name = sym->GetShortName();
+        e.kind = "import";
+        e.address = sym->GetAddress();
+        e.parent_name = module;
+        e.qualified_name = module + "!" + e.name;
+        e.source = "analysis.imports";
+        maybe_add(std::move(e));
+    }
+
+    auto strings = bv->GetStrings();
+    for (const auto& s : strings) {
+        if (matches.size() >= max_matches) break;
+        size_t length = s.length;
+        if (length > 256) length = 256;
+        DataBuffer buf = bv->ReadBuffer(s.start, length);
+        if (!buf.GetData() || buf.GetLength() == 0) continue;
+        std::string content(
+            reinterpret_cast<const char*>(buf.GetData()),
+            static_cast<size_t>(buf.GetLength())
+        );
+
+        EntityMatch e;
+        e.name = content;
+        e.kind = "string";
+        e.address = s.start;
+        e.parent_name = "";
+        e.qualified_name = content;
+        e.source = "analysis.strings";
+        maybe_add(std::move(e));
+    }
+
+    if (offset >= matches.size()) {
+        ctx.result_text_static("[]");
+        return;
+    }
+
+    size_t end = std::min(matches.size(), offset + limit);
+    std::ostringstream json;
+    json << "[";
+    bool first = true;
+    for (size_t i = offset; i < end; ++i) {
+        const auto& e = matches[i];
+        if (!first) json << ",";
+        first = false;
+        json << "{"
+             << "\"name\":\"" << json_escape_ascii(e.name) << "\","
+             << "\"kind\":\"" << e.kind << "\","
+             << "\"address\":" << e.address << ","
+             << "\"parent_name\":\"" << json_escape_ascii(e.parent_name) << "\","
+             << "\"qualified_name\":\"" << json_escape_ascii(e.qualified_name) << "\","
+             << "\"source\":\"" << e.source << "\""
+             << "}";
+    }
+    json << "]";
+    ctx.result_text(json.str());
+}
+
+// ============================================================================
+// UI Context (plugin-only)
+// ============================================================================
+
+static void sql_get_ui_context_json(xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
+#ifdef BNSQL_PLUGIN_BUILD
+    // In plugin builds, attempt to get UI context from Binary Ninja
+    // UIContext may not always be available (headless, background threads)
+    ctx.result_null();
+#else
+    // CLI/headless builds: no UI context available
+    ctx.result_null();
+#endif
 }
 
 // ============================================================================
@@ -878,6 +1094,14 @@ inline bool register_sql_functions(xsql::Database& db) {
 
     // Database operations
     db.register_function("save", 0, xsql::ScalarFn(sql_save));
+
+    // Discovery helpers
+    db.register_function("entities_search", 1, xsql::ScalarFn(sql_entities_search));
+    db.register_function("entities_search", 2, xsql::ScalarFn(sql_entities_search));
+    db.register_function("entities_search", 3, xsql::ScalarFn(sql_entities_search));
+
+    // UI context (plugin-only, returns NULL in CLI/headless)
+    db.register_function("get_ui_context_json", 0, xsql::ScalarFn(sql_get_ui_context_json));
 
     return true;
 }

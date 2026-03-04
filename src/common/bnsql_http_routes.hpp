@@ -10,9 +10,12 @@
 #ifdef BNSQL_HAS_HTTP
 
 #include <bnsql/bnsql.hpp>
+#include <bnsql/runtime_settings.hpp>
 #include <httplib.h>
 #include <xsql/thinclient/json_helpers.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <sstream>
@@ -52,6 +55,24 @@ inline std::string query_result_to_json(const bnsql::QueryResult& result) {
         json << ",\"error\":\"" << xsql::thinclient::json_escape(result.error) << "\"";
     }
 
+    // Timing metadata
+    if (result.elapsed_ms > 0.0) {
+        json << ",\"elapsed_ms\":" << std::fixed << std::setprecision(1) << result.elapsed_ms;
+    }
+    if (result.timed_out) {
+        json << ",\"timed_out\":true";
+    }
+
+    // Warnings
+    if (!result.warnings.empty()) {
+        json << ",\"warnings\":[";
+        for (size_t i = 0; i < result.warnings.size(); i++) {
+            if (i > 0) json << ",";
+            json << "\"" << xsql::thinclient::json_escape(result.warnings[i]) << "\"";
+        }
+        json << "]";
+    }
+
     json << "}";
     return json.str();
 }
@@ -64,27 +85,42 @@ inline const char* http_help_text() {
 SQL interface for Binary Ninja databases via HTTP.
 
 Endpoints:
-  GET  /         - Welcome message
-  GET  /help     - This documentation (for LLM discovery)
-  POST /query    - Execute SQL (body = raw SQL, response = JSON)
-  GET  /status   - Server health and function count
-  POST /shutdown - Stop server
+  GET  /          - Welcome message
+  GET  /help      - This documentation (for LLM discovery)
+  POST /query     - Execute SQL (body = raw SQL, response = JSON)
+  GET  /status    - Server health, function count, and runtime settings
+  GET  /settings  - Current runtime settings (JSON)
+  POST /shutdown  - Stop server
 
 Tables:
-  funcs          - Functions (address, name, size)
+  funcs          - Functions (address, name, prototype, size, comment)
   strings        - String literals (address, content, length)
   imports        - Imported functions (address, name, module)
   xrefs          - Cross-references (from_ea, to_ea, is_code)
   segments       - Memory segments (start_ea, end_ea, name, perm)
   blocks         - Basic blocks (func_ea, start_ea, end_ea)
   instructions   - Instructions (address, func_addr, mnemonic, disasm)
+  instruction_operands - Token-level operand metadata (func_addr, insn_addr, operand_index, ...)
   comments       - Address comments
   names          - Named locations
   entries        - Entry points and exports
   db_info        - Database metadata
-  pseudocode     - Decompiled code lines (filter by func_addr!)
-  hlil_vars      - HLIL variables (filter by func_addr!)
+  entities       - Unified discovery (functions/symbols/segments/imports/strings/types)
+  capabilities   - Runtime feature/capability matrix
+  pseudocode     - Decompiled code lines (func_addr, line_num, line, ea, comment)
+  hlil_vars      - HLIL variables (name/type writable, filter by func_addr!)
   hlil_calls     - HLIL function calls (filter by func_addr!)
+  types          - Defined types (id, name, kind, size, is_struct, is_enum, ...)
+  type_members   - Struct/union member fields (type_id, member_name, offset, type)
+  type_enum_values - Enum constant values (type_id, value_name, value)
+  func_signatures  - Function parameter/return types (func_addr, arg_index, arg_type)
+  patches        - Patched bytes (address, original_byte, patched_byte, status) [read-write]
+
+Views:
+  disasm_calls     - Call sites with callee info (func_addr, ea, callee_name)
+  function_chunks  - Function address ranges (func_addr, chunk_start, chunk_end)
+  types_v_structs  - Struct types only
+  types_v_enums    - Enum types only
 
 SQL Functions:
   hex(addr)           - Format address as hex
@@ -93,16 +129,36 @@ SQL Functions:
   func_at(addr)       - Function name at address
   xrefs_to(addr)      - JSON array of xrefs to address
   xrefs_from(addr)    - JSON array of xrefs from address
+  entities_search(p,l,o) - JSON entity discovery (pattern/limit/offset)
+
+Runtime Controls (PRAGMA):
+  PRAGMA bnsql.query_timeout_ms          - Get/set query timeout (0=disabled, max 3600000)
+  PRAGMA bnsql.queue_admission_timeout_ms - Get/set HTTP queue wait timeout
+  PRAGMA bnsql.max_queue                 - Get/set max queued HTTP requests (0=unbounded)
+  PRAGMA bnsql.hints_enabled             - Get/set query hint warnings (1/0)
+  PRAGMA bnsql.timeout_push = <ms>       - Push timeout onto stack
+  PRAGMA bnsql.timeout_pop               - Pop timeout from stack
+
+Writable Columns:
+  funcs.name / funcs.prototype / funcs.comment
+  names.name
+  pseudocode.comment / pseudocode.comment_placement
+  hlil_vars.name / hlil_vars.type / hlil_vars.comment
+  patches.patched_byte (INSERT/DELETE supported)
 
 Example Queries:
   SELECT name, hex(address), size FROM funcs ORDER BY size DESC LIMIT 10;
   SELECT content FROM strings WHERE content LIKE '%password%';
   SELECT module, COUNT(*) FROM imports GROUP BY module;
+  SELECT name, kind FROM entities WHERE name LIKE '%main%' LIMIT 20;
+  SELECT entities_search('DName', 20, 0);
   SELECT decompile(address) FROM funcs WHERE name = 'main';
+  PRAGMA bnsql.query_timeout_ms = 5000;
 
 Response Format:
-  Success: {"success": true, "columns": [...], "rows": [[...]], "row_count": N}
+  Success: {"success": true, "columns": [...], "rows": [[...]], "row_count": N, "elapsed_ms": 12.3}
   Error:   {"success": false, "error": "message"}
+  Timeout: {"success": false, "error": "...", "timed_out": true}
 
 Authentication (if enabled):
   Header: Authorization: Bearer <token>
@@ -111,7 +167,21 @@ Authentication (if enabled):
 Example:
   curl http://localhost:8081/help
   curl -X POST http://localhost:8081/query -d "SELECT name FROM funcs LIMIT 5"
+  curl http://localhost:8081/settings
 )";
+}
+
+// Build JSON from RuntimeSettingsSnapshot
+inline std::string settings_to_json(const RuntimeSettingsSnapshot& snap) {
+    std::ostringstream json;
+    json << "{"
+         << "\"query_timeout_ms\":" << snap.query_timeout_ms
+         << ",\"queue_admission_timeout_ms\":" << snap.queue_admission_timeout_ms
+         << ",\"max_queue\":" << snap.max_queue
+         << ",\"hints_enabled\":" << (snap.hints_enabled ? "true" : "false")
+         << ",\"timeout_stack_depth\":" << snap.timeout_stack_depth
+         << "}";
+    return json.str();
 }
 
 // Query callback type: takes SQL string, returns QueryResult
@@ -131,8 +201,9 @@ inline void setup_http_routes(
     const std::string& auth_token,
     int port)
 {
-    // Shared query mutex for thread safety
-    auto query_mutex = std::make_shared<std::mutex>();
+    // Shared state for queue management
+    auto query_mutex = std::make_shared<std::timed_mutex>();
+    auto queue_count = std::make_shared<std::atomic<size_t>>(0);
     auto query_fn_ptr = std::make_shared<HttpQueryFn>(std::move(query_fn));
     auto auth = std::make_shared<std::string>(auth_token);
 
@@ -158,6 +229,7 @@ inline void setup_http_routes(
             "  GET  /help     - API documentation\n"
             "  POST /query    - Execute SQL query\n"
             "  GET  /status   - Health check\n"
+            "  GET  /settings - Runtime settings\n"
             "  POST /shutdown - Stop server\n\n"
             "Example:\n"
             "  curl http://localhost:" + std::to_string(port) + "/help\n"
@@ -170,8 +242,10 @@ inline void setup_http_routes(
         res.set_content(http_help_text(), "text/plain");
     });
 
-    // POST /query - Execute SQL
-    svr.Post("/query", [query_fn_ptr, query_mutex, check_auth](const httplib::Request& req, httplib::Response& res) {
+    // POST /query - Execute SQL with queue management
+    svr.Post("/query", [query_fn_ptr, query_mutex, queue_count, check_auth](
+        const httplib::Request& req, httplib::Response& res)
+    {
         if (!check_auth(req, res)) return;
 
         std::string sql = req.body;
@@ -181,17 +255,76 @@ inline void setup_http_routes(
             return;
         }
 
-        std::lock_guard<std::mutex> lock(*query_mutex);
+        auto& settings = runtime_settings();
+
+        // Atomic queue admission via compare-exchange
+        size_t max_queue = settings.max_queue();
+        size_t current = queue_count->load();
+        while (true) {
+            if (max_queue > 0 && current >= max_queue) {
+                res.status = 503;
+                res.set_content("{\"success\":false,\"error\":\"Queue full\"}", "application/json");
+                return;
+            }
+            if (queue_count->compare_exchange_weak(current, current + 1))
+                break;
+        }
+
+        // Try to acquire lock with admission timeout
+        int admission_ms = settings.queue_admission_timeout_ms();
+        bool acquired = false;
+        if (admission_ms <= 0) {
+            query_mutex->lock();
+            acquired = true;
+        } else {
+            acquired = query_mutex->try_lock_for(std::chrono::milliseconds(admission_ms));
+        }
+
+        if (!acquired) {
+            queue_count->fetch_sub(1);
+            res.status = 408;
+            res.set_content("{\"success\":false,\"error\":\"Queue admission timeout\"}", "application/json");
+            return;
+        }
+
         auto result = (*query_fn_ptr)(sql);
+        query_mutex->unlock();
+        queue_count->fetch_sub(1);
+
         res.set_content(query_result_to_json(result), "application/json");
     });
 
-    // GET /status - Health check
-    svr.Get("/status", [query_fn_ptr, check_auth](const httplib::Request& req, httplib::Response& res) {
+    // GET /status - Health check with runtime settings
+    svr.Get("/status", [query_fn_ptr, query_mutex, check_auth](const httplib::Request& req, httplib::Response& res) {
         if (!check_auth(req, res)) return;
-        auto result = (*query_fn_ptr)("SELECT COUNT(*) FROM funcs");
-        std::string func_count = result.success && !result.empty() ? result.rows[0][0] : "?";
-        res.set_content("{\"success\":true,\"status\":\"ok\",\"tool\":\"bnsql\",\"functions\":" + func_count + "}", "application/json");
+
+        // Use try_lock to avoid blocking status checks
+        std::unique_lock<std::timed_mutex> lock(*query_mutex, std::defer_lock);
+        std::string func_count = "?";
+        if (lock.try_lock_for(std::chrono::seconds(2))) {
+            auto result = (*query_fn_ptr)("SELECT COUNT(*) FROM funcs");
+            if (result.success && !result.empty()) {
+                func_count = result.rows[0][0];
+            }
+        }
+
+        auto snap = runtime_settings().snapshot();
+        std::ostringstream json;
+        json << "{"
+             << "\"success\":true"
+             << ",\"status\":\"ok\""
+             << ",\"tool\":\"bnsql\""
+             << ",\"functions\":" << (func_count == "?" ? "null" : func_count)
+             << ",\"settings\":" << settings_to_json(snap)
+             << "}";
+        res.set_content(json.str(), "application/json");
+    });
+
+    // GET /settings - Runtime settings
+    svr.Get("/settings", [check_auth](const httplib::Request& req, httplib::Response& res) {
+        if (!check_auth(req, res)) return;
+        auto snap = runtime_settings().snapshot();
+        res.set_content(settings_to_json(snap), "application/json");
     });
 
     // POST /shutdown - Graceful shutdown
