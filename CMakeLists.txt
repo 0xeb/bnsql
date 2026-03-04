@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(bnsql VERSION 1.0.0 LANGUAGES C CXX)
+project(bnsql LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,36 +10,6 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
     set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
-endif()
-
-# ============================================================================
-# AI Agent Support (libagents - optional)
-# ============================================================================
-
-option(BNSQL_WITH_AI_AGENT "Build with AI agent support (libagents)" ON)
-
-if(BNSQL_WITH_AI_AGENT)
-    message(STATUS "bnsql: Building with AI agent support via libagents")
-
-    # Add libagents as subdirectory
-    set(LIBAGENTS_BUILD_CLI OFF CACHE BOOL "" FORCE)
-    set(LIBAGENTS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(LIBAGENTS_BUILD_COPILOT ON CACHE BOOL "" FORCE)
-    add_subdirectory(external/libagents)
-
-    # Auto-regenerate prompt header if outdated
-    set(PROMPT_MD "${CMAKE_CURRENT_SOURCE_DIR}/prompts/bnsql_agent.md")
-    set(PROMPT_HPP "${CMAKE_CURRENT_SOURCE_DIR}/src/common/bnsql_agent_prompt.hpp")
-
-    add_custom_command(
-        OUTPUT ${PROMPT_HPP}
-        COMMAND ${CMAKE_COMMAND} -E echo "Checking prompt header..."
-        COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/scripts/embed_prompt.py
-                ${PROMPT_MD} ${PROMPT_HPP}
-        DEPENDS ${PROMPT_MD}
-        COMMENT "Checking/regenerating bnsql_agent_prompt.hpp"
-    )
-    add_custom_target(bnsql_prompt_header DEPENDS ${PROMPT_HPP})
 endif()
 
 # ============================================================================
@@ -55,6 +25,12 @@ if(NOT EXISTS "${BN_API_PATH}/CMakeLists.txt")
 endif()
 
 # Add Binary Ninja API
+if(NOT DEFINED HEADLESS)
+    set(HEADLESS ON CACHE BOOL "Build Binary Ninja API in headless mode" FORCE)
+endif()
+if(HEADLESS)
+    message(STATUS "bnsql: Configuring Binary Ninja API in HEADLESS mode")
+endif()
 add_subdirectory(${BN_API_PATH} ${CMAKE_CURRENT_BINARY_DIR}/binaryninja-api)
 
 # ============================================================================
@@ -66,6 +42,25 @@ option(BNSQL_WITH_HTTP "Build with HTTP REST server support" ON)
 if(BNSQL_WITH_HTTP)
     message(STATUS "bnsql: Building with HTTP server support")
     set(XSQL_WITH_THINCLIENT ON CACHE BOOL "" FORCE)
+endif()
+
+# ============================================================================
+# MCP Server Support (optional, uses fastmcpp)
+# ============================================================================
+
+option(BNSQL_WITH_MCP "Build with MCP server support" ON)
+
+if(BNSQL_WITH_MCP)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/fastmcpp/CMakeLists.txt")
+        set(FASTMCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        add_subdirectory(external/fastmcpp)
+        message(STATUS "bnsql: Building with MCP server support")
+    else()
+        message(WARNING "bnsql: fastmcpp not found, MCP support disabled. "
+            "Initialize submodule: git submodule update --init external/fastmcpp")
+        set(BNSQL_WITH_MCP OFF)
+    endif()
 endif()
 
 # ============================================================================
@@ -119,6 +114,9 @@ if(BNSQL_BUILD_PLUGIN)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     )
 
+    # Plugin-specific build flag (enables UI context UDF)
+    target_compile_definitions(bnsql_plugin PRIVATE BNSQL_PLUGIN_BUILD)
+
     # Add HTTP server support to plugin
     if(BNSQL_WITH_HTTP)
         target_compile_definitions(bnsql_plugin PRIVATE BNSQL_HAS_HTTP)
@@ -165,14 +163,6 @@ if(BNSQL_BUILD_CLI)
         src/cli/main.cpp
     )
 
-    # Add AI agent source if enabled
-    if(BNSQL_WITH_AI_AGENT)
-        list(APPEND BNSQL_CLI_SOURCES
-            src/common/ai_agent.cpp
-            src/common/mcp_server.cpp
-        )
-    endif()
-
     # Add Windows manifest for UTF-8 support (Windows 10 1903+)
     if(WIN32)
         list(APPEND BNSQL_CLI_SOURCES
@@ -191,20 +181,16 @@ if(BNSQL_BUILD_CLI)
         ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     )
 
-    # Add AI agent support
-    if(BNSQL_WITH_AI_AGENT)
-        add_dependencies(bnsql-cli bnsql_prompt_header)
-        target_include_directories(bnsql-cli PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/external/libagents/include
-            ${CMAKE_CURRENT_SOURCE_DIR}/external/libagents/external/fastmcpp/include
-        )
-        target_link_libraries(bnsql-cli PRIVATE libagents fastmcpp_core)
-        target_compile_definitions(bnsql-cli PRIVATE BNSQL_HAS_AI_AGENT)
-    endif()
-
     # Add HTTP server support
     if(BNSQL_WITH_HTTP)
         target_compile_definitions(bnsql-cli PRIVATE BNSQL_HAS_HTTP)
+    endif()
+
+    # Add MCP server support
+    if(BNSQL_WITH_MCP)
+        target_sources(bnsql-cli PRIVATE src/common/mcp_server.cpp)
+        target_link_libraries(bnsql-cli PRIVATE fastmcpp_core)
+        target_compile_definitions(bnsql-cli PRIVATE BNSQL_HAS_MCP)
     endif()
 
     set_target_properties(bnsql-cli PROPERTIES

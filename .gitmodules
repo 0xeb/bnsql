@@ -1,9 +1,9 @@
 [submodule "external/binaryninja-api"]
 	path = external/binaryninja-api
 	url = https://github.com/Vector35/binaryninja-api.git
-[submodule "external/libagents"]
-	path = external/libagents
-	url = https://github.com/0xeb/libagents.git
+[submodule "external/fastmcpp"]
+	path = external/fastmcpp
+	url = https://github.com/0xeb/fastmcpp.git
 [submodule "external/libxsql"]
 	path = external/libxsql
 	url = https://github.com/0xeb/libxsql.git

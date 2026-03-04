@@ -53,14 +53,13 @@ MCPQueueResult MCPServer::queue_and_wait(MCPPendingCommand::Type type, const std
     return {true, cmd->result};
 }
 
-int MCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
+int MCPServer::start(int port, QueryCallback query_cb,
                      const std::string& bind_addr) {
     if (running_.load()) {
         return port_;
     }
 
     query_cb_ = query_cb;
-    ask_cb_ = ask_cb;
     bind_addr_ = bind_addr;
 
     impl_ = std::make_unique<Impl>();
@@ -114,63 +113,10 @@ int MCPServer::start(int port, QueryCallback query_cb, AskCallback ask_cb,
     sql_query_tool.set_description("Execute a SQL query against the Binary Ninja database and return results");
     impl_->tool_manager.register_tool(sql_query_tool);
 
-    // Register agent_ask tool - natural language query (if ask_cb provided)
-    if (ask_cb_) {
-        Json ask_input_schema = {
-            {"type", "object"},
-            {"properties", {
-                {"question", {
-                    {"type", "string"},
-                    {"description", "Natural language question about the binary (e.g., 'What functions call malloc?')"}
-                }}
-            }},
-            {"required", Json::array({"question"})}
-        };
-
-        Json ask_output_schema = {
-            {"type", "object"},
-            {"properties", {
-                {"response", {{"type", "string"}}},
-                {"success", {{"type", "boolean"}}}
-            }}
-        };
-
-        fastmcpp::tools::Tool agent_ask_tool{
-            "agent_ask",
-            ask_input_schema,
-            ask_output_schema,
-            [this](const Json& args) -> Json {
-                std::string question = args.value("question", "");
-                if (question.empty()) {
-                    return Json{
-                        {"content", Json::array({
-                            Json{{"type", "text"}, {"text", "Error: missing question"}}
-                        })},
-                        {"isError", true}
-                    };
-                }
-
-                auto result = queue_and_wait(MCPPendingCommand::Type::Ask, question);
-
-                return Json{
-                    {"content", Json::array({
-                        Json{{"type", "text"}, {"text", result.payload}}
-                    })},
-                    {"isError", !result.success}
-                };
-            }
-        };
-        agent_ask_tool.set_description("Ask a natural language question about the binary - AI translates to SQL and returns results");
-        impl_->tool_manager.register_tool(agent_ask_tool);
-    }
-
     // Create MCP handler
     std::unordered_map<std::string, std::string> descriptions = {
         {"sql_query", "Execute a SQL query against the Binary Ninja database and return results"}
     };
-    if (ask_cb_) {
-        descriptions["agent_ask"] = "Ask a natural language question about the binary - AI translates to SQL and returns results";
-    }
 
     auto handler = fastmcpp::mcp::make_mcp_handler(
         "bnsql",
@@ -227,8 +173,6 @@ void MCPServer::wait() {
             try {
                 if (cmd->type == MCPPendingCommand::Type::Query && query_cb_) {
                     cmd->result = query_cb_(cmd->input);
-                } else if (cmd->type == MCPPendingCommand::Type::Ask && ask_cb_) {
-                    cmd->result = ask_cb_(cmd->input);
                 } else {
                     cmd->result = "Error: No handler for command type";
                 }
@@ -281,8 +225,7 @@ void MCPServer::complete_pending_commands(const std::string& result) {
 std::string format_mcp_info(
     const std::string& database_name,
     size_t function_count,
-    const std::string& url,
-    bool has_agent
+    const std::string& url
 ) {
     std::ostringstream ss;
     ss << "MCP SERVER ACTIVE\n";
@@ -290,11 +233,7 @@ std::string format_mcp_info(
     ss << "Functions: " << function_count << "\n\n";
 
     ss << "AVAILABLE TOOLS:\n";
-    ss << "  sql_query   - Execute SQL query directly\n";
-    if (has_agent) {
-        ss << "  agent_ask   - Ask natural language question (AI-powered)\n";
-    }
-    ss << "\n";
+    ss << "  sql_query   - Execute SQL query directly\n\n";
 
     ss << "SSE Endpoint: " << url << "/sse\n";
     ss << "Message Endpoint: " << url << "/messages\n\n";

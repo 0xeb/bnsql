@@ -7,7 +7,6 @@
  * Usage:
  *   bnsql database.bndb -c "SELECT * FROM funcs"          # Local query
  *   bnsql database.bndb -i                                # Local interactive
- *   bnsql database.bndb --agent                           # Agent mode (AI)
  *   bnsql database.bndb --http [port]                     # HTTP server
  *   bnsql database.bndb --mcp [port]                      # MCP server
  */
@@ -31,8 +30,7 @@
 
 #include "bnsql_commands.hpp"
 
-#ifdef BNSQL_HAS_AI_AGENT
-#include "ai_agent.hpp"
+#ifdef BNSQL_HAS_MCP
 #include "mcp_server.hpp"
 #endif
 
@@ -53,10 +51,13 @@
 #include <iomanip>
 #include <csignal>
 #include <thread>
+#include <filesystem>
+#include <cstdlib>
 
 using namespace BinaryNinja;
+namespace fs = std::filesystem;
 
-static const char* g_version = "1.0.0";
+static const char* g_version = "0.0.9";
 
 // ============================================================================
 // Utilities
@@ -67,11 +68,6 @@ static std::string trim(const std::string& s) {
     if (start == std::string::npos) return "";
     auto end = s.find_last_not_of(" \t\r\n");
     return s.substr(start, end - start + 1);
-}
-
-static std::string to_lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-    return s;
 }
 
 static std::string read_file(const std::string& path) {
@@ -142,20 +138,6 @@ static std::atomic<bool> g_quit_requested{false};
 static void quit_signal_handler(int) {
     g_quit_requested.store(true);
 }
-
-#ifdef BNSQL_HAS_AI_AGENT
-// Signal handling for AI agent mode
-static bnsql::AIAgent* g_agent = nullptr;
-
-static void signal_handler(int sig) {
-    (void)sig;
-    g_quit_requested.store(true);
-    if (g_agent) {
-        g_agent->request_quit();
-    }
-}
-
-#endif // BNSQL_HAS_AI_AGENT
 
 // ============================================================================
 // HTTP Server Mode (REST API)
@@ -323,16 +305,35 @@ Commands:
   .schema TABLE      Show table schema
   .quit              Exit
 
-Tables: funcs, segments, names, entries, strings, xrefs, blocks, imports, instructions, comments, db_info
+Tables: funcs, segments, names, entries, strings, xrefs, blocks, imports, instructions, comments, db_info, pseudocode, hlil_vars, hlil_calls
 
-SQL Functions: disasm(addr), bytes(addr,n), name_at(addr), func_at(addr), hex(val), xrefs_to(addr)
+SQL Functions: disasm(addr), bytes(addr,n), name_at(addr), func_at(addr), hex(val), xrefs_to(addr), decompile(addr)
+
+Writable Columns:
+  funcs.name, funcs.prototype, names.name
+  pseudocode.comment, pseudocode.comment_placement
+  hlil_vars.name, hlil_vars.type
 
 Examples:
   SELECT COUNT(*) FROM funcs;
   SELECT hex(address), name, size FROM funcs ORDER BY size DESC LIMIT 10;
   SELECT content FROM strings WHERE content LIKE '%error%';
   SELECT module, COUNT(*) as cnt FROM imports GROUP BY module ORDER BY cnt DESC;
+  UPDATE pseudocode SET comment='check bounds' WHERE func_addr=0x401000 AND line_num=12;
 )";
+}
+
+static std::string resolve_bn_bundled_plugin_dir() {
+    // Prefer explicit BN install root in env for out-of-tree builds.
+    if (const char* bn_install_dir = std::getenv("BN_INSTALL_DIR")) {
+        fs::path install_path = bn_install_dir;
+        fs::path plugins_path = install_path / "plugins";
+        std::error_code ec;
+        if (fs::exists(plugins_path, ec) && !ec) {
+            return plugins_path.string();
+        }
+    }
+    return GetBundledPluginDirectory();
 }
 
 static void show_tables(bnsql::QueryEngine& qe) {
@@ -439,176 +440,6 @@ static void run_interactive(bnsql::QueryEngine& qe) {
 }
 
 // ============================================================================
-// Agent Mode (Natural Language -> SQL via AI)
-// ============================================================================
-
-#ifdef BNSQL_HAS_AI_AGENT
-// g_agent and signal_handler are defined above.
-
-static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
-                      bool verbose = false, const std::string& provider_override = "",
-                      int timeout_override = 0) {
-    // Create SQL executor that returns formatted results
-    auto executor = [&qe](const std::string& sql) -> std::string {
-        auto result = qe.query(sql);
-        if (!result.success) {
-            return "Error: " + result.error;
-        }
-        return result.to_string();
-    };
-
-    // Load settings and apply overrides
-    bnsql::AgentSettings settings = bnsql::LoadAgentSettings();
-    if (!provider_override.empty()) {
-        try {
-            settings.default_provider = bnsql::ParseProviderType(provider_override);
-            if (verbose) {
-                std::cerr << "[AGENT] Provider override: " << provider_override << std::endl;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
-            return;
-        }
-    }
-
-    if (timeout_override > 0) {
-        settings.response_timeout_ms = timeout_override;
-        if (verbose) {
-            std::cerr << "[AGENT] Timeout override: " << timeout_override << " ms" << std::endl;
-        }
-    }
-
-    // Create and start agent with settings
-    bnsql::AIAgent agent(executor, settings, verbose);
-    g_agent = &agent;
-
-    // Install signal handler for Ctrl-C
-    auto old_handler = std::signal(SIGINT, signal_handler);
-
-    agent.start();
-
-    bool one_shot = !prompt.empty();
-
-    if (one_shot) {
-        // One-shot mode: process single query
-        std::string response = agent.query(prompt);
-        std::cout << response << std::endl;
-
-        // Print session ID for reference
-        std::string session_id = agent.get_session_id();
-        if (!session_id.empty()) {
-            std::cout << "\n[Session: " << session_id << "]" << std::endl;
-        }
-    } else {
-        // Interactive mode
-        std::cout << "Agent mode - Natural language queries powered by AI." << std::endl;
-        std::cout << "Type SQL directly, or ask questions in natural language." << std::endl;
-        std::cout << "Commands: .help, .clear, .sql (SQL mode), .quit" << std::endl;
-        std::cout << std::endl;
-
-        // Set up command callbacks
-        bnsql::CommandCallbacks callbacks;
-        callbacks.get_tables = [&qe]() -> std::string {
-            auto result = qe.query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name");
-            std::stringstream ss;
-            for (const auto& row : result) {
-                if (row.size() > 0) ss << row[0] << "\n";
-            }
-            return ss.str();
-        };
-        callbacks.get_schema = [&qe](const std::string& table) -> std::string {
-            auto result = qe.query("SELECT sql FROM sqlite_master WHERE name='" + table + "'");
-            if (!result.empty() && result.rows[0].size() > 0) {
-                return result.rows[0][0];
-            }
-            return "Table not found: " + table;
-        };
-        callbacks.clear_session = [&agent]() -> std::string {
-            agent.reset_session();
-            return "Session cleared (conversation history reset)";
-        };
-
-#ifdef BNSQL_HAS_HTTP
-        setup_http_callbacks(callbacks, qe);
-#endif
-
-        std::string line;
-        while (!agent.quit_requested()) {
-            std::cout << "bnsql> " << std::flush;
-            if (!std::getline(std::cin, line)) break;
-
-            line = trim(line);
-            if (line.empty()) continue;
-
-            // Handle .sql command specially (switches mode)
-            if (to_lower(line) == ".sql") {
-                std::cout << "Switching to SQL mode..." << std::endl << std::endl;
-                agent.stop();
-                g_agent = nullptr;
-                std::signal(SIGINT, old_handler);
-                run_interactive(qe);
-                return;
-            }
-
-            // Use unified command handler
-            if (!line.empty() && line[0] == '.') {
-                std::string output;
-                auto result = bnsql::handle_command(line, callbacks, output);
-
-                switch (result) {
-                    case bnsql::CommandResult::QUIT:
-                        goto exit_agent;
-                    case bnsql::CommandResult::HANDLED:
-                        if (!output.empty()) {
-                            std::cout << output;
-                            if (output.back() != '\n') std::cout << "\n";
-                        }
-                        continue;
-                    case bnsql::CommandResult::NOT_HANDLED:
-                        break;
-                }
-            }
-
-            // Process query through AI agent
-            std::string response = agent.query(line);
-            if (!response.empty()) {
-                std::cout << response << std::endl;
-            }
-            std::cout << std::endl;
-        }
-        exit_agent:;
-    }
-
-    agent.stop();
-    g_agent = nullptr;
-    std::signal(SIGINT, old_handler);
-
-#ifdef BNSQL_HAS_HTTP
-    if (g_repl_http_server) {
-        g_repl_http_server->stop();
-        g_repl_http_server.reset();
-    }
-#endif
-}
-
-#else // !BNSQL_HAS_AI_AGENT
-
-// Fallback when AI agent is not available
-static void run_agent(bnsql::QueryEngine& qe, const std::string& prompt = "",
-                      bool verbose = false, const std::string& provider_override = "",
-                      int timeout_override = 0) {
-    (void)prompt;
-    (void)verbose;
-    (void)provider_override;
-    (void)timeout_override;
-    std::cerr << "Error: Agent mode requires building with -DBNSQL_WITH_AI_AGENT=ON" << std::endl;
-    std::cerr << "Falling back to interactive SQL mode..." << std::endl << std::endl;
-    run_interactive(qe);
-}
-
-#endif // BNSQL_HAS_AI_AGENT
-
-// ============================================================================
 // Usage
 // ============================================================================
 
@@ -618,8 +449,6 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " <database.bndb>                        Interactive mode" << std::endl;
     std::cout << "  " << prog << " <database.bndb> -c <query>             Execute query and exit" << std::endl;
     std::cout << "  " << prog << " <database.bndb> -f <file.sql>          Execute SQL file" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> --agent                Agent mode (AI-powered)" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> --prompt <text>        One-shot agent query" << std::endl;
     std::cout << "  " << prog << " <database.bndb> --http [port]          Start HTTP REST server (default: 8080)" << std::endl;
     std::cout << "  " << prog << " <database.bndb> --mcp [port]           Start MCP server (default: 9998)" << std::endl;
     std::cout << std::endl;
@@ -628,23 +457,13 @@ static void print_usage(const char* prog) {
     std::cout << "  -c, --command <sql>    SQL query to execute" << std::endl;
     std::cout << "  -f, --file <path>      SQL file to execute" << std::endl;
     std::cout << "  -i, --interactive      Interactive SQL mode (default)" << std::endl;
-    std::cout << "  --agent                AI-powered natural language agent mode" << std::endl;
-    std::cout << "  --prompt <text>        One-shot natural language query" << std::endl;
-    std::cout << "  --provider <name>      AI provider: claude or copilot" << std::endl;
-    std::cout << "  --timeout <ms>         Response timeout in milliseconds" << std::endl;
-    std::cout << "  --config [path] [val]  View/set agent configuration" << std::endl;
     std::cout << "  --http [port]          Start HTTP REST server (default: 8080)" << std::endl;
     std::cout << "  --mcp [port]           Start MCP server for Claude Desktop, etc. (default: 9998)" << std::endl;
     std::cout << "  --bind <addr>          Bind address for server (default: 127.0.0.1)" << std::endl;
     std::cout << "  --token <token>        Auth token for HTTP/MCP mode" << std::endl;
-    std::cout << "  --verbose              Verbose output (agent mode)" << std::endl;
     std::cout << "  -q, --quiet            Suppress banner" << std::endl;
     std::cout << "  -h, --help             Show this help" << std::endl;
     std::cout << "  -v, --version          Show version" << std::endl;
-#ifdef BNSQL_HAS_AI_AGENT
-    std::cout << std::endl;
-    std::cout << "Agent settings: " << bnsql::GetSettingsPath() << std::endl;
-#endif
 }
 
 // ============================================================================
@@ -676,9 +495,9 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    std::string database, query, query_file, prompt, provider_override, auth_token, bind_addr;
-    int timeout_override = 0, http_port = 8080, mcp_port = 9998;
-    bool interactive = false, agent = false, quiet = false, verbose = false, http_mode = false, mcp_mode = false;
+    std::string database, query, query_file, auth_token, bind_addr;
+    int http_port = 8080, mcp_port = 9998;
+    bool interactive = false, quiet = false, http_mode = false, mcp_mode = false;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -688,24 +507,9 @@ int main(int argc, char* argv[]) {
         if (arg == "-v" || arg == "--version") { std::cout << "bnsql v" << g_version << std::endl; return 0; }
         if (arg == "-q" || arg == "--quiet") { quiet = true; continue; }
         if (arg == "-i" || arg == "--interactive") { interactive = true; continue; }
-        if (arg == "--agent") { agent = true; continue; }
-        if (arg == "--verbose") { verbose = true; continue; }
-
         if ((arg == "-s" || arg == "--source") && i + 1 < argc) { database = argv[++i]; continue; }
         if ((arg == "-c" || arg == "--command") && i + 1 < argc) { query = argv[++i]; continue; }
         if ((arg == "-f" || arg == "--file") && i + 1 < argc) { query_file = argv[++i]; continue; }
-        if (arg == "--prompt" && i + 1 < argc) { prompt = argv[++i]; agent = true; continue; }
-        if (arg == "--provider" && i + 1 < argc) { provider_override = argv[++i]; continue; }
-        if (arg == "--timeout" && i + 1 < argc) {
-            try {
-                timeout_override = std::stoi(argv[++i]);
-                if (timeout_override < 0) throw std::runtime_error("invalid");
-            } catch (...) {
-                std::cerr << "Error: Invalid timeout value (must be positive integer in milliseconds)" << std::endl;
-                return 1;
-            }
-            continue;
-        }
         if (arg == "--http") {
             http_mode = true;
             // Optional port argument
@@ -737,20 +541,6 @@ int main(int argc, char* argv[]) {
         if (arg == "--bind" && i + 1 < argc) { bind_addr = argv[++i]; continue; }
         if (arg == "--token" && i + 1 < argc) { auth_token = argv[++i]; continue; }
 
-        // --config [path] [value] - handle immediately and exit
-        if (arg == "--config") {
-#ifdef BNSQL_HAS_AI_AGENT
-            std::string config_path = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "";
-            std::string config_value = (i + 1 < argc && argv[i + 1][0] != '-') ? argv[++i] : "";
-            auto [ok, output, code] = bnsql::handle_config_command(config_path, config_value);
-            std::cout << output;
-            return code;
-#else
-            std::cerr << "Error: AI agent not compiled in. Rebuild with -DBNSQL_WITH_AI_AGENT=ON\n";
-            return 1;
-#endif
-        }
-
         // Positional argument = database
         if (arg[0] != '-' && database.empty()) { database = arg; continue; }
 
@@ -773,7 +563,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize Binary Ninja
-    SetBundledPluginDirectory(GetBundledPluginDirectory());
+    SetBundledPluginDirectory(resolve_bn_bundled_plugin_dir());
     InitPlugins();
 
     // Load binary with auto-save support
@@ -823,9 +613,8 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-#ifdef BNSQL_HAS_AI_AGENT
+#ifdef BNSQL_HAS_MCP
     if (mcp_mode) {
-        // Start MCP server
         if (bind_addr.empty()) bind_addr = "127.0.0.1";
         std::string url = "http://" + bind_addr + ":" + std::to_string(mcp_port);
 
@@ -835,7 +624,6 @@ int main(int argc, char* argv[]) {
 
         bnsql::MCPServer mcp_server;
 
-        // SQL query callback - direct SQL execution
         bnsql::QueryCallback query_cb = [&qe](const std::string& sql) -> std::string {
             auto result = qe.query(sql);
             if (!result.success) {
@@ -844,41 +632,22 @@ int main(int argc, char* argv[]) {
             return result.to_string();
         };
 
-        // Agent ask callback - natural language query
-        // Create AI agent for NL queries
-        bnsql::AgentSettings settings = bnsql::LoadAgentSettings();
-        auto executor = [&qe](const std::string& sql) -> std::string {
-            auto result = qe.query(sql);
-            if (!result.success) {
-                return "Error: " + result.error;
-            }
-            return result.to_string();
-        };
-        bnsql::AIAgent ai_agent(executor, settings, verbose);
-        ai_agent.start();
-
-        bnsql::AskCallback ask_cb = [&ai_agent](const std::string& question) -> std::string {
-            return ai_agent.query(question);
-        };
-
-        int actual_port = mcp_server.start(mcp_port, query_cb, ask_cb, bind_addr);
+        int actual_port = mcp_server.start(mcp_port, query_cb, bind_addr);
         if (actual_port <= 0) {
             std::cerr << "Error: Failed to start MCP server on port " << mcp_port << std::endl;
             return 1;
         }
         url = "http://" + bind_addr + ":" + std::to_string(actual_port);
 
-        // Print MCP server info
         size_t func_count = 0;
         auto count_result = qe.query("SELECT COUNT(*) FROM functions");
         if (count_result.success && !count_result.rows.empty()) {
             try { func_count = std::stoul(count_result.rows[0][0]); } catch (...) {}
         }
 
-        std::cout << bnsql::format_mcp_info(database, func_count, url, true) << std::endl;
+        std::cout << bnsql::format_mcp_info(database, func_count, url) << std::endl;
         std::cout << "Press Ctrl+C to stop MCP server." << std::endl;
 
-        // Install signal handler for clean shutdown
         g_quit_requested.store(false);
         auto old_handler = std::signal(SIGINT, quit_signal_handler);
 #ifdef _WIN32
@@ -888,28 +657,24 @@ int main(int argc, char* argv[]) {
             return g_quit_requested.load();
         });
 
-        // Wait for shutdown (Ctrl+C)
         mcp_server.wait();
 
-        // Restore signal handlers
         std::signal(SIGINT, old_handler);
 #ifdef _WIN32
         std::signal(SIGBREAK, old_break_handler);
 #endif
-        ai_agent.stop();
 
         std::cout << "MCP server stopped." << std::endl;
         return 0;
     }
 #else
     if (mcp_mode) {
-        std::cerr << "Error: MCP mode not available. Rebuild with -DBNSQL_WITH_AI_AGENT=ON\n";
+        std::cerr << "Error: MCP mode not available. Rebuild with -DBNSQL_WITH_MCP=ON\n";
         return 1;
     }
 #endif
 
-    if (!query.empty() && !agent) {
-        // Single query mode
+    if (!query.empty()) {
         auto result = qe.query(query);
         if (!result.success) {
             std::cerr << "Error: " << result.error << "\n";
@@ -919,11 +684,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    if (agent) {
-        run_agent(qe, prompt, verbose, provider_override, timeout_override);
-    } else {
-        run_interactive(qe);
-    }
+    run_interactive(qe);
 
     return 0;
 }

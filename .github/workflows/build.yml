@@ -29,7 +29,7 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
 
       - name: Build
         run: cmake --build build --config Release
@@ -56,7 +56,7 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
 
       - name: Build
         run: cmake --build build --config Release
@@ -83,7 +83,7 @@ jobs:
           submodules: recursive
 
       - name: Configure
-        run: cmake -B build -DBNSQL_WITH_AI_AGENT=ON -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
+        run: cmake -B build -DBN_ALLOW_STUBS=ON -DHEADLESS=ON
 
       - name: Build
         run: cmake --build build --config Release

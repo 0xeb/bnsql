@@ -8,6 +8,7 @@
  * Schema is designed to be compatible with idasql wherever possible.
  *
  * Tables:
+ *   entities   - Unified discovery surface (functions/symbols/segments/imports/strings)
  *   funcs      - Functions
  *   segments   - Memory segments
  *   names      - Symbols (named locations)
@@ -23,7 +24,11 @@
 #pragma once
 
 #include <bnsql/vtable.hpp>
+#include <bnsql/persistence.hpp>
 #include <xsql/database.hpp>
+#include <algorithm>
+#include <unordered_map>
+#include <vector>
 
 // Binary Ninja API
 #include "binaryninjaapi.h"
@@ -52,10 +57,41 @@ inline Ref<BinaryView> get_bv() { return g_context ? g_context->bv : nullptr; }
 
 // ============================================================================
 // FUNCS Table - Functions
-// Schema: address, name, size, end_ea, flags
+// Schema: address, name, prototype, size, end_ea, flags, comment
 // Compatible with idasql funcs table
-// Supports: SELECT, UPDATE (name), DELETE, INSERT
+// Supports: SELECT, UPDATE (name/prototype/comment), DELETE, INSERT
 // ============================================================================
+
+inline bool parse_function_type_decl(
+    const Ref<BinaryView>& bv,
+    const std::string& decl,
+    const std::string& fallback_name,
+    Ref<Type>& out_type)
+{
+    if (!bv || decl.empty()) return false;
+
+    auto try_parse = [&](const std::string& text) -> bool {
+        QualifiedNameAndType parsed;
+        std::string errors;
+        if (!bv->ParseTypeString(text, parsed, errors)) return false;
+        if (!parsed.type || parsed.type->GetClass() != FunctionTypeClass) return false;
+        out_type = parsed.type;
+        return true;
+    };
+
+    if (try_parse(decl)) return true;
+    if (try_parse(decl + ";")) return true;
+
+    // If declaration is missing a name (e.g. "int(void)"), inject one.
+    auto lparen = decl.find('(');
+    if (lparen != std::string::npos && !fallback_name.empty()) {
+        std::string with_name = decl.substr(0, lparen) + " " + fallback_name + decl.substr(lparen);
+        if (try_parse(with_name)) return true;
+        if (try_parse(with_name + ";")) return true;
+    }
+
+    return false;
+}
 
 inline VTableDef define_funcs() {
     return table("funcs")
@@ -84,12 +120,64 @@ inline VTableDef define_funcs() {
             [](size_t i, const char* new_name) -> bool {
                 auto bv = get_bv();
                 if (!bv) return false;
+                std::string requested = new_name ? new_name : "";
+                if (requested.empty()) {
+                    xsql::set_vtab_error("Function name cannot be empty");
+                    return false;
+                }
                 auto funcs = bv->GetAnalysisFunctionList();
                 if (i >= funcs.size()) return false;
                 auto func = funcs[i];
+                auto existing_sym = func->GetSymbol();
+                std::string existing_name = existing_sym ? existing_sym->GetFullName() : "";
+                if (!existing_name.empty() && requested == existing_name) {
+                    return true;
+                }
                 // Create user symbol at function start
-                auto sym = new Symbol(FunctionSymbol, new_name, func->GetStart());
+                auto sym = new Symbol(FunctionSymbol, requested, func->GetStart());
                 bv->DefineUserSymbol(sym);
+                if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+                return true;
+            })
+        .column_text_rw("prototype",
+            // Getter
+            [](size_t i) -> std::string {
+                auto bv = get_bv();
+                if (!bv) return "";
+                auto funcs = bv->GetAnalysisFunctionList();
+                if (i >= funcs.size()) return "";
+                auto type = funcs[i]->GetType();
+                return type ? type->GetString() : "";
+            },
+            // Setter - apply user function prototype
+            [](size_t i, const char* new_proto) -> bool {
+                auto bv = get_bv();
+                if (!bv) return false;
+                auto funcs = bv->GetAnalysisFunctionList();
+                if (i >= funcs.size()) return false;
+
+                auto func = funcs[i];
+                std::string proto = new_proto ? new_proto : "";
+                auto current_type = func->GetType();
+                std::string current_proto = current_type ? current_type->GetString() : "";
+                if (proto == current_proto) return true;
+
+                if (proto.empty()) {
+                    xsql::set_vtab_error("Clearing function prototype is not supported");
+                    return false;
+                }
+
+                auto sym = func->GetSymbol();
+                std::string fallback_name = sym ? sym->GetFullName() : "";
+
+                Ref<Type> parsed_type;
+                if (!parse_function_type_decl(bv, proto, fallback_name, parsed_type) || !parsed_type) {
+                    xsql::set_vtab_error("Failed to parse prototype: " + proto);
+                    return false;
+                }
+
+                func->SetUserType(parsed_type);
+                if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
                 return true;
             })
         .column_int64("size", [](size_t i) -> int64_t {
@@ -112,6 +200,32 @@ inline VTableDef define_funcs() {
             // Return 0 for now, could map analysis flags later
             return 0;
         })
+        .column_text_rw("comment",
+            // Getter - function-level comment
+            [](size_t i) -> std::string {
+                auto bv = get_bv();
+                if (!bv) return "";
+                auto funcs = bv->GetAnalysisFunctionList();
+                if (i >= funcs.size()) return "";
+                return funcs[i]->GetComment();
+            },
+            // Setter - function-level comment
+            [](size_t i, const char* new_comment) -> bool {
+                auto bv = get_bv();
+                if (!bv) return false;
+                auto funcs = bv->GetAnalysisFunctionList();
+                if (i >= funcs.size()) return false;
+
+                auto func = funcs[i];
+                std::string updated_comment = new_comment ? new_comment : "";
+                if (updated_comment == func->GetComment()) {
+                    return true;
+                }
+
+                func->SetComment(updated_comment);
+                if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+                return true;
+            })
         // DELETE support - remove function from analysis
         .deletable([](size_t i) -> bool {
             auto bv = get_bv();
@@ -120,6 +234,7 @@ inline VTableDef define_funcs() {
             if (i >= funcs.size()) return false;
             auto func = funcs[i];
             bv->RemoveUserFunction(func);
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
             return true;
         })
         // INSERT support - create new function at address
@@ -128,7 +243,7 @@ inline VTableDef define_funcs() {
             auto bv = get_bv();
             if (!bv) return false;
 
-            // Column order: address, name, size, end_ea, flags
+            // Column order: address, name, prototype, size, end_ea, flags, comment
             // We need at least address (column 0)
             if (argc < 1) return false;
 
@@ -143,15 +258,40 @@ inline VTableDef define_funcs() {
             auto func = bv->CreateUserFunction(platform, address);
             if (!func) return false;
 
-            // If name is provided (column 1), set it
+            // If name is provided (column 1), set it.
+            std::string assigned_name;
             if (argc >= 2 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
                 const char* name = reinterpret_cast<const char*>(sqlite3_value_text(argv[1]));
                 if (name && name[0]) {
+                    assigned_name = name;
                     auto sym = new Symbol(FunctionSymbol, name, address);
                     bv->DefineUserSymbol(sym);
                 }
             }
 
+            // If prototype is provided (column 2), apply it.
+            if (argc >= 3 && sqlite3_value_type(argv[2]) != SQLITE_NULL) {
+                const char* proto = reinterpret_cast<const char*>(sqlite3_value_text(argv[2]));
+                if (proto && proto[0]) {
+                    Ref<Type> parsed_type;
+                    if (!parse_function_type_decl(bv, proto, assigned_name, parsed_type) || !parsed_type) {
+                        bv->RemoveUserFunction(func);
+                        if (!assigned_name.empty()) {
+                            bv->UndefineUserSymbol(Ref<Symbol>(new Symbol(FunctionSymbol, assigned_name, address)));
+                        }
+                        return false;
+                    }
+                    func->SetUserType(parsed_type);
+                }
+            }
+
+            // If comment is provided (column 6), apply it as function-level comment.
+            if (argc >= 7 && sqlite3_value_type(argv[6]) != SQLITE_NULL) {
+                const char* comment = reinterpret_cast<const char*>(sqlite3_value_text(argv[6]));
+                func->SetComment(comment ? comment : "");
+            }
+
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
             return true;
         })
         .build();
@@ -252,11 +392,16 @@ inline VTableDef define_names() {
             [](size_t i, const char* new_name) -> bool {
                 auto bv = get_bv();
                 if (!bv) return false;
+                if (!new_name || !new_name[0]) {
+                    xsql::set_vtab_error("Symbol name cannot be empty");
+                    return false;
+                }
                 auto syms = bv->GetSymbols();
                 if (i >= syms.size()) return false;
                 auto old_sym = syms[i];
                 auto new_sym = new Symbol(old_sym->GetType(), new_name, old_sym->GetAddress());
                 bv->DefineUserSymbol(new_sym);
+                if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
                 return true;
             })
         .column_int("is_public", [](size_t i) -> int {
@@ -275,6 +420,49 @@ inline VTableDef define_names() {
             if (i >= syms.size()) return 0;
             auto binding = syms[i]->GetBinding();
             return (binding == WeakBinding) ? 1 : 0;
+        })
+        .deletable([](size_t i) -> bool {
+            auto bv = get_bv();
+            if (!bv) return false;
+            auto syms = bv->GetSymbols();
+            if (i >= syms.size()) return false;
+
+            auto sym = syms[i];
+            if (sym->IsAutoDefined()) {
+                bv->UndefineAutoSymbol(sym);
+            } else {
+                bv->UndefineUserSymbol(sym);
+            }
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+            return true;
+        })
+        .insertable([](int argc, sqlite3_value** argv) -> bool {
+            auto bv = get_bv();
+            if (!bv) return false;
+            if (argc < 2) return false;
+            if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
+                sqlite3_value_type(argv[1]) == SQLITE_NULL) {
+                xsql::set_vtab_error("names insert requires address and name");
+                return false;
+            }
+
+            uint64_t address = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+            const char* name = reinterpret_cast<const char*>(sqlite3_value_text(argv[1]));
+            if (!name || !name[0]) {
+                xsql::set_vtab_error("Symbol name cannot be empty");
+                return false;
+            }
+
+            auto funcs = bv->GetAnalysisFunctionsForAddress(address);
+            BNSymbolType sym_type = DataSymbol;
+            if (!funcs.empty() && funcs[0]->GetStart() == address) {
+                sym_type = FunctionSymbol;
+            }
+
+            auto sym = new Symbol(sym_type, name, address);
+            bv->DefineUserSymbol(sym);
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+            return true;
         })
         .build();
 }
@@ -884,26 +1072,339 @@ inline CachedTableDef<InsnInfo> define_instructions() {
 }
 
 // ============================================================================
+// INSTRUCTION_OPERANDS Table
+// Schema: insn_addr, func_addr, operand_index, text, token_type, type_name,
+//         value, size
+//
+// Per-token operand metadata from disassembly tokens.
+// filter_eq("func_addr") enables fast single-function queries.
+// ============================================================================
+
+struct OperandInfo {
+    uint64_t insn_addr;
+    uint64_t func_addr;
+    int operand_index;
+    std::string text;
+    int token_type;
+    std::string type_name;
+    uint64_t value;
+    int size;
+};
+
+inline std::string token_type_name(int type) {
+    switch (type) {
+        case TextToken:              return "text";
+        case InstructionToken:       return "instruction";
+        case OperandSeparatorToken:  return "separator";
+        case RegisterToken:          return "register";
+        case IntegerToken:           return "integer";
+        case PossibleAddressToken:   return "address";
+        case BeginMemoryOperandToken: return "memory_start";
+        case EndMemoryOperandToken:  return "memory_end";
+        case FloatingPointToken:     return "float";
+        case AnnotationToken:        return "annotation";
+        case CodeRelativeAddressToken: return "code_address";
+        case ArgumentNameToken:      return "argument";
+        case OpcodeToken:            return "opcode";
+        case StringToken:            return "string";
+        case CharacterConstantToken: return "char";
+        case KeywordToken:           return "keyword";
+        case TypeNameToken:          return "type_name";
+        case FieldNameToken:         return "field_name";
+        case NameSpaceToken:         return "namespace";
+        case StructOffsetToken:      return "struct_offset";
+        case GotoLabelToken:         return "goto_label";
+        case CommentToken:           return "comment";
+        case EnumerationMemberToken: return "enum_member";
+        case OperationToken:         return "operation";
+        case CodeSymbolToken:        return "code_symbol";
+        case DataSymbolToken:        return "data_symbol";
+        case LocalVariableToken:     return "local_variable";
+        case ImportToken:            return "import";
+        case ExternalSymbolToken:    return "external_symbol";
+        case StackVariableToken:     return "stack_variable";
+        default:                     return "other";
+    }
+}
+
+/**
+ * Iterator for instruction_operands filtered to a single function address.
+ * Avoids full cache scan when querying WHERE func_addr = X.
+ */
+class OperandIterator : public xsql::RowIterator {
+    std::vector<OperandInfo> rows_;
+    size_t pos_ = 0;
+    bool started_ = false;
+
+public:
+    explicit OperandIterator(int64_t addr) {
+        auto bv = get_bv();
+        if (!bv) return;
+
+        uint64_t func_addr = static_cast<uint64_t>(addr);
+        auto funcs = bv->GetAnalysisFunctionsForAddress(func_addr);
+        if (funcs.empty()) return;
+
+        auto func = funcs[0];
+        auto settings = DisassemblySettings::GetDefaultSettings();
+
+        for (auto& block : func->GetBasicBlocks()) {
+            auto lines = block->GetDisassemblyText(settings);
+            for (auto& line : lines) {
+                for (auto& tok : line.tokens) {
+                    if (tok.operand == BN_INVALID_OPERAND) continue;
+
+                    OperandInfo oi;
+                    oi.insn_addr = line.addr;
+                    oi.func_addr = func_addr;
+                    oi.operand_index = static_cast<int>(tok.operand);
+                    oi.text = tok.text;
+                    oi.token_type = static_cast<int>(tok.type);
+                    oi.type_name = token_type_name(static_cast<int>(tok.type));
+                    oi.value = tok.value;
+                    oi.size = static_cast<int>(tok.size);
+                    rows_.push_back(std::move(oi));
+                }
+            }
+        }
+    }
+
+    bool next() override {
+        if (!started_) { started_ = true; pos_ = 0; }
+        else { pos_++; }
+        return pos_ < rows_.size();
+    }
+
+    bool eof() const override {
+        return !started_ || pos_ >= rows_.size();
+    }
+
+    void column(xsql::FunctionContext& ctx, int col) override {
+        if (pos_ >= rows_.size()) { ctx.result_null(); return; }
+        const auto& r = rows_[pos_];
+        switch (col) {
+            case 0: ctx.result_int64(static_cast<int64_t>(r.insn_addr)); break;
+            case 1: ctx.result_int64(static_cast<int64_t>(r.func_addr)); break;
+            case 2: ctx.result_int(r.operand_index); break;
+            case 3: ctx.result_text(r.text); break;
+            case 4: ctx.result_int(r.token_type); break;
+            case 5: ctx.result_text(r.type_name); break;
+            case 6: ctx.result_int64(static_cast<int64_t>(r.value)); break;
+            case 7: ctx.result_int(r.size); break;
+            default: ctx.result_null(); break;
+        }
+    }
+
+    int64_t rowid() const override {
+        return static_cast<int64_t>(pos_);
+    }
+};
+
+inline CachedTableDef<OperandInfo> define_instruction_operands() {
+    return cached_table<OperandInfo>("instruction_operands")
+        .estimate_rows([]() -> size_t {
+            auto bv = get_bv();
+            if (!bv) return 0;
+            // Estimate ~3 operand tokens per instruction, ~20 instructions per function
+            return bv->GetAnalysisFunctionList().size() * 60;
+        })
+        .cache_builder([](std::vector<OperandInfo>& cache) {
+            auto bv = get_bv();
+            if (!bv) return;
+
+            auto settings = DisassemblySettings::GetDefaultSettings();
+
+            for (auto& func : bv->GetAnalysisFunctionList()) {
+                uint64_t func_addr = func->GetStart();
+                for (auto& block : func->GetBasicBlocks()) {
+                    auto lines = block->GetDisassemblyText(settings);
+                    for (auto& line : lines) {
+                        for (auto& tok : line.tokens) {
+                            if (tok.operand == BN_INVALID_OPERAND) continue;
+
+                            OperandInfo oi;
+                            oi.insn_addr = line.addr;
+                            oi.func_addr = func_addr;
+                            oi.operand_index = static_cast<int>(tok.operand);
+                            oi.text = tok.text;
+                            oi.token_type = static_cast<int>(tok.type);
+                            oi.type_name = token_type_name(static_cast<int>(tok.type));
+                            oi.value = tok.value;
+                            oi.size = static_cast<int>(tok.size);
+                            cache.push_back(std::move(oi));
+                        }
+                    }
+                }
+            }
+        })
+        .column_int64("insn_addr", [](const OperandInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.insn_addr);
+        })
+        .column_int64("func_addr", [](const OperandInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.func_addr);
+        })
+        .column_int("operand_index", [](const OperandInfo& r) -> int {
+            return r.operand_index;
+        })
+        .column_text("text", [](const OperandInfo& r) -> std::string {
+            return r.text;
+        })
+        .column_int("token_type", [](const OperandInfo& r) -> int {
+            return r.token_type;
+        })
+        .column_text("type_name", [](const OperandInfo& r) -> std::string {
+            return r.type_name;
+        })
+        .column_int64("value", [](const OperandInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.value);
+        })
+        .column_int("size", [](const OperandInfo& r) -> int {
+            return r.size;
+        })
+        // Direct source filter: single-function query bypasses cache
+        .filter_eq("func_addr", [](int64_t addr) -> std::unique_ptr<xsql::RowIterator> {
+            return std::make_unique<OperandIterator>(addr);
+        }, 0.5, 20.0)  // cost=0.5, estimated_rows=20
+        .index_on("func_addr", [](const OperandInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.func_addr);
+        })
+        .build();
+}
+
+// ============================================================================
 // COMMENTS Table
 // Schema: address, comment, rpt_comment
 // Compatible with idasql comments table
 // ============================================================================
 
-// Note: BN comments are simpler - no repeatable comments like IDA
-// We'll store in a vector and rebuild on access
+struct CommentInfo {
+    uint64_t address = 0;
+    std::string comment;
+    std::string rpt_comment;
+};
 
-inline VTableDef define_comments() {
-    // For now, a minimal implementation
-    // Full implementation would iterate all addresses with comments
-    return table("comments")
-        .count([]() {
-            // Count would require iterating all addresses
-            // Return 0 for now - this table needs optimization
-            return size_t(0);
+inline void collect_comments(std::vector<CommentInfo>& out) {
+    auto bv = get_bv();
+    if (!bv) return;
+
+    std::unordered_map<uint64_t, std::string> by_addr;
+    by_addr.reserve(256);
+
+    // Global comments first.
+    for (uint64_t addr : bv->GetCommentedAddresses()) {
+        auto comment = bv->GetCommentForAddress(addr);
+        if (!comment.empty()) {
+            by_addr.emplace(addr, std::move(comment));
+        }
+    }
+
+    // Fill gaps with function-scoped comments.
+    for (auto& func : bv->GetAnalysisFunctionList()) {
+        for (uint64_t addr : func->GetCommentedAddresses()) {
+            if (by_addr.find(addr) != by_addr.end()) continue;
+            auto comment = func->GetCommentForAddress(addr);
+            if (!comment.empty()) {
+                by_addr.emplace(addr, std::move(comment));
+            }
+        }
+    }
+
+    out.reserve(by_addr.size());
+    for (const auto& [addr, comment] : by_addr) {
+        CommentInfo item;
+        item.address = addr;
+        item.comment = comment;
+        item.rpt_comment = comment;  // BN has no repeatable comment split.
+        out.push_back(std::move(item));
+    }
+
+    std::sort(out.begin(), out.end(), [](const CommentInfo& a, const CommentInfo& b) {
+        return a.address < b.address;
+    });
+}
+
+inline bool set_comment_at_address(const Ref<BinaryView>& bv, uint64_t addr, const std::string& text) {
+    if (!bv) return false;
+
+    // Keep global and function-scoped comments aligned for consistent reads.
+    bv->SetCommentForAddress(addr, text);
+    for (auto& func : bv->GetAnalysisFunctionsContainingAddress(addr)) {
+        func->SetCommentForAddress(addr, text);
+    }
+    return true;
+}
+
+inline CachedTableDef<CommentInfo> define_comments() {
+    return cached_table<CommentInfo>("comments")
+        .estimate_rows([]() -> size_t {
+            auto bv = get_bv();
+            return bv ? bv->GetCommentedAddresses().size() : 0;
         })
-        .column_int64("address", [](size_t) -> int64_t { return 0; })
-        .column_text("comment", [](size_t) -> std::string { return ""; })
-        .column_text("rpt_comment", [](size_t) -> std::string { return ""; })
+        .cache_builder([](std::vector<CommentInfo>& cache) {
+            collect_comments(cache);
+        })
+        .column_int64("address", [](const CommentInfo& r) -> int64_t {
+            return static_cast<int64_t>(r.address);
+        })
+        .column_text_rw("comment",
+            [](const CommentInfo& r) -> std::string {
+                return r.comment;
+            },
+            [](CommentInfo& r, const char* text) -> bool {
+                auto bv = get_bv();
+                if (!bv) return false;
+                std::string value = text ? text : "";
+                if (!set_comment_at_address(bv, r.address, value)) return false;
+                r.comment = value;
+                r.rpt_comment = value;
+                if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+                return true;
+            })
+        .column_text_rw("rpt_comment",
+            [](const CommentInfo& r) -> std::string {
+                return r.rpt_comment;
+            },
+            [](CommentInfo& r, const char* text) -> bool {
+                auto bv = get_bv();
+                if (!bv) return false;
+                std::string value = text ? text : "";
+                if (!set_comment_at_address(bv, r.address, value)) return false;
+                r.comment = value;
+                r.rpt_comment = value;
+                if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+                return true;
+            })
+        .deletable([](CommentInfo& r) -> bool {
+            auto bv = get_bv();
+            if (!bv) return false;
+            if (!set_comment_at_address(bv, r.address, "")) return false;
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+            return true;
+        })
+        .insertable([](int argc, sqlite3_value** argv) -> bool {
+            auto bv = get_bv();
+            if (!bv) return false;
+            if (argc < 1) return false;
+            if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return false;
+
+            uint64_t addr = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+
+            std::string value;
+            if (argc >= 2 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
+                const char* comment = reinterpret_cast<const char*>(sqlite3_value_text(argv[1]));
+                value = comment ? comment : "";
+            } else if (argc >= 3 && sqlite3_value_type(argv[2]) != SQLITE_NULL) {
+                const char* rpt_comment = reinterpret_cast<const char*>(sqlite3_value_text(argv[2]));
+                value = rpt_comment ? rpt_comment : "";
+            } else {
+                xsql::set_vtab_error("comments insert requires comment or rpt_comment");
+                return false;
+            }
+
+            if (!set_comment_at_address(bv, addr, value)) return false;
+            if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
+            return true;
+        })
         .build();
 }
 
@@ -917,6 +1418,13 @@ struct MetadataItem {
     std::string key;
     std::string value;
     std::string type;
+};
+
+struct CapabilityItem {
+    std::string key;
+    std::string value;
+    std::string type;
+    std::string note;
 };
 
 inline VTableDef define_db_info() {
@@ -970,6 +1478,80 @@ inline VTableDef define_db_info() {
 }
 
 // ============================================================================
+// CAPABILITIES Table - Runtime feature flags
+// Schema: key, value, type, note
+// ============================================================================ 
+
+inline VTableDef define_capabilities() {
+    static const std::vector<CapabilityItem> kCaps = {
+        // Mutation capabilities
+        {"mutation.table_first_default", "true", "bool", "Mutations should prefer table UPDATE/DELETE/INSERT surfaces."},
+        {"mutation.funcs.prototype_clear", "false", "bool", "Clearing user prototype override is not exposed safely by BN API here."},
+        {"mutation.funcs.name", "true", "bool", "Function names writable via funcs.name."},
+        {"mutation.funcs.prototype", "true", "bool", "Function prototypes writable via funcs.prototype."},
+        {"mutation.funcs.comment", "true", "bool", "Function comments writable via funcs.comment."},
+        {"mutation.names.insert", "true", "bool", "User symbols can be defined via INSERT INTO names."},
+        {"mutation.names.delete", "true", "bool", "Matching symbols can be undefined via DELETE FROM names."},
+        {"mutation.comments.insert", "true", "bool", "Address comments writable via INSERT INTO comments."},
+        {"mutation.comments.delete", "true", "bool", "Address comments clearable via DELETE FROM comments."},
+        {"mutation.pseudocode.comment", "true", "bool", "Pseudocode line comments writable via pseudocode.comment."},
+        {"mutation.pseudocode.delete_clear", "true", "bool", "DELETE FROM pseudocode clears line comment for matching line."},
+        {"mutation.hlil_vars.name", "true", "bool", "Variable names writable via hlil_vars.name."},
+        {"mutation.hlil_vars.type", "true", "bool", "Variable types writable via hlil_vars.type."},
+        {"mutation.hlil_vars.delete_clear", "true", "bool", "DELETE FROM hlil_vars clears user variable override."},
+        {"mutation.hlil_vars.comment", "true", "bool", "Variable comments writable via hlil_vars.comment using persistent BN metadata keyed by variable identity."},
+        // Discovery capabilities
+        {"discovery.entities", "true", "bool", "Unified discovery surface via entities view."},
+        // UDF capabilities
+        {"udf.decompiler_helper_mutators", "false", "bool", "rename_var/set_var_type/set_func_prototype/set_pseudocode_comment removed in favor of table mutations."},
+        {"udf.legacy.set_name", "true", "bool", "Legacy helper preserved; table names/funcs updates remain preferred."},
+        {"udf.legacy.set_comment", "true", "bool", "Legacy helper preserved; table comments/pseudocode/funcs updates remain preferred."},
+        // Feature-level capabilities
+        {"feature.decompiler", "true", "bool", "HLIL decompiler tables available."},
+        {"feature.types", "true", "bool", "Type intelligence tables (types, type_members, type_enum_values, func_signatures) available."},
+        {"feature.search_bytes", "true", "bool", "search_bytes() UDF available."},
+        {"feature.write_ops", "true", "bool", "Table-first write operations available."},
+        {"feature.entities_search", "true", "bool", "entities_search() UDF available."},
+        {"feature.disasm_calls", "true", "bool", "disasm_calls view available."},
+        {"feature.patches", "true", "bool", "patches table available (read-write)."},
+        {"mutation.patches.insert", "true", "bool", "New patches can be applied via INSERT INTO patches (address, patched_byte)."},
+        {"mutation.patches.delete", "true", "bool", "Patches can be reverted via DELETE FROM patches WHERE address = <addr>."},
+        {"mutation.patches.patched_byte", "true", "bool", "Patch bytes writable via UPDATE patches SET patched_byte = <byte>."},
+        {"feature.runtime_settings", "true", "bool", "PRAGMA bnsql.* runtime controls available."},
+        {"feature.query_timeout", "true", "bool", "Query timeout enforcement via sqlite3_progress_handler."},
+        {"feature.instruction_operands", "true", "bool", "instruction_operands table available."},
+#ifdef BNSQL_HAS_HTTP
+        {"feature.http_server", "true", "bool", "HTTP query server available."},
+#else
+        {"feature.http_server", "false", "bool", "HTTP query server not compiled in."},
+#endif
+#ifdef BNSQL_HAS_MCP
+        {"feature.mcp_server", "true", "bool", "MCP server available."},
+#else
+        {"feature.mcp_server", "false", "bool", "MCP server not compiled in."},
+#endif
+    };
+
+    return table("capabilities")
+        .count([]() {
+            return kCaps.size();
+        })
+        .column_text("key", [](size_t i) -> std::string {
+            return i < kCaps.size() ? kCaps[i].key : "";
+        })
+        .column_text("value", [](size_t i) -> std::string {
+            return i < kCaps.size() ? kCaps[i].value : "";
+        })
+        .column_text("type", [](size_t i) -> std::string {
+            return i < kCaps.size() ? kCaps[i].type : "";
+        })
+        .column_text("note", [](size_t i) -> std::string {
+            return i < kCaps.size() ? kCaps[i].note : "";
+        })
+        .build();
+}
+
+// ============================================================================
 // Table Registry - All tables in one place
 // ============================================================================
 
@@ -979,13 +1561,15 @@ struct TableRegistry {
     VTableDef names;
     VTableDef entries;
     CachedTableDef<StringInfo> strings;
-    VTableDef comments;
+    CachedTableDef<CommentInfo> comments;
     VTableDef db_info;
+    VTableDef capabilities;
 
     CachedTableDef<XrefInfo> xrefs;
     CachedTableDef<BlockInfo> blocks;
     CachedTableDef<ImportInfo> imports;
     CachedTableDef<InsnInfo> instructions;
+    CachedTableDef<OperandInfo> instruction_operands;
 
     TableRegistry()
         : funcs(define_funcs())
@@ -995,10 +1579,12 @@ struct TableRegistry {
         , strings(define_strings())
         , comments(define_comments())
         , db_info(define_db_info())
+        , capabilities(define_capabilities())
         , xrefs(define_xrefs())
         , blocks(define_blocks())
         , imports(define_imports())
         , instructions(define_instructions())
+        , instruction_operands(define_instruction_operands())
     {}
 
     void register_all(xsql::Database& db) {
@@ -1007,53 +1593,123 @@ struct TableRegistry {
         register_index_table(db, "segments", &segments);
         register_index_table(db, "names", &names);
         register_index_table(db, "entries", &entries);
-        register_index_table(db, "comments", &comments);
         register_index_table(db, "db_info", &db_info);
+        register_index_table(db, "capabilities", &capabilities);
 
         // Cached tables
+        register_cached_table(db, "comments", &comments);
         register_cached_table(db, "strings", &strings);
         register_cached_table(db, "xrefs", &xrefs);
         register_cached_table(db, "blocks", &blocks);
         register_cached_table(db, "imports", &imports);
         register_cached_table(db, "instructions", &instructions);
+        register_cached_table(db, "instruction_operands", &instruction_operands);
 
         // Create convenience views for common queries
         create_helper_views(db);
     }
 
     void create_helper_views(xsql::Database& db) {
+        // entities view - unified discovery surface for common analyst lookups.
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS entities AS
+            SELECT
+                f.name AS name,
+                'function' AS kind,
+                f.address AS address,
+                '' AS parent_name,
+                f.name AS qualified_name,
+                'analysis.functions' AS source
+            FROM funcs f
+            UNION ALL
+            SELECT
+                n.name AS name,
+                'symbol' AS kind,
+                n.address AS address,
+                '' AS parent_name,
+                n.name AS qualified_name,
+                'analysis.symbols' AS source
+            FROM names n
+            UNION ALL
+            SELECT
+                s.name AS name,
+                'segment' AS kind,
+                s.start_ea AS address,
+                '' AS parent_name,
+                s.name AS qualified_name,
+                'analysis.segments' AS source
+            FROM segments s
+            UNION ALL
+            SELECT
+                i.name AS name,
+                'import' AS kind,
+                i.address AS address,
+                i.module AS parent_name,
+                i.module || '!' || i.name AS qualified_name,
+                'analysis.imports' AS source
+            FROM imports i
+            UNION ALL
+            SELECT
+                t.content AS name,
+                'string' AS kind,
+                t.address AS address,
+                '' AS parent_name,
+                t.content AS qualified_name,
+                'analysis.strings' AS source
+            FROM strings t
+            UNION ALL
+            SELECT
+                ty.name AS name,
+                'type' AS kind,
+                NULL AS address,
+                '' AS parent_name,
+                ty.name AS qualified_name,
+                'analysis.types' AS source
+            FROM types ty
+        )");
+
         // callers view - who calls a function
-        // Uses pre-computed from_func for O(1) lookup instead of range scan
+        // Uses pre-computed from_func and name_at() scalar lookups to avoid
+        // expensive joins against large virtual tables.
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS callers AS
             SELECT
                 x.to_ea as func_addr,
                 x.from_ea as caller_addr,
-                f.name as caller_name,
+                COALESCE(name_at(x.from_func), printf('sub_%X', x.from_func)) as caller_name,
                 x.from_func as caller_func_addr
             FROM xrefs x
-            LEFT JOIN funcs f ON x.from_func = f.address
-            WHERE x.is_code = 1
+            WHERE x.is_code = 1 AND x.from_func != 0
         )");
 
         // callees view - what does a function call
-        // Uses pre-computed from_func for O(1) lookup instead of range scan
+        // Uses scalar name_at() lookup to avoid heavy funcs/names joins.
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS callees AS
             SELECT
                 x.from_func as func_addr,
-                f.name as func_name,
+                COALESCE(name_at(x.from_func), printf('sub_%X', x.from_func)) as func_name,
                 x.to_ea as callee_addr,
-                COALESCE(f2.name, n.name, printf('sub_%X', x.to_ea)) as callee_name
+                COALESCE(name_at(x.to_ea), printf('sub_%X', x.to_ea)) as callee_name
             FROM xrefs x
-            LEFT JOIN funcs f ON x.from_func = f.address
-            LEFT JOIN funcs f2 ON x.to_ea = f2.address
-            LEFT JOIN names n ON x.to_ea = n.address
             WHERE x.is_code = 1 AND x.from_func != 0
         )");
 
+        // function_chunks view - function address ranges (BN functions are typically contiguous)
+        db.exec(R"(
+            CREATE VIEW IF NOT EXISTS function_chunks AS
+            SELECT
+                func_ea AS func_addr,
+                MIN(start_ea) AS chunk_start,
+                MAX(end_ea) AS chunk_end,
+                COUNT(*) AS block_count,
+                SUM(end_ea - start_ea) AS total_size
+            FROM blocks
+            GROUP BY func_ea
+        )");
+
         // string_refs view - which functions reference which strings
-        // Uses pre-computed from_func for O(1) lookup instead of range scan
+        // Uses scalar name lookup to keep this view bounded on larger fixtures.
         db.exec(R"(
             CREATE VIEW IF NOT EXISTS string_refs AS
             SELECT
@@ -1062,10 +1718,10 @@ struct TableRegistry {
                 s.length as string_length,
                 x.from_ea as ref_addr,
                 x.from_func as func_addr,
-                f.name as func_name
+                COALESCE(name_at(x.from_func), printf('sub_%X', x.from_func)) as func_name
             FROM strings s
             JOIN xrefs x ON x.to_ea = s.address
-            LEFT JOIN funcs f ON x.from_func = f.address
+            WHERE x.from_func != 0
         )");
     }
 
