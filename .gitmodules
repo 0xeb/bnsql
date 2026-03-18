@@ -4,6 +4,3 @@
 [submodule "external/fastmcpp"]
 	path = external/fastmcpp
 	url = https://github.com/0xeb/fastmcpp.git
-[submodule "external/libxsql"]
-	path = external/libxsql
-	url = https://github.com/0xeb/libxsql.git

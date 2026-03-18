@@ -69,12 +69,18 @@ endif()
 
 if(TARGET xsql::xsql)
     message(STATUS "bnsql: Using existing xsql::xsql target")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql/CMakeLists.txt")
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/external/libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
-    message(STATUS "bnsql: Added libxsql from external/libxsql submodule")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
+    message(STATUS "bnsql: Added libxsql from sibling directory")
 else()
-    message(FATAL_ERROR "libxsql not found. Initialize submodule:\n"
-        "  git submodule update --init --recursive")
+    message(STATUS "bnsql: Fetching libxsql from GitHub...")
+    include(FetchContent)
+    FetchContent_Declare(libxsql
+        GIT_REPOSITORY https://github.com/0xeb/libxsql.git
+        GIT_TAG        main
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(libxsql)
 endif()
 
 # ============================================================================
