@@ -1,6 +1,3 @@
 [submodule "external/binaryninja-api"]
 	path = external/binaryninja-api
 	url = https://github.com/Vector35/binaryninja-api.git
-[submodule "external/fastmcpp"]
-	path = external/fastmcpp
-	url = https://github.com/0xeb/fastmcpp.git

@@ -51,16 +51,22 @@ endif()
 option(BNSQL_WITH_MCP "Build with MCP server support" ON)
 
 if(BNSQL_WITH_MCP)
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/fastmcpp/CMakeLists.txt")
+    if(NOT TARGET fastmcpp_core)
         set(FASTMCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-        add_subdirectory(external/fastmcpp)
-        message(STATUS "bnsql: Building with MCP server support")
-    else()
-        message(WARNING "bnsql: fastmcpp not found, MCP support disabled. "
-            "Initialize submodule: git submodule update --init external/fastmcpp")
-        set(BNSQL_WITH_MCP OFF)
+        set(FASTMCPP_ENABLE_POST_STREAMING OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_ENABLE_SAMPLING_HTTP_HANDLERS OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_FETCH_CURL OFF CACHE BOOL "" FORCE)
+        message(STATUS "bnsql: Fetching fastmcpp from GitHub...")
+        include(FetchContent)
+        FetchContent_Declare(fastmcpp
+            GIT_REPOSITORY https://github.com/0xeb/fastmcpp.git
+            GIT_TAG        main
+            GIT_SHALLOW    TRUE
+        )
+        FetchContent_MakeAvailable(fastmcpp)
     endif()
+    message(STATUS "bnsql: Building with MCP server support")
 endif()
 
 # ============================================================================
