@@ -344,4 +344,4 @@ Elias Bachaalany ([@0xeb](https://github.com/0xeb))
 
 ## License
 
-MIT License - Copyright (c) 2025 Elias Bachaalany
+This project is licensed under the [Mozilla Public License 2.0](LICENSE).
