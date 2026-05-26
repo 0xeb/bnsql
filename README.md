@@ -27,8 +27,12 @@ copy bnsql.exe "C:\Program Files\Vector35\BinaryNinja\"
 ```
 
 ```bash
-# Interactive SQL mode
+# Interactive SQL mode (existing Binary Ninja database)
 bnsql database.bndb
+
+# Raw binary - bnsql triggers BN auto-analysis and auto-saves database.bndb next to source
+bnsql sample.exe
+bnsql firmware.bin --http 8080
 
 # Single query
 bnsql database.bndb -c "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
@@ -36,6 +40,11 @@ bnsql database.bndb -c "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10
 # MCP server for AI tool integration
 bnsql database.bndb --mcp
 ```
+
+**Input file:** `bnsql <file>` accepts either an existing Binary Ninja database
+(`.bndb`) or a raw binary (`.exe`/`.dll`/firmware/etc.). Raw binaries trigger
+fresh Binary Ninja analysis; the resulting `.bndb` is auto-saved next to the
+source on clean exit. No need to pre-build a `.bndb` with `binaryninja --headless`.
 
 ### For LLM/AI Agent Integration
 
@@ -116,14 +125,26 @@ WHERE name IN ('strcpy', 'strcat', 'sprintf', 'gets')
 
 ## CLI Reference
 
+### Input file
+
+`bnsql <file>` accepts either form:
+
+- **Existing Binary Ninja database** (`.bndb`) — loads directly, ready to query.
+- **Raw binary** (`.exe`/`.dll`/firmware/etc.) — bnsql calls Binary Ninja to
+  analyze it from scratch and auto-saves the resulting `.bndb` next to the
+  source on clean exit. If a sibling `.bndb` already exists, that's loaded
+  instead.
+
 ### Modes
 
 ```bash
 # Interactive SQL mode (default)
 bnsql database.bndb
+bnsql sample.exe                # raw binary: BN auto-analyzes on open
 
 # One-shot SQL query
 bnsql database.bndb -c "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
+bnsql sample.exe -c "SELECT * FROM funcs LIMIT 5"
 
 # Execute SQL file
 bnsql database.bndb -f queries.sql
@@ -303,33 +324,47 @@ cmake --build build --config Release
 </tr>
 </table>
 
-## Claude Code Plugin
+## Coding Agent Plugins
 
-BNSQL is available as a Claude Code plugin, allowing Claude to query Binary Ninja databases directly within your coding workflow.
+BNSQL skills give your coding agent full control over Binary Ninja databases through natural language. The skills are packaged at [0xeb/bnsql-skills](https://github.com/0xeb/bnsql-skills).
+
+- **Claude Code** — full plugin with 9 topic-focused skills. Install via `/install-plugin` (see below).
+- **GitHub Copilot CLI** — also supports BNSQL skills. Install the same plugin.
+- **Codex (OpenAI)** — supports skills. See the [bnsql-skills](https://github.com/0xeb/bnsql-skills) README for the Codex install steps.
 
 ### Prerequisites
 
-1. **Binary Ninja** installed with its DLL directory in your PATH
-2. **bnsql.exe** in your PATH
+1. **Binary Ninja** installed with its DLL directory in your PATH (or set `BN_INSTALL_DIR`)
+2. **bnsql.exe** in your PATH (from [Releases](https://github.com/0xeb/bnsql/releases) or built locally)
 3. Verify setup: `bnsql --version` should work from command line
 
-### Installation
+### Install
 
 ```bash
-# Add the marketplace (one-time)
-/plugin marketplace add 0xeb/anthropic-xsql-tools-plugin
-
-# Install bnsql plugin
-/plugin install bnsql@0xeb-tools
+claude /install-plugin https://github.com/0xeb/bnsql-skills
 ```
 
-### Usage
+### Skills
 
-Once installed, the skill is automatically available:
+| Skill | Description |
+|-------|-------------|
+| `connect` | Connect to Binary Ninja databases: CLI, HTTP server, session bootstrap. |
+| `disassembly` | Query Binary Ninja disassembly: functions, segments, instructions, blocks, operands. |
+| `data` | Query strings, bytes, binary data: search, byte patterns. |
+| `xrefs` | Analyze cross-references: callers, callees, imports, data refs. |
+| `decompiler` | Decompile functions: pseudocode, HLIL/MLIL, variables, labels. |
+| `annotations` | Edit databases: comments, renames, types, function signatures. |
+| `types` | Type system: create/modify/apply structs, unions, enums, typedefs. |
+| `functions` | Complete bnsql SQL function reference catalog. |
+| `analysis` | Analyze binaries: triage, security audit, crypto/network detection, multi-table queries. |
+
+### Example Prompts
 
 ```
 "Using bnsql, count functions in malware.bndb"
 "Using bnsql, find strings containing 'error' in malware.bndb"
+"/bnsql:analysis triage this binary; tell me the most called functions."
+"/bnsql:xrefs show callers of CreateFileW and summarize error handling."
 ```
 
 ### Updating

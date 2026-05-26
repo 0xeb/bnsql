@@ -243,7 +243,7 @@ inline VTableDef define_funcs() {
         })
         // INSERT support - create new function at address
         // INSERT INTO funcs (address, name) VALUES (0x1234, 'my_func')
-        .insertable([](int argc, sqlite3_value** argv) -> bool {
+        .insertable([](int argc, xsql::FunctionArg* argv) -> bool {
             auto bv = get_bv();
             if (!bv) return false;
 
@@ -252,8 +252,8 @@ inline VTableDef define_funcs() {
             if (argc < 1) return false;
 
             // Get address from first column
-            if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return false;
-            uint64_t address = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+            if (argv[0].is_null()) return false;
+            uint64_t address = static_cast<uint64_t>(argv[0].as_int64());
 
             // Create user function at address
             auto platform = bv->GetDefaultPlatform();
@@ -264,8 +264,8 @@ inline VTableDef define_funcs() {
 
             // If name is provided (column 1), set it.
             std::string assigned_name;
-            if (argc >= 2 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
-                const char* name = reinterpret_cast<const char*>(sqlite3_value_text(argv[1]));
+            if (argc >= 2 && !argv[1].is_null()) {
+                const char* name = argv[1].as_c_str();
                 if (name && name[0]) {
                     assigned_name = name;
                     auto sym = new Symbol(FunctionSymbol, name, address);
@@ -274,8 +274,8 @@ inline VTableDef define_funcs() {
             }
 
             // If prototype is provided (column 2), apply it.
-            if (argc >= 3 && sqlite3_value_type(argv[2]) != SQLITE_NULL) {
-                const char* proto = reinterpret_cast<const char*>(sqlite3_value_text(argv[2]));
+            if (argc >= 3 && !argv[2].is_null()) {
+                const char* proto = argv[2].as_c_str();
                 if (proto && proto[0]) {
                     Ref<Type> parsed_type;
                     if (!parse_function_type_decl(bv, proto, assigned_name, parsed_type) || !parsed_type) {
@@ -290,8 +290,8 @@ inline VTableDef define_funcs() {
             }
 
             // If comment is provided (column 6), apply it as function-level comment.
-            if (argc >= 7 && sqlite3_value_type(argv[6]) != SQLITE_NULL) {
-                const char* comment = reinterpret_cast<const char*>(sqlite3_value_text(argv[6]));
+            if (argc >= 7 && !argv[6].is_null()) {
+                const char* comment = argv[6].as_c_str();
                 func->SetComment(comment ? comment : "");
             }
 
@@ -440,18 +440,17 @@ inline VTableDef define_names() {
             if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
             return true;
         })
-        .insertable([](int argc, sqlite3_value** argv) -> bool {
+        .insertable([](int argc, xsql::FunctionArg* argv) -> bool {
             auto bv = get_bv();
             if (!bv) return false;
             if (argc < 2) return false;
-            if (sqlite3_value_type(argv[0]) == SQLITE_NULL ||
-                sqlite3_value_type(argv[1]) == SQLITE_NULL) {
+            if (argv[0].is_null() || argv[1].is_null()) {
                 xsql::set_vtab_error("names insert requires address and name");
                 return false;
             }
 
-            uint64_t address = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-            const char* name = reinterpret_cast<const char*>(sqlite3_value_text(argv[1]));
+            uint64_t address = static_cast<uint64_t>(argv[0].as_int64());
+            const char* name = argv[1].as_c_str();
             if (!name || !name[0]) {
                 xsql::set_vtab_error("Symbol name cannot be empty");
                 return false;
@@ -1385,20 +1384,20 @@ inline CachedTableDef<CommentInfo> define_comments() {
             if (persistence::on_decompiler_invalidate) persistence::on_decompiler_invalidate();
             return true;
         })
-        .insertable([](int argc, sqlite3_value** argv) -> bool {
+        .insertable([](int argc, xsql::FunctionArg* argv) -> bool {
             auto bv = get_bv();
             if (!bv) return false;
             if (argc < 1) return false;
-            if (sqlite3_value_type(argv[0]) == SQLITE_NULL) return false;
+            if (argv[0].is_null()) return false;
 
-            uint64_t addr = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+            uint64_t addr = static_cast<uint64_t>(argv[0].as_int64());
 
             std::string value;
-            if (argc >= 2 && sqlite3_value_type(argv[1]) != SQLITE_NULL) {
-                const char* comment = reinterpret_cast<const char*>(sqlite3_value_text(argv[1]));
+            if (argc >= 2 && !argv[1].is_null()) {
+                const char* comment = argv[1].as_c_str();
                 value = comment ? comment : "";
-            } else if (argc >= 3 && sqlite3_value_type(argv[2]) != SQLITE_NULL) {
-                const char* rpt_comment = reinterpret_cast<const char*>(sqlite3_value_text(argv[2]));
+            } else if (argc >= 3 && !argv[2].is_null()) {
+                const char* rpt_comment = argv[2].as_c_str();
                 value = rpt_comment ? rpt_comment : "";
             } else {
                 xsql::set_vtab_error("comments insert requires comment or rpt_comment");
@@ -1522,7 +1521,7 @@ inline VTableDef define_capabilities() {
         {"mutation.patches.delete", "true", "bool", "Patches can be reverted via DELETE FROM patches WHERE address = <addr>."},
         {"mutation.patches.patched_byte", "true", "bool", "Patch bytes writable via UPDATE patches SET patched_byte = <byte>."},
         {"feature.runtime_settings", "true", "bool", "PRAGMA bnsql.* runtime controls available."},
-        {"feature.query_timeout", "true", "bool", "Query timeout enforcement via sqlite3_progress_handler."},
+        {"feature.query_timeout", "true", "bool", "Query timeout enforcement via xsql::QueryOptions::timeout_ms."},
         {"feature.instruction_operands", "true", "bool", "instruction_operands table available."},
 #ifdef BNSQL_HAS_HTTP
         {"feature.http_server", "true", "bool", "HTTP query server available."},

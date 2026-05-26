@@ -65,13 +65,6 @@ using CachedTableDef = xsql::CachedTableDef<RowData>;
 template<typename RowData>
 using CachedCursor = xsql::CachedCursor<RowData>;
 
-// Cached table registration
-template<typename RowData>
-inline bool register_cached_vtable(sqlite3* db, const char* module_name,
-                                   const CachedTableDef<RowData>* def) {
-    return xsql::register_cached_vtable(db, module_name, def);
-}
-
 // Cached table builder
 template<typename RowData>
 using CachedTableBuilder = xsql::CachedTableBuilder<RowData>;

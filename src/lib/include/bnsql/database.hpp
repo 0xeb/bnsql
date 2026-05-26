@@ -173,45 +173,31 @@ public:
         // Set context for this query
         entities::set_context(context_.get());
 
-        struct QueryData {
-            QueryResult* result;
-            bool first_row;
-        } qd = { &result, true };
+        // Configure timeout via libxsql's QueryOptions (libxsql installs a
+        // progress handler internally and surfaces timed_out in the Result).
+        xsql::QueryOptions options;
+        options.timeout_ms = runtime_settings().query_timeout_ms();
 
-        auto callback = [](void* data, int argc, char** argv, char** cols) -> int {
-            auto* qd = static_cast<QueryData*>(data);
+        xsql::Result raw = db_.query(sql, options);
 
-            if (qd->first_row) {
-                for (int i = 0; i < argc; i++) {
-                    qd->result->columns.push_back(cols[i] ? cols[i] : "");
-                }
-                qd->first_row = false;
-            }
-
+        // Translate xsql::Result -> bnsql::QueryResult. xsql::Row already
+        // holds std::vector<std::string> values, same shape as bnsql::Row.
+        result.columns = raw.columns;
+        result.rows.reserve(raw.rows.size());
+        for (const auto& xr : raw.rows) {
             Row row;
-            row.values.reserve(argc);
-            for (int i = 0; i < argc; i++) {
-                row.values.push_back(argv[i] ? argv[i] : "NULL");
-            }
-            qd->result->rows.push_back(std::move(row));
-
-            return 0;
-        };
-
-        auto t0 = std::chrono::steady_clock::now();
-        int rc = exec(sql, callback, &qd);
-        auto t1 = std::chrono::steady_clock::now();
-        result.elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-
-        if (rc == SQLITE_INTERRUPT) {
-            result.success = false;
-            result.timed_out = true;
-            result.error = "Query timed out after " +
-                std::to_string(runtime_settings().query_timeout_ms()) + " ms";
-        } else {
-            result.success = (rc == SQLITE_OK);
-            if (!result.success && result.error.empty()) {
-                result.error = sqlite3_errmsg(db_.handle());
+            row.values = xr.values;
+            result.rows.push_back(std::move(row));
+        }
+        result.elapsed_ms = static_cast<double>(raw.elapsed_ms);
+        result.timed_out = raw.timed_out;
+        result.success = raw.error.empty();
+        if (!result.success) {
+            if (result.timed_out) {
+                result.error = "Query timed out after " +
+                    std::to_string(options.timeout_ms) + " ms";
+            } else {
+                result.error = raw.error;
             }
         }
 
@@ -222,65 +208,20 @@ public:
     }
 
     /**
-     * Execute SQL with callback, enforcing query timeout via sqlite3_progress_handler.
-     */
-    int exec(const char* sql, sqlite3_callback callback, void* data) {
-        if (!db_.is_open()) {
-            error_ = "QueryEngine not initialized";
-            return SQLITE_ERROR;
-        }
-
-        // Set context
-        entities::set_context(context_.get());
-
-        // Install timeout progress handler
-        struct TimeoutState {
-            std::chrono::steady_clock::time_point deadline;
-            bool timed_out = false;
-        };
-
-        int timeout_ms = runtime_settings().query_timeout_ms();
-        TimeoutState timeout_state;
-        if (timeout_ms > 0) {
-            timeout_state.deadline = std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(timeout_ms);
-            sqlite3_progress_handler(db_.handle(), 1000,
-                [](void* ctx) -> int {
-                    auto* state = static_cast<TimeoutState*>(ctx);
-                    if (std::chrono::steady_clock::now() >= state->deadline) {
-                        state->timed_out = true;
-                        return 1;  // non-zero aborts
-                    }
-                    return 0;
-                }, &timeout_state);
-        }
-
-        char* err_msg = nullptr;
-        int rc = sqlite3_exec(db_.handle(), sql, callback, data, &err_msg);
-
-        // Clear progress handler
-        if (timeout_ms > 0) {
-            sqlite3_progress_handler(db_.handle(), 0, nullptr, nullptr);
-        }
-
-        if (err_msg) {
-            error_ = err_msg;
-            sqlite3_free(err_msg);
-        }
-
-        // Map interrupt caused by timeout to SQLITE_INTERRUPT
-        if (timeout_state.timed_out && rc != SQLITE_OK) {
-            return SQLITE_INTERRUPT;
-        }
-
-        return rc;
-    }
-
-    /**
      * Execute SQL, ignore results
      */
     bool execute(const char* sql) {
-        return exec(sql, nullptr, nullptr) == SQLITE_OK;
+        if (!db_.is_open()) {
+            error_ = "QueryEngine not initialized";
+            return false;
+        }
+        entities::set_context(context_.get());
+        xsql::Status rc = db_.exec(sql);
+        if (rc != xsql::Status::ok) {
+            error_ = db_.last_error();
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -300,7 +241,6 @@ public:
 
     const std::string& error() const { return error_; }
     bool is_valid() const { return db_.is_open(); }
-    sqlite3* handle() { return db_.handle(); }
     Ref<BinaryView> binaryView() { return bv_; }
 
 private:

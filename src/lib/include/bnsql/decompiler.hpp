@@ -1322,26 +1322,26 @@ inline CachedTableDef<HLILCall> define_hlil_calls() {
  * decompile(addr, limit) - Get pseudocode with line limit
  * decompile(addr, limit, refresh) - Get pseudocode; refresh=1 forces re-decompilation
  */
-static void sql_decompile(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_decompile(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "decompile requires at least 1 argument (address)", -1);
+        ctx.result_error("decompile requires at least 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
-    int limit = (argc >= 2) ? sqlite3_value_int(argv[1]) : 10000;
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
+    int limit = (argc >= 2) ? argv[1].as_int() : 10000;
     if (limit <= 0) limit = 10000;
-    bool refresh = (argc >= 3) ? (sqlite3_value_int(argv[2]) != 0) : false;
+    bool refresh = (argc >= 3) ? (argv[2].as_int() != 0) : false;
 
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
     if (funcs.empty()) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
@@ -1352,14 +1352,14 @@ static void sql_decompile(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
         // Re-fetch function list after re-analysis
         funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
         if (funcs.empty()) {
-            sqlite3_result_null(ctx);
+            ctx.result_null();
             return;
         }
     }
 
     auto hlil = funcs[0]->GetHighLevelIL();
     if (!hlil) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
@@ -1375,36 +1375,35 @@ static void sql_decompile(sqlite3_context* ctx, int argc, sqlite3_value** argv) 
         ++count;
     }
 
-    std::string str = result.str();
-    sqlite3_result_text(ctx, str.c_str(), -1, SQLITE_TRANSIENT);
+    ctx.result_text(result.str());
 }
 
 /**
  * hlil_at(addr) - Get HLIL text at specific address
  */
-static void sql_hlil_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_hlil_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "hlil_at requires 1 argument (address)", -1);
+        ctx.result_error("hlil_at requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
     if (funcs.empty()) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
     auto hlil = funcs[0]->GetHighLevelIL();
     if (!hlil) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
@@ -1422,38 +1421,38 @@ static void sql_hlil_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
     });
 
     if (!result.empty()) {
-        sqlite3_result_text(ctx, result.c_str(), -1, SQLITE_TRANSIENT);
+        ctx.result_text(result);
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
 /**
  * hlil_op_at(addr) - Get HLIL operation name at address
  */
-static void sql_hlil_op_at(sqlite3_context* ctx, int argc, sqlite3_value** argv) {
+static void sql_hlil_op_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
     if (argc < 1) {
-        sqlite3_result_error(ctx, "hlil_op_at requires 1 argument (address)", -1);
+        ctx.result_error("hlil_op_at requires 1 argument (address)");
         return;
     }
 
     auto bv = get_bv();
     if (!bv) {
-        sqlite3_result_error(ctx, "No BinaryView context", -1);
+        ctx.result_error("No BinaryView context");
         return;
     }
 
-    uint64_t ea = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
     auto funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
     if (funcs.empty()) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
     auto hlil = funcs[0]->GetHighLevelIL();
     if (!hlil) {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
         return;
     }
 
@@ -1468,26 +1467,23 @@ static void sql_hlil_op_at(sqlite3_context* ctx, int argc, sqlite3_value** argv)
     });
 
     if (result) {
-        sqlite3_result_text(ctx, result, -1, SQLITE_STATIC);
+        // hlil_op_name returns a static / long-lived C-string — use the
+        // static-lifetime libxsql result variant to avoid a copy.
+        ctx.result_text_static(result);
     } else {
-        sqlite3_result_null(ctx);
+        ctx.result_null();
     }
 }
 
 /**
- * Register decompiler SQL functions
+ * Register decompiler SQL functions via libxsql's public API.
  */
 inline bool register_decompiler_functions(xsql::Database& db) {
-    sqlite3_create_function(db.handle(), "decompile", 1, SQLITE_UTF8, nullptr,
-                           sql_decompile, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "decompile", 2, SQLITE_UTF8, nullptr,
-                           sql_decompile, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "decompile", 3, SQLITE_UTF8, nullptr,
-                           sql_decompile, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "hlil_at", 1, SQLITE_UTF8, nullptr,
-                           sql_hlil_at, nullptr, nullptr);
-    sqlite3_create_function(db.handle(), "hlil_op_at", 1, SQLITE_UTF8, nullptr,
-                           sql_hlil_op_at, nullptr, nullptr);
+    db.register_function("decompile",  1, xsql::ScalarFn(sql_decompile));
+    db.register_function("decompile",  2, xsql::ScalarFn(sql_decompile));
+    db.register_function("decompile",  3, xsql::ScalarFn(sql_decompile));
+    db.register_function("hlil_at",    1, xsql::ScalarFn(sql_hlil_at));
+    db.register_function("hlil_op_at", 1, xsql::ScalarFn(sql_hlil_op_at));
     return true;
 }
 

@@ -61,7 +61,7 @@
 using namespace BinaryNinja;
 namespace fs = std::filesystem;
 
-static const char* g_version = "0.0.9";
+static const char* g_version = "0.0.10";
 
 // ============================================================================
 // Utilities
@@ -450,14 +450,20 @@ static void run_interactive(bnsql::QueryEngine& qe) {
 static void print_usage(const char* prog) {
     std::cout << "bnsql v" << g_version << " - SQL interface for Binary Ninja" << std::endl << std::endl;
     std::cout << "Usage:" << std::endl;
-    std::cout << "  " << prog << " <database.bndb>                        Interactive mode" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> -c <query>             Execute query and exit" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> -f <file.sql>          Execute SQL file" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> --http [port]          Start HTTP REST server (default: 8080)" << std::endl;
-    std::cout << "  " << prog << " <database.bndb> --mcp [port]           Start MCP server (default: 9998)" << std::endl;
+    std::cout << "  " << prog << " <file>                                 Interactive mode" << std::endl;
+    std::cout << "  " << prog << " <file> -c <query>                      Execute query and exit" << std::endl;
+    std::cout << "  " << prog << " <file> -f <file.sql>                   Execute SQL file" << std::endl;
+    std::cout << "  " << prog << " <file> --http [port]                   Start HTTP REST server (default: 8080)" << std::endl;
+    std::cout << "  " << prog << " <file> --mcp [port]                    Start MCP server (default: 9998)" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  <file> is a Binary Ninja database (.bndb) OR a raw binary" << std::endl;
+    std::cout << "  (.exe/.dll/firmware/etc.). Raw binaries trigger fresh BN analysis;" << std::endl;
+    std::cout << "  the resulting .bndb is auto-saved next to the source on clean exit." << std::endl;
     std::cout << std::endl;
     std::cout << "Options:" << std::endl;
-    std::cout << "  -s, --source <path>    Binary Ninja database (.bndb)" << std::endl;
+    std::cout << "  -s, --source <path>    Binary Ninja database (.bndb) OR raw binary" << std::endl;
+    std::cout << "                         (.exe/.dll/firmware/etc.) — raw binaries trigger" << std::endl;
+    std::cout << "                         fresh BN analysis (auto-saved next to source)" << std::endl;
     std::cout << "  -c, --command <sql>    SQL query to execute" << std::endl;
     std::cout << "  -f, --file <path>      SQL file to execute" << std::endl;
     std::cout << "  -i, --interactive      Interactive SQL mode (default)" << std::endl;
@@ -468,6 +474,12 @@ static void print_usage(const char* prog) {
     std::cout << "  -q, --quiet            Suppress banner" << std::endl;
     std::cout << "  -h, --help             Show this help" << std::endl;
     std::cout << "  -v, --version          Show version" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Examples:" << std::endl;
+    std::cout << "  " << prog << " sample.bndb -c \"SELECT name, size FROM funcs LIMIT 10\"" << std::endl;
+    std::cout << "  " << prog << " sample.bndb --http 8080" << std::endl;
+    std::cout << "  " << prog << " sample.exe --http 8080       # raw PE: BN auto-analyzes, then serves SQL" << std::endl;
+    std::cout << "  " << prog << " firmware.bin -c \"SELECT COUNT(*) FROM funcs\"" << std::endl;
 }
 
 // ============================================================================

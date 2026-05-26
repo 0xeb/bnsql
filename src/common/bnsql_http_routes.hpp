@@ -22,6 +22,8 @@
 #include <xsql/thinclient/json_helpers.hpp>
 
 #include <atomic>
+#include <xsql/query_script.hpp>
+
 #include <chrono>
 #include <functional>
 #include <mutex>
@@ -94,7 +96,7 @@ SQL interface for Binary Ninja databases via HTTP.
 Endpoints:
   GET  /          - Welcome message
   GET  /help      - This documentation (for LLM discovery)
-  POST /query     - Execute SQL (body = raw SQL, response = JSON)
+  POST /query     - Execute SQL (body = raw SQL, single or semicolon-separated script, response = canonical envelope)
   GET  /status    - Server health, function count, and runtime settings
   GET  /settings  - Current runtime settings (JSON)
   POST /shutdown  - Stop server
@@ -162,10 +164,24 @@ Example Queries:
   SELECT decompile(address) FROM funcs WHERE name = 'main';
   PRAGMA bnsql.query_timeout_ms = 5000;
 
-Response Format:
-  Success: {"success": true, "columns": [...], "rows": [[...]], "row_count": N, "elapsed_ms": 12.3}
-  Error:   {"success": false, "error": "message"}
-  Timeout: {"success": false, "error": "...", "timed_out": true}
+Response Format (canonical script envelope, single = array of one):
+  {
+    "success": true,
+    "statement_count": N,
+    "results": [
+      {"statement_index": 0, "success": true,
+       "columns": [...], "rows": [[...]], "row_count": N,
+       "elapsed_ms": 12.3, "error": null},
+      ...
+    ],
+    "row_count_total": N,
+    "elapsed_ms_total": 12.3,
+    "first_error_index": null    // or index of earliest failed statement
+  }
+  Splitter failure (e.g. unterminated quote):
+    {"success": false, "statement_count": 0, "results": [],
+     "parse_error": "<message>", ...}
+  Options (query string): continue_on_error=1, include_sql=1
 
 Authentication (if enabled):
   Header: Authorization: Bearer <token>
@@ -294,11 +310,36 @@ inline void setup_http_routes(
             return;
         }
 
-        auto result = (*query_fn_ptr)(sql);
+        // Multi-statement: split via xsql::run_script and dispatch each
+        // statement through the supplied single-statement executor. Single
+        // statement is just array-of-one in the canonical envelope.
+        xsql::ScriptOptions opts;
+        auto cont_it = req.params.find("continue_on_error");
+        if (cont_it != req.params.end() && cont_it->second == "1") {
+            opts.continue_on_error = true;
+        }
+        auto incl_it = req.params.find("include_sql");
+        if (incl_it != req.params.end() && incl_it->second == "1") {
+            opts.include_sql = true;
+        }
+
+        auto script = xsql::run_script(sql, opts,
+            [&](const std::string& stmt, xsql::ScriptStatementResult& out) {
+                auto r = (*query_fn_ptr)(stmt);
+                out.columns = r.columns;
+                out.rows.reserve(r.rows.size());
+                for (const auto& row : r.rows) {
+                    out.rows.push_back(row.values);
+                }
+                out.elapsed_ms = r.elapsed_ms;
+                out.success = r.success;
+                out.error = r.error;
+            });
         query_mutex->unlock();
         queue_count->fetch_sub(1);
 
-        res.set_content(query_result_to_json(result), "application/json");
+        res.set_content(xsql::script_result_to_json(script, opts.include_sql),
+                        "application/json");
     });
 
     // GET /status - Health check with runtime settings

@@ -622,21 +622,21 @@ inline CachedTableDef<PatchInfo> define_patches() {
         })
         // INSERT: apply new patch at address
         // INSERT INTO patches (address, patched_byte) VALUES (0x1234, 0x90)
-        .insertable([](int argc, sqlite3_value** argv) -> bool {
+        .insertable([](int argc, xsql::FunctionArg* argv) -> bool {
             auto bv = get_bv();
             if (!bv) return false;
             // Column order: address, original_byte, patched_byte, status
-            if (argc < 1 || sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+            if (argc < 1 || argv[0].is_null()) {
                 xsql::set_vtab_error("patches insert requires address");
                 return false;
             }
-            uint64_t address = static_cast<uint64_t>(sqlite3_value_int64(argv[0]));
+            uint64_t address = static_cast<uint64_t>(argv[0].as_int64());
             // patched_byte is column 2 (index 2)
-            if (argc < 3 || sqlite3_value_type(argv[2]) == SQLITE_NULL) {
+            if (argc < 3 || argv[2].is_null()) {
                 xsql::set_vtab_error("patches insert requires patched_byte");
                 return false;
             }
-            int byte_val = sqlite3_value_int(argv[2]);
+            int byte_val = argv[2].as_int();
             if (byte_val < 0 || byte_val > 255) {
                 xsql::set_vtab_error("patched_byte must be 0-255");
                 return false;
