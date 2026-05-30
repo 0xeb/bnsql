@@ -328,9 +328,9 @@ cmake --build build --config Release
 
 BNSQL skills give your coding agent full control over Binary Ninja databases through natural language. The skills are packaged at [0xeb/bnsql-skills](https://github.com/0xeb/bnsql-skills).
 
-- **Claude Code** — full plugin with 9 topic-focused skills. Install via `/install-plugin` (see below).
-- **GitHub Copilot CLI** — also supports BNSQL skills. Install the same plugin.
-- **Codex (OpenAI)** — supports skills. See the [bnsql-skills](https://github.com/0xeb/bnsql-skills) README for the Codex install steps.
+- **Claude Code** — full plugin with 9 topic-focused skills, installed from the [`0xeb/bnsql-skills`](https://github.com/0xeb/bnsql-skills) marketplace.
+- **GitHub Copilot CLI** — also supports BNSQL skills via the same plugin.
+- **Codex (OpenAI)** — supports skills via the same plugin packaging. See the [bnsql-skills](https://github.com/0xeb/bnsql-skills) README for the Codex install steps.
 
 ### Prerequisites
 
@@ -338,11 +338,15 @@ BNSQL skills give your coding agent full control over Binary Ninja databases thr
 2. **bnsql.exe** in your PATH (from [Releases](https://github.com/0xeb/bnsql/releases) or built locally)
 3. Verify setup: `bnsql --version` should work from command line
 
-### Install
+### Install (Claude Code)
 
-```bash
-claude /install-plugin https://github.com/0xeb/bnsql-skills
+Inside Claude Code, run:
+
+```text
+/plugin marketplace add 0xeb/bnsql-skills
 ```
+
+then install the `bnsql` plugin from that marketplace. See the [bnsql-skills README](https://github.com/0xeb/bnsql-skills#installation) for Codex and other install paths.
 
 ### Skills
 
