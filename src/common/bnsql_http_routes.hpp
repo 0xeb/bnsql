@@ -188,9 +188,9 @@ Authentication (if enabled):
   Or:     X-XSQL-Token: <token>
 
 Example:
-  curl http://localhost:8081/help
-  curl -X POST http://localhost:8081/query -d "SELECT name FROM funcs LIMIT 5"
-  curl http://localhost:8081/settings
+  curl http://localhost:8080/help
+  curl -X POST http://localhost:8080/query -d "SELECT name FROM funcs LIMIT 5"
+  curl http://localhost:8080/settings
 )";
 }
 

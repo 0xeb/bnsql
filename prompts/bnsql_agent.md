@@ -773,9 +773,42 @@ SELECT func_addr, callee_addr FROM callees;
 |----------|-------------|
 | `disasm(addr)` | Disassembly line at address |
 | `disasm(addr, n)` | Multiple lines from address |
-| `bytes(addr, n)` | Bytes as hex string |
-| `bytes_raw(addr, n)` | Raw bytes as BLOB |
 | `mnemonic(addr)` | Instruction mnemonic only |
+
+### Byte Reads via the `bytes` Table
+
+Bulk byte reads use the `bytes` virtual table with hidden `start_address`
++ `n` input columns composed with `blob_concat`:
+
+```sql
+-- N bytes as uppercase hex
+SELECT hex(blob_concat(value)) FROM bytes
+  WHERE start_address = X AND n = N ORDER BY address;
+
+-- N bytes as BLOB
+SELECT blob_concat(value) FROM bytes
+  WHERE start_address = X AND n = N ORDER BY address;
+
+-- two-sided range
+SELECT value FROM bytes
+  WHERE address >= A AND address < B ORDER BY address;
+```
+
+The hidden `start_address` + `n` columns do NOT appear in `SELECT *`.
+Keeping `start_address` distinct from the visible `address` keeps any
+user predicate on `address` enforceable by SQLite (joins stay correct).
+Always pair the read with one of `WHERE start_address = X AND n = N`,
+`AND address < B`, or an outer `LIMIT` to bound the output.
+
+### Byte Patches via the `patches` Table
+
+Byte patching is exposed by the `patches` table (writable
+`patched_byte`, `DELETE` reverts, `INSERT` applies).
+
+### Aggregates (libxsql built-in)
+| Function | Description |
+|----------|-------------|
+| `blob_concat(value)` | Aggregate — concatenate BLOB inputs or INTEGER 0-255 values into one BLOB. NULL inputs skipped; TEXT and out-of-range INTs error. Use over a row-shaped byte source, e.g. `SELECT hex(blob_concat(x)) FROM (SELECT ... ORDER BY ...)`. |
 
 ### Binary Search
 | Function | Description |
@@ -1219,14 +1252,12 @@ When running in interactive mode (`bnsql database.bndb -i`), these dot-commands 
 | `.tables` | List all virtual tables |
 | `.schema [table]` | Show table schema |
 | `.info` | Show database metadata |
+| `.clear` / `.reset` | Clear/reset session |
 | `.quit` / `.exit` | Exit REPL |
 | `.help` | Show available commands |
 | `.http start` | Start HTTP server on random port |
 | `.http stop` | Stop HTTP server |
-| `.http status` | Show HTTP server status |
-| `.mcp start [port]` | Start MCP server on the given (or random) port |
-| `.mcp stop` | Stop MCP server |
-| `.mcp status` | Show MCP server status |
+| `.http` | Show HTTP server status (start if not running) |
 
 ---
 
@@ -1242,14 +1273,14 @@ Standard REST API that works with curl, any HTTP client, or LLM tools.
 
 **Starting the server:**
 ```bash
-# Default port 8081
+# Default port 8080
 bnsql database.bndb --http
 
 # Custom port and bind address
 bnsql database.bndb --http 9000 --bind 0.0.0.0
 
 # With authentication
-bnsql database.bndb --http 8081 --token mysecret
+bnsql database.bndb --http 8080 --token mysecret
 ```
 
 **HTTP Endpoints:**
@@ -1267,18 +1298,18 @@ bnsql database.bndb --http 8081 --token mysecret
 **Example with curl:**
 ```bash
 # Get API documentation
-curl http://localhost:8081/help
+curl http://localhost:8080/help
 
 # Execute SQL query
-curl -X POST http://localhost:8081/query -d "SELECT name, size FROM funcs LIMIT 5"
+curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs LIMIT 5"
 
 # With authentication
-curl -X POST http://localhost:8081/query \
+curl -X POST http://localhost:8080/query \
      -H "Authorization: Bearer mysecret" \
      -d "SELECT * FROM funcs"
 
 # Check status
-curl http://localhost:8081/status
+curl http://localhost:8080/status
 ```
 
 **Response Format (JSON):**

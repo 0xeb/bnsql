@@ -1,9 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(bnsql LANGUAGES C CXX)
+project(bnsql VERSION 0.0.11 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Windows VERSIONINFO wiring (version is from project() above)
+set(TOOL_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+set(TOOL_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+set(TOOL_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/versioninfo.cmake)
 
 # Output directories
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
@@ -140,6 +146,12 @@ if(BNSQL_BUILD_PLUGIN)
         PREFIX ""
     )
 
+    # Windows VS_VERSION_INFO resource
+    xsql_add_versioninfo(bnsql_plugin
+        FILETYPE          VFT_DLL
+        DESCRIPTION       "bnsql plugin for Binary Ninja"
+        ORIGINAL_FILENAME "bnsql.dll")
+
     # Platform-specific plugin extension
     if(WIN32)
         set_target_properties(bnsql_plugin PROPERTIES SUFFIX ".dll")
@@ -208,6 +220,12 @@ if(BNSQL_BUILD_CLI)
     set_target_properties(bnsql-cli PROPERTIES
         OUTPUT_NAME "bnsql"
     )
+
+    # Windows VS_VERSION_INFO resource
+    xsql_add_versioninfo(bnsql-cli
+        FILETYPE          VFT_APP
+        DESCRIPTION       "bnsql command-line interface for Binary Ninja databases"
+        ORIGINAL_FILENAME "bnsql.exe")
 
     # Delay-load Binary Ninja DLLs on Windows
     # Allows CLI to check for DLL presence before loading

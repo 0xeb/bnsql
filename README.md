@@ -377,6 +377,26 @@ then install the `bnsql` plugin from that marketplace. See the [bnsql-skills REA
 /plugin update bnsql
 ```
 
+## The xsql family
+
+BNSQL is part of a family of tools that expose different binary-analysis and
+debug-information platforms through the **same** SQL surface, all built on the
+shared [libxsql](https://github.com/0xeb/libxsql) virtual-table framework. A
+query you learn against one tool largely carries over to the others.
+
+**Reverse-engineering platforms**
+- **[idasql](https://github.com/allthingsida/idasql)** — IDA Pro databases as SQL.
+- **[ghidrasql](https://github.com/0xeb/ghidrasql)** — Ghidra databases as SQL.
+
+**Debug info & compiler data**
+- **[pdbsql](https://github.com/0xeb/pdbsql)** — Windows PDB symbol files as SQL.
+- **[dwarfsql](https://github.com/0xeb/dwarfsql)** — DWARF debug information as SQL.
+- **[clangsql](https://github.com/0xeb/clangsql)** — Clang AST as SQL.
+
+**Core**
+- **[libxsql](https://github.com/0xeb/libxsql)** — the C++ SQLite virtual-table
+  framework every tool above is built on.
+
 ## Author
 
 Elias Bachaalany ([@0xeb](https://github.com/0xeb))

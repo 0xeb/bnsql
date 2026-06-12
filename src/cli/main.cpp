@@ -61,7 +61,7 @@
 using namespace BinaryNinja;
 namespace fs = std::filesystem;
 
-static const char* g_version = "0.0.10";
+static const char* g_version = "0.0.11";
 
 // ============================================================================
 // Utilities

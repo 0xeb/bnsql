@@ -28,6 +28,7 @@
 #pragma once
 
 #include <bnsql/vtable.hpp>
+#include <bnsql/bytes_table.hpp>
 #include <bnsql/persistence.hpp>
 #include <xsql/database.hpp>
 #include <algorithm>
@@ -1574,6 +1575,8 @@ struct TableRegistry {
     CachedTableDef<InsnInfo> instructions;
     CachedTableDef<OperandInfo> instruction_operands;
 
+    GeneratorTableDef<ByteRow> bytes;
+
     TableRegistry()
         : funcs(define_funcs())
         , segments(define_segments())
@@ -1588,6 +1591,7 @@ struct TableRegistry {
         , imports(define_imports())
         , instructions(define_instructions())
         , instruction_operands(define_instruction_operands())
+        , bytes(define_bytes_table())
     {}
 
     void register_all(xsql::Database& db) {
@@ -1607,6 +1611,10 @@ struct TableRegistry {
         register_cached_table(db, "imports", &imports);
         register_cached_table(db, "instructions", &instructions);
         register_cached_table(db, "instruction_operands", &instruction_operands);
+
+        // Generator tables
+        db.register_generator_table("bn_bytes", &bytes);
+        db.create_table("bytes", "bn_bytes");
 
         // Create convenience views for common queries
         create_helper_views(db);

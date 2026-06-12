@@ -204,60 +204,6 @@ static void sql_disasm(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* 
 }
 
 // ============================================================================
-// Bytes Functions
-// ============================================================================
-
-static void sql_bytes_hex(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
-    if (argc < 2) {
-        ctx.result_error("bytes requires 2 arguments (address, count)");
-        return;
-    }
-
-    auto bv = get_bv();
-    if (!bv) {
-        ctx.result_error("No BinaryView context");
-        return;
-    }
-
-    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
-    size_t count = static_cast<size_t>(argv[1].as_int());
-    if (count > 4096) count = 4096;
-
-    DataBuffer buf = bv->ReadBuffer(ea, count);
-
-    std::ostringstream result;
-    result << std::hex << std::setfill('0');
-    const uint8_t* data = static_cast<const uint8_t*>(buf.GetData());
-    for (size_t i = 0; i < buf.GetLength(); i++) {
-        if (i > 0) result << " ";
-        result << std::setw(2) << static_cast<int>(data[i]);
-    }
-
-    std::string str = result.str();
-    ctx.result_text(str);
-}
-
-static void sql_bytes_raw(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
-    if (argc < 2) {
-        ctx.result_error("bytes_raw requires 2 arguments (address, count)");
-        return;
-    }
-
-    auto bv = get_bv();
-    if (!bv) {
-        ctx.result_error("No BinaryView context");
-        return;
-    }
-
-    uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
-    size_t count = static_cast<size_t>(argv[1].as_int());
-    if (count > 4096) count = 4096;
-
-    DataBuffer buf = bv->ReadBuffer(ea, count);
-    ctx.result_blob(buf.GetData(), static_cast<size_t>(buf.GetLength()));
-}
-
-// ============================================================================
 // Name Functions
 // ============================================================================
 
@@ -1061,9 +1007,11 @@ inline bool register_sql_functions(xsql::Database& db) {
     db.register_function("disasm", 1, xsql::ScalarFn(sql_disasm));
     db.register_function("disasm", 2, xsql::ScalarFn(sql_disasm));
 
-    // Bytes
-    db.register_function("bytes", 2, xsql::ScalarFn(sql_bytes_hex));
-    db.register_function("bytes_raw", 2, xsql::ScalarFn(sql_bytes_raw));
+    // Bytes — bulk reads go through the `bytes` virtual table with hidden
+    // `start_address` + `n` input columns: SELECT hex(blob_concat(value))
+    // FROM bytes WHERE start_address = X AND n = N ORDER BY address; (or
+    // blob_concat(value) for BLOB). Byte patching uses the existing
+    // `patches` table.
 
     // Names
     db.register_function("name_at", 1, xsql::ScalarFn(sql_name_at));
