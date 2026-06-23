@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.jpg" alt="BNSQL logo" width="360">
+</p>
+
 # BNSQL
 
 > **Status:** Pre-release Alpha | **Platform:** Windows only (for now)
