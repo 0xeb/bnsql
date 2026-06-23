@@ -256,6 +256,31 @@ cmake -B build -DBUILD_WITH_BNSQL=ON \
 cmake --build build --config Release
 ```
 
+### Matching the Binary Ninja API to your install
+
+The `external/binaryninja-api` submodule must match the version of Binary Ninja
+you link against — the API headers and the installed `binaryninjacore` share an
+ABI that changes between releases. The submodule is pinned to one revision, so if
+your installed Binary Ninja is a different build, the configure step will warn:
+
+```
+bnsql: Binary Ninja API submodule (<have>) does not match your installed Binary Ninja (<want>).
+```
+
+Each install records the exact API commit it was built from in
+`<BN_INSTALL_DIR>/api_REVISION.txt`. To sync automatically, configure with:
+
+```bash
+cmake -B build -DBN_INSTALL_DIR=/path/to/binaryninja -DBNSQL_SYNC_BN_API=ON
+```
+
+or do it by hand using the commit from the warning:
+
+```bash
+git -C external/binaryninja-api fetch origin <want>
+git -C external/binaryninja-api checkout <want>
+```
+
 
 ## Performance Tips
 

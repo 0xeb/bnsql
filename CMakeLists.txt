@@ -30,6 +30,60 @@ if(NOT EXISTS "${BN_API_PATH}/CMakeLists.txt")
         "Initialize submodule: git submodule update --init --recursive")
 endif()
 
+# Keep the API checkout in sync with the INSTALLED Binary Ninja (issue #10).
+# The API headers/static lib must be ABI-compatible with the libbinaryninjacore
+# we link against, which in practice means the API submodule must match your
+# installed Binary Ninja build. Every install records the exact API commit it
+# was built from in "<BN_INSTALL_DIR>/api_REVISION.txt" -- read it and compare.
+# On mismatch we warn with the precise checkout command; pass
+# -DBNSQL_SYNC_BN_API=ON to have CMake check it out for you.
+option(BNSQL_SYNC_BN_API "Auto-checkout the BN API submodule to match the installed Binary Ninja" OFF)
+
+if(BN_INSTALL_DIR AND EXISTS "${BN_INSTALL_DIR}/api_REVISION.txt" AND EXISTS "${BN_API_PATH}/.git")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
+        # api_REVISION.txt holds the full commit hash on its own line.
+        set(_bn_want_rev "")
+        file(STRINGS "${BN_INSTALL_DIR}/api_REVISION.txt" _bn_rev_lines)
+        foreach(_line IN LISTS _bn_rev_lines)
+            string(STRIP "${_line}" _line)
+            if(_line MATCHES "^[0-9a-fA-F]+$")
+                string(TOLOWER "${_line}" _bn_want_rev)
+            endif()
+        endforeach()
+
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} -C "${BN_API_PATH}" rev-parse HEAD
+            OUTPUT_VARIABLE _bn_have_rev OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _bn_rev_rc ERROR_QUIET)
+        string(TOLOWER "${_bn_have_rev}" _bn_have_rev)
+
+        if(_bn_want_rev AND _bn_rev_rc EQUAL 0 AND NOT _bn_have_rev STREQUAL _bn_want_rev)
+            if(BNSQL_SYNC_BN_API)
+                message(STATUS "bnsql: syncing BN API submodule to installed revision ${_bn_want_rev}")
+                execute_process(COMMAND ${GIT_EXECUTABLE} -C "${BN_API_PATH}" fetch --quiet origin "${_bn_want_rev}" ERROR_QUIET)
+                execute_process(
+                    COMMAND ${GIT_EXECUTABLE} -C "${BN_API_PATH}" checkout --quiet "${_bn_want_rev}"
+                    RESULT_VARIABLE _bn_co_rc ERROR_VARIABLE _bn_co_err)
+                if(NOT _bn_co_rc EQUAL 0)
+                    message(FATAL_ERROR "bnsql: failed to checkout BN API ${_bn_want_rev}:\n${_bn_co_err}")
+                endif()
+            else()
+                message(WARNING
+                    "bnsql: Binary Ninja API submodule (${_bn_have_rev})\n"
+                    "       does not match your installed Binary Ninja (${_bn_want_rev}).\n"
+                    "       The API must match the installed core or the build/link will fail.\n"
+                    "       Fix it with:\n"
+                    "         git -C \"${BN_API_PATH}\" fetch origin ${_bn_want_rev}\n"
+                    "         git -C \"${BN_API_PATH}\" checkout ${_bn_want_rev}\n"
+                    "       or re-run cmake with -DBNSQL_SYNC_BN_API=ON to do it automatically.")
+            endif()
+        elseif(_bn_want_rev AND _bn_rev_rc EQUAL 0)
+            message(STATUS "bnsql: BN API submodule matches installed Binary Ninja (${_bn_want_rev})")
+        endif()
+    endif()
+endif()
+
 # Add Binary Ninja API
 if(NOT DEFINED HEADLESS)
     set(HEADLESS ON CACHE BOOL "Build Binary Ninja API in headless mode" FORCE)
