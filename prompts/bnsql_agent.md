@@ -1312,14 +1312,21 @@ curl -X POST http://localhost:8080/query \
 curl http://localhost:8080/status
 ```
 
-**Response Format (JSON):**
+**Response Format (JSON envelope):**
 ```json
-{"success": true, "columns": ["name", "size"], "rows": [["main", "500"]], "row_count": 1}
+{"success": true, "statement_count": 1,
+ "results": [{"statement_index": 0, "success": true,
+   "columns": ["name", "size"], "rows": [["_main", "2851"]],
+   "row_count": 1, "elapsed_ms": 8, "error": null}],
+ "row_count_total": 1, "elapsed_ms_total": 8, "first_error_index": null}
 ```
+On failure a result's `"success"` is `false` and `"error"` carries the message (a
+splitter failure instead yields a top-level `"parse_error"`).
 
-```json
-{"success": false, "error": "no such table: bad_table"}
-```
+**Consume this JSON directly — do not pipe it through `python`/`jq` to pre-render a
+table.** Parse the envelope and render results in your reply (see *Output Guidelines →
+Deciding what to show*). Reformatting for display discards the `success`/`elapsed_ms`/
+`error` fields and makes you reason over a lossy view.
 
 ---
 
@@ -1397,9 +1404,19 @@ Only use `_hlil_ast` and its views for specialized AST analysis tasks.
 
 ## Output Guidelines
 
-### ALWAYS Show Actual Data
+### Deciding what to show
 
-When the user asks to see something (decompilation, code, data), **ALWAYS include the actual output** in your response - don't just describe it!
+Showing data serves the user's intent — it is not automatic. Keep three concerns separate:
+
+**Selection — *whether* and *how much* to show.** A judgment driven by what was asked:
+- They asked to *see* something (decompile, show the strings) → show it.
+- They asked a *question* the data answers (biggest function? does it call malloc?) →
+  answer directly ("biggest is `_main`, 2851 bytes"), surfacing supporting rows only
+  when they help the user verify. Don't dump full tables unprompted.
+- You queried only to decide your next step → don't show it; it's internal.
+
+**Fidelity — when you *do* present code or data, show the real artifact, not a paraphrase.**
+Never describe what code does in place of showing it:
 
 **BAD (don't do this):**
 > "The function appears to call malloc and contains a loop..."
@@ -1414,6 +1431,14 @@ int64_t sub_401000() {
     return 0;
 }
 ```
+
+**Mechanics — consume the JSON; don't reformat it for display.** In HTTP mode `/query`
+returns a JSON envelope (`{success, results:[{columns,rows,…}]}`). Parse it yourself and
+render the result in your reply (a markdown table, or just the answer). Do **not** pipe
+responses through `python`/`jq`/`awk` to pre-render a table — that discards the envelope's
+`success`/`elapsed_ms`/`error` fields and makes you reason over a lossy view. Reserve
+`jq`/`python` for extracting a value to feed a later query, never for display. The CLI
+(`-c`/`-f`) already prints an ASCII table, so show that directly.
 
 ### Decompilation Requests
 
