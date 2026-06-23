@@ -181,7 +181,9 @@ Response Format (canonical script envelope, single = array of one):
   Splitter failure (e.g. unterminated quote):
     {"success": false, "statement_count": 0, "results": [],
      "parse_error": "<message>", ...}
-  Options (query string): continue_on_error=1, include_sql=1
+  Options (query string): continue_on_error=1, include_sql=1,
+                          format=json|text|csv|tsv (default json; text/csv/tsv
+                          are for terminal/pipe use, agents should consume json)
 
 Authentication (if enabled):
   Header: Authorization: Bearer <token>
@@ -322,6 +324,13 @@ inline void setup_http_routes(
         if (incl_it != req.params.end() && incl_it->second == "1") {
             opts.include_sql = true;
         }
+        // Optional output format (default json). text/csv/tsv are for direct
+        // terminal/curl use; json stays the canonical machine format.
+        std::string format = "json";
+        auto fmt_it = req.params.find("format");
+        if (fmt_it != req.params.end() && !fmt_it->second.empty()) {
+            format = fmt_it->second;
+        }
 
         auto script = xsql::run_script(sql, opts,
             [&](const std::string& stmt, xsql::ScriptStatementResult& out) {
@@ -338,8 +347,17 @@ inline void setup_http_routes(
         query_mutex->unlock();
         queue_count->fetch_sub(1);
 
-        res.set_content(xsql::script_result_to_json(script, opts.include_sql),
-                        "application/json");
+        if (format == "text") {
+            res.set_content(xsql::script_result_to_text(script), "text/plain");
+        } else if (format == "csv") {
+            res.set_content(xsql::script_result_to_csv(script), "text/csv");
+        } else if (format == "tsv") {
+            res.set_content(xsql::script_result_to_tsv(script),
+                            "text/tab-separated-values");
+        } else {
+            res.set_content(xsql::script_result_to_json(script, opts.include_sql),
+                            "application/json");
+        }
     });
 
     // GET /status - Health check with runtime settings
