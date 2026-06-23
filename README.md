@@ -258,10 +258,13 @@ cmake --build build --config Release
 
 ### Matching the Binary Ninja API to your install
 
-The `external/binaryninja-api` submodule must match the version of Binary Ninja
-you link against — the API headers and the installed `binaryninjacore` share an
-ABI that changes between releases. The submodule is pinned to one revision, so if
-your installed Binary Ninja is a different build, the configure step will warn:
+The `external/binaryninja-api` submodule should be compatible with the version of
+Binary Ninja you link against — the API and the installed `binaryninjacore` share
+a core ABI (`BN_CURRENT_CORE_ABI_VERSION`) that only changes on breaking releases.
+The submodule is pinned to one revision, so if your installed Binary Ninja is a
+different build, the configure step warns. The check compares the commit (the only
+signal the install exposes statically, in `api_REVISION.txt`), so a same-series
+difference may still build fine — the warning is advisory:
 
 ```
 bnsql: Binary Ninja API submodule (<have>) does not match your installed Binary Ninja (<want>).

@@ -71,9 +71,11 @@ if(BN_INSTALL_DIR AND EXISTS "${BN_INSTALL_DIR}/api_REVISION.txt" AND EXISTS "${
             else()
                 message(WARNING
                     "bnsql: Binary Ninja API submodule (${_bn_have_rev})\n"
-                    "       does not match your installed Binary Ninja (${_bn_want_rev}).\n"
-                    "       The API must match the installed core or the build/link will fail.\n"
-                    "       Fix it with:\n"
+                    "       differs from your installed Binary Ninja (${_bn_want_rev}).\n"
+                    "       Compatibility is ultimately gated by the core ABI version, not the\n"
+                    "       commit, so a same-series difference may still build and run fine.\n"
+                    "       But if the build fails to link, or the tool fails to load the core,\n"
+                    "       sync the API to the installed revision:\n"
                     "         git -C \"${BN_API_PATH}\" fetch origin ${_bn_want_rev}\n"
                     "         git -C \"${BN_API_PATH}\" checkout ${_bn_want_rev}\n"
                     "       or re-run cmake with -DBNSQL_SYNC_BN_API=ON to do it automatically.")
