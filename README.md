@@ -208,12 +208,29 @@ curl -X POST http://localhost:8080/query \
 
 # Check status
 curl http://localhost:8080/status
+
+# Plain-text / CSV / TSV output for terminals and unix pipes
+curl -X POST "http://localhost:8080/query?format=text" -d "SELECT name, size FROM funcs LIMIT 5"
+curl -X POST "http://localhost:8080/query?format=csv"  -d "SELECT name, size FROM funcs LIMIT 5"
 ```
 
-**Response Format:**
+**Response Format:** JSON by default — a script envelope (single statement = array of one):
 ```json
-{"success": true, "columns": ["name", "size"], "rows": [["main", "500"]], "row_count": 1}
+{"success": true, "statement_count": 1,
+ "results": [{"statement_index": 0, "success": true,
+   "columns": ["name", "size"], "rows": [["_main", "2851"]],
+   "row_count": 1, "elapsed_ms": 8, "error": null}],
+ "row_count_total": 1, "elapsed_ms_total": 8, "first_error_index": null}
 ```
+
+**Output formats** (query-string `format=`, default `json`):
+
+| `format` | Content-Type | Use |
+|----------|--------------|-----|
+| `json` (default) | `application/json` | Programmatic use — **agents should consume this**, not a reformatted view |
+| `text` | `text/plain` | Ready-to-read ASCII table for terminals |
+| `csv` | `text/csv` | Spreadsheets / RFC-4180 CSV |
+| `tsv` | `text/tab-separated-values` | Unix pipes (`cut`/`awk`/`sort`) |
 
 ### MCP Server (Model Context Protocol)
 
