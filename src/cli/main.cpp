@@ -40,6 +40,7 @@
 
 #ifdef BNSQL_HAS_HTTP
 #include <xsql/thinclient/server.hpp>
+#include <xsql/thinclient/http_query_server.hpp>
 #include "bnsql_http_routes.hpp"
 #endif
 
@@ -148,7 +149,7 @@ static void quit_signal_handler(int) {
 // ============================================================================
 
 #ifdef BNSQL_HAS_HTTP
-static xsql::thinclient::server* g_http_server = nullptr;
+static xsql::thinclient::http_query_server* g_http_server = nullptr;
 static std::unique_ptr<xsql::thinclient::server> g_repl_http_server;
 
 static void http_signal_handler(int) {
@@ -212,54 +213,97 @@ static void setup_http_callbacks(bnsql::CommandCallbacks& callbacks, bnsql::Quer
 }
 
 static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bind_addr, const std::string& auth_token) {
-    xsql::thinclient::server_config cfg;
+    if (!bind_addr.empty() && bind_addr != "127.0.0.1" && bind_addr != "localhost"
+        && auth_token.empty()) {
+        std::cerr << "WARNING: Binding to non-loopback address " << bind_addr << "\n";
+        std::cerr << "WARNING: No authentication token set. Server is accessible without authentication.\n";
+        std::cerr << "         Consider using --token <secret> for remote access.\n";
+    }
+
+    xsql::thinclient::http_query_server_config cfg;
+    cfg.tool_name = "bnsql";
+    cfg.help_text = bnsql::http_help_text();
     cfg.port = port;
     cfg.bind_address = bind_addr.empty() ? "127.0.0.1" : bind_addr;
-    if (!auth_token.empty()) {
-        cfg.auth_token = auth_token;
-    }
-    if (!bind_addr.empty() && bind_addr != "127.0.0.1" && bind_addr != "localhost") {
-        cfg.allow_insecure_no_auth = auth_token.empty();
-        std::cerr << "WARNING: Binding to non-loopback address " << bind_addr << "\n";
-        if (auth_token.empty()) {
-            std::cerr << "WARNING: No authentication token set. Server is accessible without authentication.\n";
-            std::cerr << "         Consider using --token <secret> for remote access.\n";
-        }
-    }
-
-    cfg.setup_routes = [&qe, &auth_token, port](httplib::Server& svr) {
-        bnsql::setup_http_routes(svr,
-            [&qe](const std::string& sql) { return qe.query(sql); },
-            auth_token, port);
+    if (!auth_token.empty()) cfg.auth_token = auth_token;
+    // BN's QueryEngine is not concurrency-safe; serialize on the main thread
+    // via the thinclient queue (also provides admission timeout + max_queue).
+    cfg.use_queue = true;
+    cfg.queue_admission_timeout_ms_fn = []() {
+        return bnsql::runtime_settings().queue_admission_timeout_ms();
+    };
+    cfg.max_queue_fn = []() { return bnsql::runtime_settings().max_queue(); };
+    cfg.statement_executor = [&qe](const std::string& stmt, xsql::ScriptStatementResult& out) {
+        auto r = qe.query(stmt);
+        out.columns = r.columns;
+        out.rows.reserve(r.rows.size());
+        for (const auto& row : r.rows) out.rows.push_back(row.values);
+        out.elapsed_ms = r.elapsed_ms;
+        out.success = r.success;
+        out.error = r.error;
     };
 
-    xsql::thinclient::server http_server(cfg);
-    g_http_server = &http_server;
+    // Function count is static after load; query once (main thread) and report
+    // the cached value from status_fn (which runs off the main thread).
+    std::string func_count;
+    {
+        auto r = qe.query("SELECT COUNT(*) FROM funcs");
+        if (r.success && !r.empty()) func_count = r.rows[0][0];
+    }
+    cfg.status_fn = [func_count]() -> xsql::json {
+        xsql::json j;
+        j["tool"] = "bnsql";
+        j["functions"] = func_count.empty() ? xsql::json(nullptr)
+                                            : xsql::json(std::stoll(func_count));
+        j["settings"] = xsql::json::parse(
+            bnsql::settings_to_json(bnsql::runtime_settings().snapshot()));
+        return j;
+    };
+    // Preserve bnsql's auth-gated GET /settings (thinclient extra routes are raw).
+    cfg.extra_routes = [auth_token](httplib::Server& svr) {
+        svr.Get("/settings", [auth_token](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_token.empty()) {
+                std::string tok;
+                if (req.has_header("X-XSQL-Token")) tok = req.get_header_value("X-XSQL-Token");
+                else if (req.has_header("Authorization")) {
+                    auto a = req.get_header_value("Authorization");
+                    if (a.rfind("Bearer ", 0) == 0) tok = a.substr(7);
+                }
+                if (tok != auth_token) {
+                    res.status = 401;
+                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
+                    return;
+                }
+            }
+            res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
+                            "application/json");
+        });
+    };
+
+    auto server = std::make_unique<xsql::thinclient::http_query_server>(cfg);
+    g_http_server = server.get();
 
     auto old_handler = std::signal(SIGINT, http_signal_handler);
 #ifdef _WIN32
     std::signal(SIGBREAK, http_signal_handler);
 #endif
 
-    http_server.run_async();
-    int actual_port = http_server.port();
+    int actual_port = server->start();
+    if (actual_port < 0) {
+        std::cerr << "Error: Failed to start HTTP server\n";
+        g_http_server = nullptr;
+        return 1;
+    }
 
     std::cout << "HTTP server listening on http://" << cfg.bind_address << ":" << actual_port << "\n";
-    std::cout << "Endpoints:\n";
-    std::cout << "  GET  /help     - API documentation\n";
-    std::cout << "  POST /query    - Execute SQL (body = raw SQL)\n";
-    std::cout << "  GET  /status   - Health check\n";
-    std::cout << "  POST /shutdown - Stop server\n";
-    std::cout << "\nExamples:\n";
-    std::cout << "  curl http://localhost:" << actual_port << "/help\n";
+    std::cout << "Endpoints: /help /query /status /settings /shutdown\n";
     std::cout << "  curl -X POST http://localhost:" << actual_port << "/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
     std::cout << "\nPress Ctrl+C to stop.\n\n";
     std::cout.flush();
 
-    // Block until server stops (via signal or /shutdown)
-    while (http_server.is_running()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    // Process the query queue on this (main) thread until stopped.
+    server->run_until_stopped();
+    server->stop();
 
     std::signal(SIGINT, old_handler);
     g_http_server = nullptr;
