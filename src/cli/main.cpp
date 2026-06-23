@@ -150,7 +150,7 @@ static void quit_signal_handler(int) {
 
 #ifdef BNSQL_HAS_HTTP
 static xsql::thinclient::http_query_server* g_http_server = nullptr;
-static std::unique_ptr<xsql::thinclient::server> g_repl_http_server;
+static std::unique_ptr<xsql::thinclient::http_query_server> g_repl_http_server;
 
 static void http_signal_handler(int) {
     if (g_http_server) {
@@ -165,24 +165,37 @@ static void setup_http_callbacks(bnsql::CommandCallbacks& callbacks, bnsql::Quer
             return "HTTP server already running on port " + std::to_string(g_repl_http_server->port());
         }
 
-        xsql::thinclient::server_config cfg;
+        xsql::thinclient::http_query_server_config cfg;
+        cfg.tool_name = "bnsql";
+        cfg.help_text = bnsql::http_help_text();
         cfg.port = 0;  // Random port
         cfg.bind_address = "127.0.0.1";
-        cfg.setup_routes = [&qe](httplib::Server& svr) {
-            bnsql::setup_http_routes(svr,
-                [&qe](const std::string& sql) { return qe.query(sql); },
-                "", 0);
+        // Background server (no main-thread queue), so serialize requests:
+        // BN's QueryEngine is not concurrency-safe.
+        cfg.use_queue = false;
+        cfg.serialize_requests = true;
+        cfg.statement_executor = [&qe](const std::string& stmt, xsql::ScriptStatementResult& out) {
+            auto r = qe.query(stmt);
+            out.columns = r.columns;
+            out.rows.reserve(r.rows.size());
+            for (const auto& row : r.rows) out.rows.push_back(row.values);
+            out.elapsed_ms = r.elapsed_ms;
+            out.success = r.success;
+            out.error = r.error;
+        };
+        cfg.extra_routes = [](httplib::Server& svr) {
+            svr.Get("/settings", [](const httplib::Request&, httplib::Response& res) {
+                res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
+                                "application/json");
+            });
         };
 
-        g_repl_http_server = std::make_unique<xsql::thinclient::server>(cfg);
-        g_repl_http_server->run_async();
-
-        if (!g_repl_http_server->is_running()) {
+        g_repl_http_server = std::make_unique<xsql::thinclient::http_query_server>(cfg);
+        int port = g_repl_http_server->start();
+        if (port < 0) {
             g_repl_http_server.reset();
             return "Failed to start HTTP server";
         }
-
-        int port = g_repl_http_server->port();
         return "HTTP server started on port " + std::to_string(port) + "\n"
                "  curl http://127.0.0.1:" + std::to_string(port) + "/help\n"
                "  curl -X POST http://127.0.0.1:" + std::to_string(port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"";

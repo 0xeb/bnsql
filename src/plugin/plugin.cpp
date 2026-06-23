@@ -26,6 +26,7 @@
 #include <bnsql/bnsql.hpp>
 #ifdef BNSQL_HAS_HTTP
 #include <xsql/thinclient/server.hpp>
+#include <xsql/thinclient/http_query_server.hpp>
 #include "bnsql_http_routes.hpp"
 #endif
 #include "binaryninjaapi.h"
@@ -99,7 +100,7 @@ static void ListStrings(BinaryView* bv) {
 // ============================================================================
 
 #ifdef BNSQL_HAS_HTTP
-static std::unique_ptr<xsql::thinclient::server> g_http_server;
+static std::unique_ptr<xsql::thinclient::http_query_server> g_http_server;
 static std::mutex g_http_server_mutex;
 static Ref<BinaryView> g_http_server_bv;
 
@@ -122,27 +123,41 @@ static void StartHTTPServer(BinaryView* bv) {
 
     g_http_server_bv = bv;
 
-    xsql::thinclient::server_config cfg;
+    xsql::thinclient::http_query_server_config cfg;
+    cfg.tool_name = "bnsql";
+    cfg.help_text = bnsql::http_help_text();
     cfg.port = port;
     cfg.bind_address = "127.0.0.1";
-    cfg.setup_routes = [port](httplib::Server& svr) {
-        bnsql::setup_http_routes(svr,
-            [](const std::string& sql) -> bnsql::QueryResult {
-                if (!g_http_server_bv) {
-                    bnsql::QueryResult result;
-                    result.error = "No binary loaded";
-                    return result;
-                }
-                bnsql::QueryEngine qe(g_http_server_bv);
-                return qe.query(sql);
-            },
-            "", port);
+    // Background server (no main-thread queue); serialize concurrent requests
+    // since a per-request QueryEngine over the shared BinaryView isn't
+    // concurrency-safe (matches the prior timed_mutex behavior).
+    cfg.use_queue = false;
+    cfg.serialize_requests = true;
+    cfg.statement_executor = [](const std::string& stmt, xsql::ScriptStatementResult& out) {
+        if (!g_http_server_bv) {
+            out.success = false;
+            out.error = "No binary loaded";
+            return;
+        }
+        bnsql::QueryEngine qe(g_http_server_bv);
+        auto r = qe.query(stmt);
+        out.columns = r.columns;
+        out.rows.reserve(r.rows.size());
+        for (const auto& row : r.rows) out.rows.push_back(row.values);
+        out.elapsed_ms = r.elapsed_ms;
+        out.success = r.success;
+        out.error = r.error;
+    };
+    cfg.extra_routes = [](httplib::Server& svr) {
+        svr.Get("/settings", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
+                            "application/json");
+        });
     };
 
-    g_http_server = std::make_unique<xsql::thinclient::server>(cfg);
-    g_http_server->run_async();
-
-    if (!g_http_server->is_running()) {
+    g_http_server = std::make_unique<xsql::thinclient::http_query_server>(cfg);
+    int actual_port_check = g_http_server->start();
+    if (actual_port_check < 0) {
         g_http_server.reset();
         g_http_server_bv = nullptr;
         ShowMessageBox("Error", "Failed to start HTTP server", OKButtonSet, ErrorIcon);
