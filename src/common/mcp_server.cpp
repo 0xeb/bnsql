@@ -113,6 +113,10 @@ int MCPServer::start(int port, QueryCallback query_cb,
                 {"content", Json::array({
                     Json{{"type", "text"}, {"text", result.payload}}
                 })},
+                {"structuredContent", Json{
+                    {"result", result.payload},
+                    {"success", result.success}
+                }},
                 {"isError", !result.success}
             };
         }
