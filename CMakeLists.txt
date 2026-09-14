@@ -1,14 +1,33 @@
+#
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
+
 cmake_minimum_required(VERSION 3.20)
-project(bnsql VERSION 0.0.11 LANGUAGES C CXX)
+project(bnsql LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Windows VERSIONINFO wiring (version is from project() above)
-set(TOOL_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-set(TOOL_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-set(TOOL_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+# Version single source of truth: src/common/bnsql_version.hpp. Parse it here so
+# the Windows VERSIONINFO resource can never drift from the header (the CLI reads
+# BNSQL_VERSION_STRING from the same header).
+set(_bnsql_version_hpp "${CMAKE_CURRENT_SOURCE_DIR}/src/common/bnsql_version.hpp")
+file(READ "${_bnsql_version_hpp}" _bnsql_version_contents)
+string(REGEX MATCH
+    "BNSQL_VERSION_STRING[ \t]+\"([0-9]+)\\.([0-9]+)\\.([0-9]+)\""
+    _bnsql_version_match "${_bnsql_version_contents}")
+set(TOOL_VERSION_MAJOR "${CMAKE_MATCH_1}")
+set(TOOL_VERSION_MINOR "${CMAKE_MATCH_2}")
+set(TOOL_VERSION_PATCH "${CMAKE_MATCH_3}")
+if(TOOL_VERSION_MAJOR STREQUAL "" OR TOOL_VERSION_MINOR STREQUAL "" OR TOOL_VERSION_PATCH STREQUAL "")
+    message(FATAL_ERROR "bnsql: failed to parse version from ${_bnsql_version_hpp}")
+endif()
+message(STATUS "bnsql: version ${TOOL_VERSION_MAJOR}.${TOOL_VERSION_MINOR}.${TOOL_VERSION_PATCH}")
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/versioninfo.cmake)
 
 # Output directories
@@ -22,68 +41,43 @@ endif()
 # Binary Ninja API
 # ============================================================================
 
+# Resolve BN_INSTALL_DIR: -D flag > env var > warn. Used to install the CLI next
+# to Binary Ninja so it can locate libbinaryninjacore at runtime.
+if(NOT BN_INSTALL_DIR)
+    if(DEFINED ENV{BN_INSTALL_DIR})
+        set(BN_INSTALL_DIR "$ENV{BN_INSTALL_DIR}" CACHE PATH "Path to Binary Ninja installation")
+        message(STATUS "bnsql: Using BN_INSTALL_DIR from environment: ${BN_INSTALL_DIR}")
+    else()
+        message(WARNING "bnsql: BN_INSTALL_DIR not specified. The CLI will build but won't be\n"
+            "  installed next to Binary Ninja (needed to locate libbinaryninjacore at runtime).\n"
+            "  Set via cmake flag:  -DBN_INSTALL_DIR=/path/to/binaryninja\n"
+            "  Or environment var:  export BN_INSTALL_DIR=/path/to/binaryninja")
+    endif()
+else()
+    message(STATUS "bnsql: Using BN_INSTALL_DIR from cmake flag: ${BN_INSTALL_DIR}")
+endif()
+
+# Helper: install a Binary Ninja plugin target into the BN user plugins directory
+function(bn_install_plugin target)
+    if(WIN32)
+        set(BN_PLUGINS_DIR "$ENV{APPDATA}/Binary Ninja/plugins" CACHE PATH "Binary Ninja plugins directory")
+    elseif(APPLE)
+        set(BN_PLUGINS_DIR "$ENV{HOME}/Library/Application Support/Binary Ninja/plugins" CACHE PATH "Binary Ninja plugins directory")
+    else()
+        set(BN_PLUGINS_DIR "$ENV{HOME}/.binaryninja/plugins" CACHE PATH "Binary Ninja plugins directory")
+    endif()
+    install(TARGETS ${target}
+        LIBRARY DESTINATION "${BN_PLUGINS_DIR}"
+        RUNTIME DESTINATION "${BN_PLUGINS_DIR}"
+    )
+endfunction()
+
 # Option to specify BN API path (defaults to external submodule)
 set(BN_API_PATH "${CMAKE_CURRENT_SOURCE_DIR}/external/binaryninja-api" CACHE PATH "Path to Binary Ninja API")
 
 if(NOT EXISTS "${BN_API_PATH}/CMakeLists.txt")
     message(FATAL_ERROR "Binary Ninja API not found at ${BN_API_PATH}\n"
         "Initialize submodule: git submodule update --init --recursive")
-endif()
-
-# Keep the API checkout in sync with the INSTALLED Binary Ninja (issue #10).
-# The API headers/static lib must be ABI-compatible with the libbinaryninjacore
-# we link against, which in practice means the API submodule must match your
-# installed Binary Ninja build. Every install records the exact API commit it
-# was built from in "<BN_INSTALL_DIR>/api_REVISION.txt" -- read it and compare.
-# On mismatch we warn with the precise checkout command; pass
-# -DBNSQL_SYNC_BN_API=ON to have CMake check it out for you.
-option(BNSQL_SYNC_BN_API "Auto-checkout the BN API submodule to match the installed Binary Ninja" OFF)
-
-if(BN_INSTALL_DIR AND EXISTS "${BN_INSTALL_DIR}/api_REVISION.txt" AND EXISTS "${BN_API_PATH}/.git")
-    find_package(Git QUIET)
-    if(GIT_FOUND)
-        # api_REVISION.txt holds the full commit hash on its own line.
-        set(_bn_want_rev "")
-        file(STRINGS "${BN_INSTALL_DIR}/api_REVISION.txt" _bn_rev_lines)
-        foreach(_line IN LISTS _bn_rev_lines)
-            string(STRIP "${_line}" _line)
-            if(_line MATCHES "^[0-9a-fA-F]+$")
-                string(TOLOWER "${_line}" _bn_want_rev)
-            endif()
-        endforeach()
-
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} -C "${BN_API_PATH}" rev-parse HEAD
-            OUTPUT_VARIABLE _bn_have_rev OUTPUT_STRIP_TRAILING_WHITESPACE
-            RESULT_VARIABLE _bn_rev_rc ERROR_QUIET)
-        string(TOLOWER "${_bn_have_rev}" _bn_have_rev)
-
-        if(_bn_want_rev AND _bn_rev_rc EQUAL 0 AND NOT _bn_have_rev STREQUAL _bn_want_rev)
-            if(BNSQL_SYNC_BN_API)
-                message(STATUS "bnsql: syncing BN API submodule to installed revision ${_bn_want_rev}")
-                execute_process(COMMAND ${GIT_EXECUTABLE} -C "${BN_API_PATH}" fetch --quiet origin "${_bn_want_rev}" ERROR_QUIET)
-                execute_process(
-                    COMMAND ${GIT_EXECUTABLE} -C "${BN_API_PATH}" checkout --quiet "${_bn_want_rev}"
-                    RESULT_VARIABLE _bn_co_rc ERROR_VARIABLE _bn_co_err)
-                if(NOT _bn_co_rc EQUAL 0)
-                    message(FATAL_ERROR "bnsql: failed to checkout BN API ${_bn_want_rev}:\n${_bn_co_err}")
-                endif()
-            else()
-                message(WARNING
-                    "bnsql: Binary Ninja API submodule (${_bn_have_rev})\n"
-                    "       differs from your installed Binary Ninja (${_bn_want_rev}).\n"
-                    "       Compatibility is ultimately gated by the core ABI version, not the\n"
-                    "       commit, so a same-series difference may still build and run fine.\n"
-                    "       But if the build fails to link, or the tool fails to load the core,\n"
-                    "       sync the API to the installed revision:\n"
-                    "         git -C \"${BN_API_PATH}\" fetch origin ${_bn_want_rev}\n"
-                    "         git -C \"${BN_API_PATH}\" checkout ${_bn_want_rev}\n"
-                    "       or re-run cmake with -DBNSQL_SYNC_BN_API=ON to do it automatically.")
-            endif()
-        elseif(_bn_want_rev AND _bn_rev_rc EQUAL 0)
-            message(STATUS "bnsql: BN API submodule matches installed Binary Ninja (${_bn_want_rev})")
-        endif()
-    endif()
 endif()
 
 # Add Binary Ninja API
@@ -107,6 +101,32 @@ if(BNSQL_WITH_HTTP)
 endif()
 
 # ============================================================================
+# libxsql dependency
+# ============================================================================
+# NOTE: this must stay AHEAD of the MCP block below. libxsql is what creates the
+# httplib::httplib target, and fastmcpp only consumes that target if it already
+# exists when fastmcpp is configured. Configure fastmcpp first and it falls back
+# to fetching its own private cpp-httplib copy, putting two sets of header-only
+# inline definitions into one binary — an ODR violation that shows up as a crash
+# inside httplib's mutexes rather than as a link error.
+
+if(TARGET xsql::xsql)
+    message(STATUS "bnsql: Using existing xsql::xsql target")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
+    message(STATUS "bnsql: Added libxsql from sibling directory")
+else()
+    message(STATUS "bnsql: Fetching libxsql from GitHub...")
+    include(FetchContent)
+    FetchContent_Declare(libxsql
+        GIT_REPOSITORY https://github.com/0xeb/libxsql.git
+        GIT_TAG        main
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(libxsql)
+endif()
+
+# ============================================================================
 # MCP Server Support (optional, uses fastmcpp)
 # ============================================================================
 
@@ -116,6 +136,7 @@ if(BNSQL_WITH_MCP)
     if(NOT TARGET fastmcpp_core)
         set(FASTMCPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(FASTMCPP_BUILD_CLI OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_ENABLE_POST_STREAMING OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_ENABLE_SAMPLING_HTTP_HANDLERS OFF CACHE BOOL "" FORCE)
         set(FASTMCPP_FETCH_CURL OFF CACHE BOOL "" FORCE)
@@ -128,45 +149,113 @@ if(BNSQL_WITH_MCP)
         )
         FetchContent_MakeAvailable(fastmcpp)
     endif()
+    # Keep fastmcpp's cpp-httplib feature macros identical to everyone else's.
+    if(TARGET fastmcpp_core AND TARGET httplib::httplib)
+        target_link_libraries(fastmcpp_core PUBLIC httplib::httplib)
+    endif()
     message(STATUS "bnsql: Building with MCP server support")
 endif()
 
 # ============================================================================
-# libxsql dependency
+# bnsql library (compiled STATIC library)
 # ============================================================================
+# Compiled STATIC library (mirrors idasql). Every table/UDF is split into its own
+# translation unit under src/lib/src/: the core entity tables grouped by domain
+# namespace (code/symbols/memory/xrefs/meta), decompiler, types_*, and the scalar/
+# search UDFs. The QueryEngine is PIMPL'd (database.cpp) so consumers never
+# instantiate the builders. The per-table split keeps every TU small enough that
+# /bigobj is no longer needed anywhere (plugin, CLI, or library).
 
-if(TARGET xsql::xsql)
-    message(STATUS "bnsql: Using existing xsql::xsql target")
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libxsql ${CMAKE_CURRENT_BINARY_DIR}/libxsql)
-    message(STATUS "bnsql: Added libxsql from sibling directory")
-else()
-    message(STATUS "bnsql: Fetching libxsql from GitHub...")
-    include(FetchContent)
-    FetchContent_Declare(libxsql
-        GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        v1.0.10
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(libxsql)
-endif()
-
-# ============================================================================
-# bnsql library (header-only with BN dependency)
-# ============================================================================
-
-add_library(bnsql INTERFACE)
+add_library(bnsql STATIC
+    # shared infra + PIMPL'd engine
+    src/lib/src/core_common.cpp
+    src/lib/src/database.cpp
+    # core registry + entity-domain tables
+    src/lib/src/core_registry.cpp
+    src/lib/src/code_funcs.cpp
+    src/lib/src/code_blocks.cpp
+    src/lib/src/code_cfg.cpp
+    src/lib/src/code_switch_tables.cpp
+    src/lib/src/code_function_frames.cpp
+    src/lib/src/code_data_items.cpp
+    src/lib/src/code_graph_tables.cpp
+    src/lib/src/code_instructions.cpp
+    src/lib/src/code_operands.cpp
+    src/lib/src/symbols_names.cpp
+    src/lib/src/symbols_exports.cpp
+    src/lib/src/symbols_imports.cpp
+    src/lib/src/symbols_comments.cpp
+    src/lib/src/symbols_bookmarks.cpp
+    src/lib/src/memory_segments.cpp
+    src/lib/src/memory_strings.cpp
+    src/lib/src/memory_bytes.cpp
+    src/lib/src/xrefs.cpp
+    src/lib/src/meta_binary.cpp
+    src/lib/src/meta_capabilities.cpp
+    src/lib/src/meta_true_believers.cpp
+    # decompiler domain
+    src/lib/src/decompiler.cpp
+    # types domain
+    src/lib/src/types_registry.cpp
+    src/lib/src/types_types.cpp
+    src/lib/src/types_members.cpp
+    src/lib/src/types_enum_values.cpp
+    src/lib/src/types_func_signatures.cpp
+    src/lib/src/types_patches.cpp
+    # scalar / search UDFs
+    src/lib/src/functions.cpp
+    src/lib/src/bnsql_python_exec.cpp   # BN-Python exec engine (bnsql_python + ui-context)
+    src/lib/src/search_bytes.cpp
+    src/lib/src/true_believers.cpp   # vendored true_believers decoder
+)
 add_library(bnsql::bnsql ALIAS bnsql)
 
-target_include_directories(bnsql INTERFACE
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/lib/include>
-    $<INSTALL_INTERFACE:include>
+target_include_directories(bnsql
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/lib/include>
+        $<INSTALL_INTERFACE:include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/common   # bnsql_version.hpp (binary table tool_version)
 )
 
-target_link_libraries(bnsql INTERFACE
+target_link_libraries(bnsql PUBLIC
     xsql::xsql
     binaryninjaapi
 )
+
+if(MSVC)
+    # No /bigobj: the per-table split keeps every translation unit well under the
+    # COFF section limit.
+    target_compile_definitions(bnsql PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
+# Avoid name collision with bnsql_plugin's import lib (bnsql.lib)
+set_target_properties(bnsql PROPERTIES OUTPUT_NAME "libbnsql")
+
+# Position-independent code so this STATIC lib can be linked into the
+# bnsql_plugin SHARED object on Linux. Without it, ELF x86_64 rejects the
+# thread_local g_context TLS relocation (R_X86_64_TPOFF32) when pulling the
+# archive into a .so. No-op on Windows (PE has no -fPIC distinction); the CLI
+# and test executables link the same PIC archive fine.
+set_target_properties(bnsql PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Precompile the Binary Ninja SDK superset once for the whole library.
+target_precompile_headers(bnsql PRIVATE src/lib/src/bn_headers.hpp)
+
+# The vendored true_believers decoder is engine-agnostic — keep the BN PCH out
+# of it so it compiles standalone with no Binary Ninja dependency.
+set_source_files_properties(src/lib/src/true_believers.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+
+# The `capabilities` table (meta_capabilities.cpp) bakes feature.http_server /
+# feature.mcp_server from these defines. It now compiles once inside the library,
+# so drive them from the library's own build options.
+if(BNSQL_WITH_HTTP)
+    target_compile_definitions(bnsql PRIVATE BNSQL_HAS_HTTP)
+endif()
+if(BNSQL_WITH_MCP)
+    target_compile_definitions(bnsql PRIVATE BNSQL_HAS_MCP)
+endif()
 
 # ============================================================================
 # bnsql plugin (Binary Ninja plugin)
@@ -177,16 +266,23 @@ option(BNSQL_BUILD_PLUGIN "Build bnsql Binary Ninja plugin" ON)
 if(BNSQL_BUILD_PLUGIN)
     add_library(bnsql_plugin SHARED
         src/plugin/plugin.cpp
+        src/plugin/ui_context_capture.cpp
     )
 
     target_link_libraries(bnsql_plugin PRIVATE
         bnsql::bnsql
     )
 
-    # Include common headers (for bnsql_http_routes.hpp, etc.)
+    # Include common headers (for bnsql_http_routes.hpp, etc.) + the lib's private
+    # src (for bnsql_python_exec.hpp used by ui_context_capture.cpp).
     target_include_directories(bnsql_plugin PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/src
     )
+
+    # plugin.cpp no longer needs /bigobj: the SQL table surface is compiled into
+    # the bnsql library now, so it no longer instantiates in this translation unit.
+    # (It hit the COFF section limit purely from that surface before the refactor.)
 
     # Plugin-specific build flag (enables UI context UDF)
     target_compile_definitions(bnsql_plugin PRIVATE BNSQL_PLUGIN_BUILD)
@@ -217,19 +313,8 @@ if(BNSQL_BUILD_PLUGIN)
         set_target_properties(bnsql_plugin PROPERTIES SUFFIX ".so")
     endif()
 
-    # Detect BN plugins directory
-    if(WIN32)
-        set(BN_PLUGINS_DIR "$ENV{APPDATA}/Binary Ninja/plugins" CACHE PATH "Binary Ninja plugins directory")
-    elseif(APPLE)
-        set(BN_PLUGINS_DIR "$ENV{HOME}/Library/Application Support/Binary Ninja/plugins" CACHE PATH "Binary Ninja plugins directory")
-    else()
-        set(BN_PLUGINS_DIR "$ENV{HOME}/.binaryninja/plugins" CACHE PATH "Binary Ninja plugins directory")
-    endif()
-
-    install(TARGETS bnsql_plugin
-        LIBRARY DESTINATION "${BN_PLUGINS_DIR}"
-        RUNTIME DESTINATION "${BN_PLUGINS_DIR}"
-    )
+    # Install plugin into the Binary Ninja user plugins directory
+    bn_install_plugin(bnsql_plugin)
 endif()
 
 # ============================================================================
@@ -256,6 +341,7 @@ if(BNSQL_BUILD_CLI)
         bnsql::bnsql
     )
 
+
     # Common headers (bnsql_commands.hpp, bnsql_http_routes.hpp, etc.)
     target_include_directories(bnsql-cli PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/common
@@ -276,6 +362,12 @@ if(BNSQL_BUILD_CLI)
     set_target_properties(bnsql-cli PROPERTIES
         OUTPUT_NAME "bnsql"
     )
+
+    # Install CLI next to Binary Ninja so it can find libbinaryninjacore at runtime
+    if(BN_INSTALL_DIR)
+        get_filename_component(_BN_INSTALL_ABS "${BN_INSTALL_DIR}" ABSOLUTE)
+        install(TARGETS bnsql-cli RUNTIME DESTINATION "${_BN_INSTALL_ABS}")
+    endif()
 
     # Windows VS_VERSION_INFO resource
     xsql_add_versioninfo(bnsql-cli

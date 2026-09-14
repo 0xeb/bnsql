@@ -4,7 +4,7 @@
 
 # BNSQL
 
-> **Status:** Pre-release Alpha | **Platform:** Windows only (for now)
+> **Status:** Pre-release Alpha | **Platform:** macOS, Linux, Windows
 
 **SQL interface for Binary Ninja** - Query your reverse engineering database using SQL.
 
@@ -20,14 +20,16 @@
 
 ## Quick Start
 
-**Requirements:** Binary Ninja must be in your PATH, or place `bnsql.exe` in your Binary Ninja installation folder.
+**Requirements:** Binary Ninja installed. The `bnsql` CLI must be able to find
+`libbinaryninjacore` — either install it into the Binary Ninja folder (done
+automatically by `cmake --install`) or add Binary Ninja to your PATH.
 
 ```bash
-# Windows: Add BN to PATH
-set PATH=C:\Program Files\Vector35\BinaryNinja;%PATH%
+# macOS / Linux: add BN to PATH (if not using cmake --install)
+export PATH=/path/to/binaryninja:$PATH
 
-# Or copy bnsql.exe to BN folder
-copy bnsql.exe "C:\Program Files\Vector35\BinaryNinja\"
+# Windows: add BN to PATH
+set PATH=C:\Program Files\Vector35\BinaryNinja;%PATH%
 ```
 
 ```bash
@@ -68,11 +70,11 @@ See [Server Modes](#server-modes) for full HTTP API documentation, authenticatio
 
 ```sql
 -- 10 largest functions
-SELECT hex(address) as addr, name, size
+SELECT hex(addr) as addr, name, size
 FROM funcs ORDER BY size DESC LIMIT 10;
 
 -- Find password-related strings
-SELECT content, hex(address) as addr
+SELECT content, hex(addr) as addr
 FROM strings WHERE content LIKE '%password%';
 
 -- Import analysis by module
@@ -81,13 +83,13 @@ FROM imports GROUP BY module ORDER BY count DESC;
 
 -- Functions called <= 10 times (uses CTE for performance)
 WITH call_counts AS (
-    SELECT to_ea, COUNT(1) as cnt
+    SELECT to_addr, COUNT(1) as cnt
     FROM xrefs WHERE is_code = 1
-    GROUP BY to_ea
+    GROUP BY to_addr
 )
 SELECT f.name, COALESCE(c.cnt, 0) as calls
 FROM funcs f
-LEFT JOIN call_counts c ON c.to_ea = f.address
+LEFT JOIN call_counts c ON c.to_addr = f.addr
 WHERE COALESCE(c.cnt, 0) <= 10
 ORDER BY calls DESC;
 
@@ -101,17 +103,27 @@ WHERE name IN ('strcpy', 'strcat', 'sprintf', 'gets')
 
 | Table | Description |
 |-------|-------------|
-| `funcs` | Functions (address, name, size) |
+| `funcs` | Functions (addr, name, size) |
 | `segments` | Memory segments (.text, .data, etc.) |
 | `names` | All named locations |
 | `entries` | Entry points and exports |
 | `imports` | Imported functions |
 | `strings` | String literals |
-| `xrefs` | Cross-references (from_ea, to_ea, is_code) |
+| `xrefs` | Cross-references (from_addr, to_addr, is_code) |
 | `blocks` | Basic blocks |
+| `cfg_edges` | Control-flow graph edges |
+| `switch_tables` | Reconstructed switch metadata |
+| `function_frames` | Per-function stack-frame summaries |
+| `data_items` | Defined data variables and best-effort values |
+| `dominators`, `post_dominators`, `loops` | Control-flow graph analysis |
 | `instructions` | Decoded instructions |
+| `instruction_operands` | One row per disassembly operand |
+| `bytes` | Addressable memory bytes (use `start_addr` + `n` for bounded reads) |
+| `byte_search` | FlexHex pattern matches (requires a `pattern`) |
 | `comments` | Address comments |
-| `db_info` | Database metadata |
+| `bookmarks` | Binary Ninja user-data tags |
+| `mlil`, `mlil_operands` | Six-rung LLIL/MLIL/HLIL operation and operand streams |
+| `binary` | Database metadata |
 
 ## SQL Functions
 
@@ -119,12 +131,14 @@ WHERE name IN ('strcpy', 'strcat', 'sprintf', 'gets')
 |----------|-------------|
 | `hex(addr)` | Format address as hex |
 | `disasm(addr)` | Disassembly at address |
-| `bytes(addr, n)` | Read n bytes as hex |
 | `name_at(addr)` | Name at address |
 | `func_at(addr)` | Function name containing address |
 | `func_start(addr)` | Start of containing function |
 | `xrefs_to(addr)` | JSON array of xrefs to address |
 | `xrefs_from(addr)` | JSON array of xrefs from address |
+| `search_first(pattern)` | Address of the first FlexHex byte-pattern match |
+| `entities_search(pattern, limit, offset)` | Unified JSON entity discovery |
+| `get_ui_context_json()` | Live GUI context, or an unavailable envelope headlessly |
 | `save()` | Save database to disk |
 
 ## CLI Reference
@@ -168,9 +182,30 @@ bnsql> .http start         Start HTTP server
 bnsql> .quit               Exit
 ```
 
+### Logging / diagnostics
+
+By default Binary Ninja's own log output is discarded. Two switches capture it:
+
+- `--log-file <path>` — write BN log output (Info and up, including plugin-load
+  messages) to a file. The file is opened once and closed on clean exit.
+- `-V, --verbose` — raise the level to Debug and echo BN logs to stdout.
+
+```bash
+# Capture a diagnostic log to a file
+bnsql database.bndb --log-file bn.log -c "SELECT COUNT(*) FROM funcs"
+
+# Stream Debug-level BN logs to the console (redirect as you like)
+bnsql database.bndb --http 8080 --verbose
+```
+
+> **Windows note:** the log file is held open while a server is running, so a live
+> `tail` of it may be blocked until the server stops. For a live view, use
+> `--verbose` (which streams to stdout) and redirect it yourself, e.g.
+> `bnsql database.bndb --http 8080 --verbose > bn.log 2>&1`.
+
 ## Server Modes
 
-BNSQL supports two server protocols: **HTTP REST** (recommended) and raw TCP.
+BNSQL supports two server protocols: **HTTP REST** (recommended) and **MCP** (Model Context Protocol).
 
 ### HTTP REST Server (Recommended)
 
@@ -212,29 +247,12 @@ curl -X POST http://localhost:8080/query \
 
 # Check status
 curl http://localhost:8080/status
-
-# Plain-text / CSV / TSV output for terminals and unix pipes
-curl -X POST "http://localhost:8080/query?format=text" -d "SELECT name, size FROM funcs LIMIT 5"
-curl -X POST "http://localhost:8080/query?format=csv"  -d "SELECT name, size FROM funcs LIMIT 5"
 ```
 
-**Response Format:** JSON by default — a script envelope (single statement = array of one):
+**Response Format:**
 ```json
-{"success": true, "statement_count": 1,
- "results": [{"statement_index": 0, "success": true,
-   "columns": ["name", "size"], "rows": [["_main", "2851"]],
-   "row_count": 1, "elapsed_ms": 8, "error": null}],
- "row_count_total": 1, "elapsed_ms_total": 8, "first_error_index": null}
+{"success": true, "columns": ["name", "size"], "rows": [["main", "500"]], "row_count": 1}
 ```
-
-**Output formats** (query-string `format=`, default `json`):
-
-| `format` | Content-Type | Use |
-|----------|--------------|-----|
-| `json` (default) | `application/json` | Programmatic use — **agents should consume this**, not a reformatted view |
-| `text` | `text/plain` | Ready-to-read ASCII table for terminals |
-| `csv` | `text/csv` | Spreadsheets / RFC-4180 CSV |
-| `tsv` | `text/tab-separated-values` | Unix pipes (`cut`/`awk`/`sort`) |
 
 ### MCP Server (Model Context Protocol)
 
@@ -267,43 +285,61 @@ cmake -B build -DBNSQL_WITH_HTTP=ON ...
 ```
 
 The server can also be started from the Binary Ninja plugin:
-- Menu: `BNSQL > HTTP Server > Start HTTP Server...`
+- Menu: `BNSQL > Start HTTP Server...`
 
 ## Building
 
 ```bash
-cmake -B build -DBUILD_WITH_BNSQL=ON \
-      -DBN_INSTALL_DIR=/path/to/binaryninja
+cmake -B build -DBN_INSTALL_DIR=/path/to/binaryninja
 cmake --build build --config Release
+cmake --install build
 ```
 
-### Matching the Binary Ninja API to your install
+`BN_INSTALL_DIR` may also be supplied via the `BN_INSTALL_DIR` environment
+variable; if it is omitted entirely the build still proceeds (with a warning) but
+the CLI is not auto-installed next to Binary Ninja.
 
-The `external/binaryninja-api` submodule should be compatible with the version of
-Binary Ninja you link against — the API and the installed `binaryninjacore` share
-a core ABI (`BN_CURRENT_CORE_ABI_VERSION`) that only changes on breaking releases.
-The submodule is pinned to one revision, so if your installed Binary Ninja is a
-different build, the configure step warns. The check compares the commit (the only
-signal the install exposes statically, in `api_REVISION.txt`), so a same-series
-difference may still build fine — the warning is advisory:
+The install step deploys:
+- **Plugin** (`bnsql.dll`/`.dylib`/`.so`) → the Binary Ninja user plugins directory
+- **CLI** (`bnsql`) → the Binary Ninja installation directory (set by `BN_INSTALL_DIR`)
 
-```
-bnsql: Binary Ninja API submodule (<have>) does not match your installed Binary Ninja (<want>).
-```
 
-Each install records the exact API commit it was built from in
-`<BN_INSTALL_DIR>/api_REVISION.txt`. To sync automatically, configure with:
+## Binary Ninja Plugin
 
-```bash
-cmake -B build -DBN_INSTALL_DIR=/path/to/binaryninja -DBNSQL_SYNC_BN_API=ON
-```
+BNSQL ships as a native Binary Ninja plugin (`bnsql.dll` / `.so` / `.dylib`) that adds a
+**`BNSQL`** menu to the Binary Ninja GUI, alongside the standalone CLI.
 
-or do it by hand using the commit from the warning:
+### Deploying the plugin
 
-```bash
-git -C external/binaryninja-api fetch origin <want>
-git -C external/binaryninja-api checkout <want>
-```
+`cmake --install build` copies the plugin into your Binary Ninja **user plugins
+directory** automatically. To deploy manually, copy the built library there yourself:
+
+| OS | User plugins directory |
+|----|------------------------|
+| Windows | `%APPDATA%\Binary Ninja\plugins` |
+| Linux | `~/.binaryninja/plugins` |
+| macOS | `~/Library/Application Support/Binary Ninja/plugins` |
+
+The built plugin is `bnsql.dll` (Windows), `bnsql.so` (Linux), or `bnsql.dylib` (macOS).
+Restart Binary Ninja after copying — it loads plugins from that directory at startup.
+
+### Using it
+
+Open a binary, then use the **`BNSQL`** menu:
+
+- **Run SQL Query…** — run an arbitrary query and view the results
+- **Show Tables** — list the available SQL tables
+- **Start HTTP Server…** / **Stop HTTP Server** / **HTTP Server Status** —
+  serve the REST API (default port 8080) against the binary open in your GUI session, then
+  query it exactly like the CLI's [`--http` mode](#http-rest-server-recommended)
+
+The plugin is GUI-only. For headless or scripted use, run the **CLI** (`bnsql <file> …`)
+instead — it does not need the plugin (the plugin detects a headless host and skips itself,
+so it never loads inside the CLI).
+
+> **Note:** this native Binary Ninja plugin is distinct from the **Coding Agent Plugins**
+> (Claude Code / Codex *skills*) described further below — those extend your AI coding
+> agent, not the Binary Ninja GUI.
 
 
 ## Performance Tips
@@ -383,8 +419,8 @@ BNSQL skills give your coding agent full control over Binary Ninja databases thr
 
 ### Prerequisites
 
-1. **Binary Ninja** installed with its DLL directory in your PATH (or set `BN_INSTALL_DIR`)
-2. **bnsql.exe** in your PATH (from [Releases](https://github.com/0xeb/bnsql/releases) or built locally)
+1. **Binary Ninja** installed with its library directory in your PATH (or set `BN_INSTALL_DIR`)
+2. **bnsql** in your PATH (from [Releases](https://github.com/0xeb/bnsql/releases) or built locally)
 3. Verify setup: `bnsql --version` should work from command line
 
 ### Install (Claude Code)
@@ -450,6 +486,16 @@ query you learn against one tool largely carries over to the others.
 
 Elias Bachaalany ([@0xeb](https://github.com/0xeb))
 
-## License
+## License and Terms of Use
 
-This project is licensed under the [Mozilla Public License 2.0](LICENSE).
+In short: you may read, build, evaluate, benchmark, package, and use unmodified bnsql, including commercially, if you preserve notices and follow the license terms. You may fork or patch it to prepare bug fixes, optimizations, features, tests, or documentation improvements for contribution back within the license's contribution-purpose rules.
+
+You may not maintain a divergent private fork, port, rebrand, clone, API-compatible replacement, competing implementation, or use bnsql as AI input to recreate or improve a derivative implementation without prior written permission from Elias Bachaalany. Independent implementations that are not copied from, materially derived from, or substantially informed by bnsql in the license's defined sense are not prohibited.
+
+Permission requests: open a GitHub issue at [0xeb/bnsql/issues](https://github.com/0xeb/bnsql/issues).
+
+If bnsql materially informs a distributed project, preserve the human origin: credit bnsql and Elias Bachaalany visibly in your README/docs and in About/credits UI when applicable. The license includes an examples/FAQ section for common allowed and permission-required uses. Third-party dependencies (libxsql, the Binary Ninja API, and their transitive dependencies) remain under their own licenses.
+
+See the full [Human-Origin Source License v1.0](LICENSE).
+
+Releases up to v0.0.11 remain under the MPL-2.0 they shipped with.

@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * persistence.hpp - Shared save/persistence helpers for bnsql mutations
@@ -12,22 +11,58 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <functional>
 #include <string>
+#include <type_traits>
+#include <utility>
 
 #include "binaryninjaapi.h"
 
 namespace bnsql {
 namespace persistence {
 
-// Callback invoked by mutation handlers to invalidate decompiler caches.
-// Set by DecompilerTableRegistry::register_all() to avoid circular includes.
-// owner tracks which registry installed the callback, so only that registry clears it.
-inline std::function<void()> on_decompiler_invalidate;
-inline void* on_decompiler_invalidate_owner = nullptr;
-
 using namespace BinaryNinja;
+
+template <typename Builder, typename = void>
+struct has_legacy_on_commit : std::false_type {};
+
+template <typename Builder>
+struct has_legacy_on_commit<
+    Builder,
+    std::void_t<decltype(std::declval<Builder&>().on_commit(
+        std::declval<std::function<void()>>()))>> : std::true_type {};
+
+template <typename MemberFunction>
+struct member_function_argument;
+
+template <typename Result, typename Owner, typename Arg>
+struct member_function_argument<Result (Owner::*)(Arg)> {
+    using type = std::decay_t<Arg>;
+};
+
+// Bridge libxsql's former on_commit(fn) builder API and its transaction-hooks
+// replacement. Keeping this at the bnsql boundary preserves standalone builds
+// across the supported libxsql API generations.
+template <typename Builder, typename Fn>
+void install_commit_hook(Builder& builder, Fn&& fn) {
+    std::function<void()> hook(std::forward<Fn>(fn));
+    if constexpr (has_legacy_on_commit<Builder>::value) {
+        builder.on_commit(std::move(hook));
+    } else {
+        using Hooks = typename member_function_argument<
+            decltype(&Builder::transaction_hooks)>::type;
+        Hooks hooks;
+        // TransactionHooks gained a connection-state argument after its initial
+        // introduction. A generic adapter accepts either signature while the
+        // bnsql action itself remains state-independent.
+        hooks.commit =
+            [hook = std::move(hook)](auto&&...) noexcept { hook(); };
+        builder.transaction_hooks(std::move(hooks));
+    }
+}
 
 inline bool ends_with_bndb_case_insensitive(const std::string& path) {
     static constexpr const char* kExt = ".bndb";

@@ -1,35 +1,32 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
- * functions.hpp - Custom SQL functions for Binary Ninja operations
+ * functions.cpp - Custom SQL functions for Binary Ninja operations
  *
  * Compatible with idasql functions where applicable.
  *
  * Query Functions:
- *   - disasm(address)           - Get disassembly line at address
- *   - disasm(address, count)    - Get multiple disassembly lines
- *   - bytes(address, count)     - Get bytes as hex string
- *   - bytes_raw(address, count) - Get bytes as blob
- *   - name_at(address)          - Get name at address
- *   - func_at(address)          - Get function name containing address
- *   - func_start(address)       - Get start address of function containing address
- *   - func_end(address)         - Get end address of function containing address
- *   - xrefs_to(address)         - Get xrefs to address (JSON array)
- *   - xrefs_from(address)       - Get xrefs from address (JSON array)
- *   - segment_at(address)       - Get segment name containing address
- *   - comment_at(address)       - Get comment at address
- *   - set_comment(address, text) - Set address comment
- *   - set_name(address, name)   - Set name at address
+ *   - disasm(addr)              - Get disassembly line at address
+ *   - disasm(addr, count)       - Get multiple disassembly lines
+ *   - name_at(addr)             - Get name at address
+ *   - func_at(addr)             - Get function name containing address
+ *   - func_start(addr)          - Get start address of function containing address
+ *   - func_end(addr)            - Get end address of function containing address
+ *   - xrefs_to(addr)            - Get xrefs to address (JSON array)
+ *   - xrefs_from(addr)          - Get xrefs from address (JSON array)
+ *   - segment_at(addr)          - Get segment name containing address
+ *   - comment_at(addr)          - Get comment at address
+ *   - set_comment(addr, text)   - Set address comment
+ *   - set_name(addr, name)      - Set name at address
  *   - entities_search(pattern, limit, offset) - Search unified entities (JSON array)
  *
  * Navigation:
- *   - next_head(address)        - Get next defined head
- *   - prev_head(address)        - Get previous defined head
+ *   - next_head(addr)           - Get next defined head
+ *   - prev_head(addr)           - Get previous defined head
  *   - hex(value)                - Format integer as hex string
  *
  * Function Index (O(1)):
@@ -47,10 +44,14 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
+#include <functional>
 
+#include <bnsql/fwd.hpp>
+#include <bnsql/runtime_settings.hpp>
+#include "bnsql_python_exec.hpp"
 #include "binaryninjaapi.h"
-#include <bnsql/entities.hpp>
-#include <bnsql/persistence.hpp>
+#include "core_common.hpp"
+#include "persistence.hpp"
 
 namespace bnsql {
 namespace functions {
@@ -62,7 +63,7 @@ using namespace BinaryNinja;
 // ============================================================================
 
 inline Ref<BinaryView> get_bv() {
-    return entities::get_bv();
+    return core::get_bv();
 }
 
 inline Ref<Function> get_function_for_address(const Ref<BinaryView>& bv, uint64_t ea) {
@@ -149,14 +150,9 @@ static void sql_disasm(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* 
         // Use BasicBlock::GetDisassemblyText for proper disassembly within function
         auto func = funcs[0];
 
-        // Find the basic block containing this address
-        Ref<BasicBlock> target_block;
-        for (auto& block : func->GetBasicBlocks()) {
-            if (ea >= block->GetStart() && ea < block->GetEnd()) {
-                target_block = block;
-                break;
-            }
-        }
+        // Find the basic block containing this address (indexed core lookup)
+        Ref<BasicBlock> target_block =
+            func->GetBasicBlockAtAddress(func->GetArchitecture(), ea);
 
         if (target_block) {
             auto settings = DisassemblySettings::GetDefaultSettings();
@@ -385,14 +381,16 @@ static void sql_segment_at(xsql::FunctionContext& ctx, int argc, xsql::FunctionA
 
     uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
-    for (auto& seg : bv->GetSegments()) {
-        if (ea >= seg->GetStart() && ea < seg->GetEnd()) {
-            // Segments don't have names in BN, use address-based name
-            char buf[32];
-            snprintf(buf, sizeof(buf), "seg_%llx", (unsigned long long)seg->GetStart());
-            ctx.result_text(buf);
-            return;
-        }
+    // Point lookup instead of walking GetSegments() per call: this UDF runs once
+    // per row (e.g. SELECT segment_at(addr) FROM instructions), so the old
+    // whole-collection walk materialized every segment for every row.
+    auto seg = bv->GetSegmentAt(ea);
+    if (seg) {
+        // Segments don't have names in BN, use address-based name
+        char buf[32];
+        snprintf(buf, sizeof(buf), "seg_%llx", (unsigned long long)seg->GetStart());
+        ctx.result_text(buf);
+        return;
     }
     ctx.result_null();
 }
@@ -604,8 +602,7 @@ static void sql_prev_head(xsql::FunctionContext& ctx, int argc, xsql::FunctionAr
 
     uint64_t ea = static_cast<uint64_t>(argv[0].as_int64());
 
-    // BN doesn't have GetPreviousValidOffset, use simple approach
-    // Try to find previous instruction by scanning backwards
+    // BN has no GetPreviousValidOffset — scan backwards for the previous instruction.
     if (ea <= bv->GetStart()) {
         ctx.result_null();
         return;
@@ -674,20 +671,19 @@ static void sql_mnemonic(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg
     if (!funcs.empty()) {
         auto func = funcs[0];
         auto settings = DisassemblySettings::GetDefaultSettings();
-        for (auto& block : func->GetBasicBlocks()) {
-            if (ea >= block->GetStart() && ea < block->GetEnd()) {
-                auto lines = block->GetDisassemblyText(settings);
-                for (auto& line : lines) {
-                    if (line.addr == ea) {
-                        for (auto& tok : line.tokens) {
-                            if (tok.type == InstructionToken) {
-                                ctx.result_text(tok.text);
-                                return;
-                            }
+        // Containing block via indexed core lookup (avoids walking all blocks)
+        auto block = func->GetBasicBlockAtAddress(func->GetArchitecture(), ea);
+        if (block) {
+            auto lines = block->GetDisassemblyText(settings);
+            for (auto& line : lines) {
+                if (line.addr == ea) {
+                    for (auto& tok : line.tokens) {
+                        if (tok.type == InstructionToken) {
+                            ctx.result_text(tok.text);
+                            return;
                         }
                     }
                 }
-                break;
             }
         }
     }
@@ -763,16 +759,15 @@ static void sql_operand(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg*
     if (!funcs.empty()) {
         auto func = funcs[0];
         auto settings = DisassemblySettings::GetDefaultSettings();
-        for (auto& block : func->GetBasicBlocks()) {
-            if (ea >= block->GetStart() && ea < block->GetEnd()) {
-                auto lines = block->GetDisassemblyText(settings);
-                for (auto& line : lines) {
-                    if (line.addr == ea) {
-                        operands = extract_operands(line.tokens);
-                        break;
-                    }
+        // Containing block via indexed core lookup (avoids walking all blocks)
+        auto block = func->GetBasicBlockAtAddress(func->GetArchitecture(), ea);
+        if (block) {
+            auto lines = block->GetDisassemblyText(settings);
+            for (auto& line : lines) {
+                if (line.addr == ea) {
+                    operands = extract_operands(line.tokens);
+                    break;
                 }
-                break;
             }
         }
     }
@@ -854,6 +849,7 @@ static void sql_entities_search(xsql::FunctionContext& ctx, int argc, xsql::Func
         std::string name;
         std::string kind;
         uint64_t address = 0;
+        bool addr_is_null = false;  // type rows carry no address (mirrors the `entities` view's NULL addr)
         std::string parent_name;
         std::string qualified_name;
         std::string source;
@@ -876,7 +872,11 @@ static void sql_entities_search(xsql::FunctionContext& ctx, int argc, xsql::Func
 
     for (auto& f : bv->GetAnalysisFunctionList()) {
         auto sym = f->GetSymbol();
-        std::string name = sym ? sym->GetFullName() : ("sub_" + std::to_string(f->GetStart()));
+        // Match the funcs.name getter / entities view exactly: BN supplies an
+        // auto-symbol ("sub_<hex>") for unnamed functions via GetFullName();
+        // only the rare null-symbol edge case falls back, and there the view
+        // emits an empty name, so mirror that here (no divergent decimal form).
+        std::string name = sym ? sym->GetFullName() : "";
         EntityMatch e;
         e.name = name;
         e.kind = "function";
@@ -957,6 +957,22 @@ static void sql_entities_search(xsql::FunctionContext& ctx, int argc, xsql::Func
         maybe_add(std::move(e));
     }
 
+    // Types — parity with the `entities` view's kind='type' branch
+    // (FROM types ty, addr = NULL). The `types` table names each type by its
+    // qualified name (qname.GetString()); mirror that here.
+    for (const auto& [qname, type] : bv->GetTypes()) {
+        if (matches.size() >= max_matches) break;
+        (void)type;
+        EntityMatch e;
+        e.name = qname.GetString();
+        e.kind = "type";
+        e.addr_is_null = true;
+        e.parent_name = "";
+        e.qualified_name = e.name;
+        e.source = "analysis.types";
+        maybe_add(std::move(e));
+    }
+
     if (offset >= matches.size()) {
         ctx.result_text_static("[]");
         return;
@@ -973,7 +989,10 @@ static void sql_entities_search(xsql::FunctionContext& ctx, int argc, xsql::Func
         json << "{"
              << "\"name\":\"" << json_escape_ascii(e.name) << "\","
              << "\"kind\":\"" << e.kind << "\","
-             << "\"address\":" << e.address << ","
+             << "\"addr\":";
+        if (e.addr_is_null) json << "null";
+        else json << e.address;
+        json << ","
              << "\"parent_name\":\"" << json_escape_ascii(e.parent_name) << "\","
              << "\"qualified_name\":\"" << json_escape_ascii(e.qualified_name) << "\","
              << "\"source\":\"" << e.source << "\""
@@ -984,32 +1003,95 @@ static void sql_entities_search(xsql::FunctionContext& ctx, int argc, xsql::Func
 }
 
 // ============================================================================
-// UI Context (plugin-only)
+// UI Context
 // ============================================================================
 
+// The GUI plugin installs a live capture (a Binary Ninja Python UIContext
+// snapshot) into this slot at CorePluginInit. When unset (CLI / headless /
+// no scripting), get_ui_context_json() returns a stable {available:false}
+// envelope instead of NULL, so every runtime yields one parseable schema.
+static std::function<std::string()>& ui_context_provider_slot() {
+    static std::function<std::string()> slot;
+    return slot;
+}
+
+void set_ui_context_provider(std::function<std::string()> provider) {
+    ui_context_provider_slot() = std::move(provider);
+}
+
+// {available:false} envelope — shape-compatible with the live plugin capture
+// and with idasql's get_ui_context_json(), so downstream tooling parses one
+// schema everywhere.
+static std::string ui_context_unavailable_json(const char* source) {
+    std::ostringstream j;
+    j << "{\"available\":false,"
+      << "\"capture\":{\"source\":\"" << source << "\",\"fresh\":false,\"error\":null},"
+      << "\"code_context\":{\"has_address\":false}}";
+    return j.str();
+}
+
 static void sql_get_ui_context_json(xsql::FunctionContext& ctx, int, xsql::FunctionArg*) {
-#ifdef BNSQL_PLUGIN_BUILD
-    // In plugin builds, attempt to get UI context from Binary Ninja
-    // UIContext may not always be available (headless, background threads)
-    ctx.result_null();
-#else
-    // CLI/headless builds: no UI context available
-    ctx.result_null();
-#endif
+    auto& provider = ui_context_provider_slot();
+    if (provider) {
+        std::string json = provider();
+        if (!json.empty()) { ctx.result_text(json); return; }
+    }
+    // No live provider (CLI/headless, or capture yielded nothing) — return a
+    // stable unavailable envelope rather than NULL.
+    ctx.result_text(ui_context_unavailable_json("cli"));
+}
+
+// ============================================================================
+// Python execution (bnsql_python / bnsql_python_file)
+// ============================================================================
+
+// Off by default (arbitrary code exec) — enable with
+// UPDATE runtime_settings SET value='1' WHERE key='enable_python'. Mirrors
+// idasql's idapython gate.
+static bool ensure_python_enabled(xsql::FunctionContext& ctx) {
+    if (runtime_settings().python_enabled()) return true;
+    ctx.result_error("python is disabled (enable via UPDATE runtime_settings SET value='1' WHERE key='enable_python')");
+    return false;
+}
+
+static void sql_bnsql_python(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    if (argc < 1 || argc > 2) {
+        ctx.result_error("bnsql_python requires 1-2 arguments (code, [sandbox])");
+        return;
+    }
+    if (!ensure_python_enabled(ctx)) return;
+    const std::string code = argv[0].as_text();
+    const std::string sandbox = (argc == 2) ? argv[1].as_text() : std::string();
+    auto r = python::execute_snippet(code, sandbox, runtime_settings().python_output_max());
+    if (r.success) ctx.result_text(r.output);
+    else ctx.result_error(r.error.empty() ? "python execution failed" : r.error);
+}
+
+static void sql_bnsql_python_file(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+    if (argc < 1 || argc > 2) {
+        ctx.result_error("bnsql_python_file requires 1-2 arguments (path, [sandbox])");
+        return;
+    }
+    if (!ensure_python_enabled(ctx)) return;
+    const std::string path = argv[0].as_text();
+    const std::string sandbox = (argc == 2) ? argv[1].as_text() : std::string();
+    auto r = python::execute_file(path, sandbox, runtime_settings().python_output_max());
+    if (r.success) ctx.result_text(r.output);
+    else ctx.result_error(r.error.empty() ? "python execution failed" : r.error);
 }
 
 // ============================================================================
 // Registration
 // ============================================================================
 
-inline bool register_sql_functions(xsql::Database& db) {
+bool register_sql_functions(xsql::Database& db) {
     // Disassembly
     db.register_function("disasm", 1, xsql::ScalarFn(sql_disasm));
     db.register_function("disasm", 2, xsql::ScalarFn(sql_disasm));
 
     // Bytes — bulk reads go through the `bytes` virtual table with hidden
-    // `start_address` + `n` input columns: SELECT hex(blob_concat(value))
-    // FROM bytes WHERE start_address = X AND n = N ORDER BY address; (or
+    // `start_addr` + `n` input columns: SELECT hex(blob_concat(value))
+    // FROM bytes WHERE start_addr = X AND n = N ORDER BY addr; (or
     // blob_concat(value) for BLOB). Byte patching uses the existing
     // `patches` table.
 
@@ -1052,8 +1134,15 @@ inline bool register_sql_functions(xsql::Database& db) {
     db.register_function("entities_search", 2, xsql::ScalarFn(sql_entities_search));
     db.register_function("entities_search", 3, xsql::ScalarFn(sql_entities_search));
 
-    // UI context (plugin-only, returns NULL in CLI/headless)
+    // UI context — live capture in the GUI plugin; a stable {available:false}
+    // envelope (never NULL) in CLI/headless so the schema parses everywhere.
     db.register_function("get_ui_context_json", 0, xsql::ScalarFn(sql_get_ui_context_json));
+
+    // Python execution (gated by the enable_python runtime setting)
+    db.register_function("bnsql_python", 1, xsql::ScalarFn(sql_bnsql_python));
+    db.register_function("bnsql_python", 2, xsql::ScalarFn(sql_bnsql_python));
+    db.register_function("bnsql_python_file", 1, xsql::ScalarFn(sql_bnsql_python_file));
+    db.register_function("bnsql_python_file", 2, xsql::ScalarFn(sql_bnsql_python_file));
 
     return true;
 }

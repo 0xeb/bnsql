@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * database.hpp - BNSQL API
@@ -26,6 +25,7 @@
 #pragma once
 
 #include <xsql/database.hpp>
+#include <xsql/runtime_settings.hpp>
 #include <string>
 #include <vector>
 #include <functional>
@@ -34,13 +34,10 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 
 #include "binaryninjaapi.h"
-#include <bnsql/entities.hpp>
-#include <bnsql/functions.hpp>
-#include <bnsql/decompiler.hpp>
-#include <bnsql/types.hpp>
-#include <bnsql/search_bytes.hpp>
+#include <bnsql/fwd.hpp>
 #include <bnsql/runtime_settings.hpp>
 
 namespace bnsql {
@@ -126,27 +123,22 @@ struct QueryResult {
  * Example:
  *   Ref<BinaryView> bv = ...;
  *   bnsql::QueryEngine qe(bv);
- *   auto result = qe.query("SELECT name, address FROM funcs LIMIT 10");
+ *   auto result = qe.query("SELECT name, addr FROM funcs LIMIT 10");
  *   for (const auto& row : result) {
  *       LogInfo("%s: %s", row[0].c_str(), row[1].c_str());
  *   }
  */
 class QueryEngine {
 public:
-    explicit QueryEngine(Ref<BinaryView> bv) : bv_(bv) {
-        init();
-    }
+    explicit QueryEngine(Ref<BinaryView> bv);
 
-    ~QueryEngine() {
-        // Restore previous context if we changed it
-        if (context_ && entities::g_context == context_.get()) {
-            entities::set_context(nullptr);
-        }
-    }
+    // Out-of-line: the registry members are unique_ptr to types that are only
+    // complete inside database.cpp (where the per-table/registry headers live).
+    ~QueryEngine();
 
-    // Moveable but not copyable
-    QueryEngine(QueryEngine&&) noexcept = default;
-    QueryEngine& operator=(QueryEngine&&) noexcept = default;
+    // Moveable but not copyable (defaulted out-of-line for the same reason).
+    QueryEngine(QueryEngine&&) noexcept;
+    QueryEngine& operator=(QueryEngine&&) noexcept;
     QueryEngine(const QueryEngine&) = delete;
     QueryEngine& operator=(const QueryEngine&) = delete;
 
@@ -171,7 +163,7 @@ public:
         }
 
         // Set context for this query
-        entities::set_context(context_.get());
+        core::set_context(context_.get());
 
         // Configure timeout via libxsql's QueryOptions (libxsql installs a
         // progress handler internally and surfaces timed_out in the Result).
@@ -182,11 +174,12 @@ public:
 
         // Translate xsql::Result -> bnsql::QueryResult. xsql::Row already
         // holds std::vector<std::string> values, same shape as bnsql::Row.
-        result.columns = raw.columns;
+        // `raw` is dead after this block, so move instead of copying cells.
+        result.columns = std::move(raw.columns);
         result.rows.reserve(raw.rows.size());
-        for (const auto& xr : raw.rows) {
+        for (auto& xr : raw.rows) {
             Row row;
-            row.values = xr.values;
+            row.values = std::move(xr.values);
             result.rows.push_back(std::move(row));
         }
         result.elapsed_ms = static_cast<double>(raw.elapsed_ms);
@@ -215,7 +208,7 @@ public:
             error_ = "QueryEngine not initialized";
             return false;
         }
-        entities::set_context(context_.get());
+        core::set_context(context_.get());
         xsql::Status rc = db_.exec(sql);
         if (rc != xsql::Status::ok) {
             error_ = db_.last_error();
@@ -248,63 +241,11 @@ private:
     xsql::Database db_;
     std::string error_;
 
-    std::unique_ptr<entities::BNContext> context_;
-    std::unique_ptr<entities::TableRegistry> entities_;
+    std::unique_ptr<core::BNContext> context_;
+    std::unique_ptr<core::CoreRegistry> core_;
     std::unique_ptr<decompiler::DecompilerTableRegistry> decompiler_;
     std::unique_ptr<types::TypesRegistry> types_;
 
-    // ================================================================
-    // PRAGMA helpers
-    // ================================================================
-
-    static inline std::string trim_copy(const std::string& s) {
-        auto start = s.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) return "";
-        auto end = s.find_last_not_of(" \t\r\n");
-        return s.substr(start, end - start + 1);
-    }
-
-    static inline std::string to_lower_copy(const std::string& s) {
-        std::string out = s;
-        std::transform(out.begin(), out.end(), out.begin(),
-            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return out;
-    }
-
-    static inline std::string strip_optional_quotes(const std::string& s) {
-        if (s.size() >= 2) {
-            char first = s.front(), last = s.back();
-            if ((first == '\'' && last == '\'') || (first == '"' && last == '"')) {
-                return s.substr(1, s.size() - 2);
-            }
-        }
-        return s;
-    }
-
-    static inline bool parse_int_value(const std::string& s, int& out) {
-        try {
-            size_t pos = 0;
-            long val = std::stol(s, &pos);
-            if (pos != s.size()) return false;
-            out = static_cast<int>(val);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    static inline bool parse_bool_value(const std::string& s, bool& out) {
-        std::string lower = to_lower_copy(s);
-        if (lower == "1" || lower == "true" || lower == "on" || lower == "yes") {
-            out = true;
-            return true;
-        }
-        if (lower == "0" || lower == "false" || lower == "off" || lower == "no") {
-            out = false;
-            return true;
-        }
-        return false;
-    }
 
     static inline QueryResult make_pragma_result(const std::string& name, const std::string& value) {
         QueryResult result;
@@ -324,144 +265,61 @@ private:
     }
 
     bool handle_runtime_pragma(const char* sql, QueryResult& out) {
-        if (sql == nullptr) return false;
+        const auto request = xsql::runtime::parse_runtime_pragma(sql, "bnsql");
+        if (!request.matched) return false;
 
-        std::string text = trim_copy(sql);
-        if (text.empty()) return false;
-        if (text.back() == ';') {
-            text.pop_back();
-            text = trim_copy(text);
-        }
-
-        std::string lower = to_lower_copy(text);
-        const std::string pragma_prefix = "pragma";
-        if (lower.rfind(pragma_prefix, 0) != 0) return false;
-
-        std::string body = trim_copy(text.substr(pragma_prefix.size()));
-        std::string body_lower = to_lower_copy(body);
-        const std::string bnsql_prefix = "bnsql.";
-        if (body_lower.rfind(bnsql_prefix, 0) != 0) return false;
-
-        std::string key_expr = trim_copy(body.substr(bnsql_prefix.size()));
-        std::string value_expr;
-        size_t eq_pos = key_expr.find('=');
-        if (eq_pos != std::string::npos) {
-            value_expr = trim_copy(key_expr.substr(eq_pos + 1));
-            key_expr = trim_copy(key_expr.substr(0, eq_pos));
-            value_expr = strip_optional_quotes(value_expr);
-        }
-
-        const std::string key = to_lower_copy(key_expr);
-        auto& settings = runtime_settings();
-
-        if (key == "query_timeout_ms") {
-            if (value_expr.empty()) {
-                out = make_pragma_result("query_timeout_ms",
-                    std::to_string(settings.query_timeout_ms()));
-                return true;
-            }
-            int timeout_ms = 0;
-            if (!parse_int_value(value_expr, timeout_ms) ||
-                !settings.set_query_timeout_ms(timeout_ms)) {
-                out = make_pragma_error("Invalid bnsql.query_timeout_ms value");
-                return true;
-            }
-            out = make_pragma_result("query_timeout_ms",
-                std::to_string(settings.query_timeout_ms()));
+        // Clean break: only the two imperative timeout verbs remain PRAGMAs. Value
+        // settings (the common keys + enable_python / python_output_max) are read
+        // via SELECT and changed via UPDATE runtime_settings.
+        if (request.key == "timeout_push" || request.key == "timeout_pop") {
+            auto& settings = runtime_settings();
+            const auto common = xsql::runtime::handle_common_runtime_pragma(
+                request, "bnsql", settings.common_settings());
+            out = common.success
+                ? make_pragma_result(common.name, common.value)
+                : make_pragma_error(common.error);
             return true;
         }
 
-        if (key == "queue_admission_timeout_ms") {
-            if (value_expr.empty()) {
-                out = make_pragma_result("queue_admission_timeout_ms",
-                    std::to_string(settings.queue_admission_timeout_ms()));
-                return true;
-            }
-            int timeout_ms = 0;
-            if (!parse_int_value(value_expr, timeout_ms) ||
-                !settings.set_queue_admission_timeout_ms(timeout_ms)) {
-                out = make_pragma_error("Invalid bnsql.queue_admission_timeout_ms value");
-                return true;
-            }
-            out = make_pragma_result("queue_admission_timeout_ms",
-                std::to_string(settings.queue_admission_timeout_ms()));
-            return true;
-        }
-
-        if (key == "max_queue") {
-            if (value_expr.empty()) {
-                out = make_pragma_result("max_queue",
-                    std::to_string(settings.max_queue()));
-                return true;
-            }
-            int queue_limit = 0;
-            if (!parse_int_value(value_expr, queue_limit) || queue_limit < 0 ||
-                !settings.set_max_queue(static_cast<size_t>(queue_limit))) {
-                out = make_pragma_error("Invalid bnsql.max_queue value");
-                return true;
-            }
-            out = make_pragma_result("max_queue",
-                std::to_string(settings.max_queue()));
-            return true;
-        }
-
-        if (key == "hints_enabled") {
-            if (value_expr.empty()) {
-                out = make_pragma_result("hints_enabled",
-                    settings.hints_enabled() ? "1" : "0");
-                return true;
-            }
-            bool enabled = false;
-            if (!parse_bool_value(value_expr, enabled)) {
-                out = make_pragma_error("Invalid bnsql.hints_enabled value");
-                return true;
-            }
-            settings.set_hints_enabled(enabled);
-            out = make_pragma_result("hints_enabled",
-                settings.hints_enabled() ? "1" : "0");
-            return true;
-        }
-
-        if (key == "timeout_push") {
-            if (value_expr.empty()) {
-                out = make_pragma_error("bnsql.timeout_push requires a timeout value");
-                return true;
-            }
-            int timeout_ms = 0;
-            if (!parse_int_value(value_expr, timeout_ms)) {
-                out = make_pragma_error("Invalid bnsql.timeout_push value");
-                return true;
-            }
-            int effective_timeout = 0;
-            if (!settings.timeout_push(timeout_ms, &effective_timeout)) {
-                out = make_pragma_error("Invalid bnsql.timeout_push value");
-                return true;
-            }
-            out = make_pragma_result("query_timeout_ms",
-                std::to_string(effective_timeout));
-            return true;
-        }
-
-        if (key == "timeout_pop") {
-            int effective_timeout = 0;
-            if (!settings.timeout_pop(&effective_timeout)) {
-                out = make_pragma_error("bnsql.timeout_pop stack is empty");
-                return true;
-            }
-            out = make_pragma_result("query_timeout_ms",
-                std::to_string(effective_timeout));
-            return true;
-        }
-
-        out = make_pragma_error("Unknown bnsql pragma key");
+        out = make_pragma_error(xsql::runtime::unknown_runtime_pragma_error("bnsql"));
         return true;
+    }
+
+    // True when the active view is backed by an on-disk .bndb, so user mutations
+    // survive a save(). A raw-binary view is not database-backed; see issue #4.
+    bool view_is_database_backed() const {
+        if (!bv_) return false;
+        auto file = bv_->GetFile();
+        return file && file->IsBackedByDatabase();
     }
 
     void append_query_hints(const char* sql, QueryResult& result) const {
         if (!runtime_settings().hints_enabled()) return;
         if (!sql) return;
 
-        const std::string lower = to_lower_copy(sql);
+        const std::string lower = xsql::runtime::to_lower_copy(sql);
+
+        // bnsql issue #4: mutations on a raw-binary-backed view succeed in-memory
+        // but do not persist (and some BN write APIs apply lossily) — unlike a
+        // .bndb-backed view which round-trips. When a write ran successfully on a
+        // view with no on-disk database backing, warn and steer the caller to a
+        // .bndb / explicit save() so a "success" is never mistaken for durable.
+        const bool is_mutation =
+            lower.find("update ") != std::string::npos ||
+            lower.find("insert ") != std::string::npos ||
+            lower.find("delete ") != std::string::npos;
+        if (is_mutation && result.success && !view_is_database_backed()) {
+            const std::string warning =
+                "This session is backed by a raw binary, not a .bndb: mutations "
+                "may not persist (and some writes apply lossily). Open/save a "
+                ".bndb (SELECT save();) for durable, lossless edits.";
+            bool exists = false;
+            for (const auto& w : result.warnings) {
+                if (w == warning) { exists = true; break; }
+            }
+            if (!exists) result.warnings.push_back(warning);
+        }
+
         const bool touches_decompiler_table =
             lower.find("pseudocode") != std::string::npos ||
             lower.find("hlil_vars") != std::string::npos ||
@@ -488,29 +346,9 @@ private:
         }
     }
 
-    void init() {
-        // Create context for this BinaryView
-        context_ = std::make_unique<entities::BNContext>(bv_);
-        entities::set_context(context_.get());
-
-        // Register all virtual tables
-        entities_ = std::make_unique<entities::TableRegistry>();
-        entities_->register_all(db_);
-
-        // Register decompiler tables
-        decompiler_ = std::make_unique<decompiler::DecompilerTableRegistry>();
-        decompiler_->register_all(db_);
-
-        // Register type intelligence tables
-        types_ = std::make_unique<types::TypesRegistry>();
-        types_->register_all(db_);
-
-        // Register SQL functions
-        functions::register_sql_functions(db_);
-
-        // Register search functions
-        search::register_search_bytes(db_);
-    }
+    // Defined out-of-line in database.cpp (constructs + registers every
+    // registry; needs the complete per-table/registry definitions).
+    void init();
 };
 
 // ============================================================================

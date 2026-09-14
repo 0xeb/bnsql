@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #include "mcp_server.hpp"
 
@@ -57,7 +56,7 @@ MCPQueueResult MCPServer::queue_and_wait(MCPPendingCommand::Type type, const std
         return {false, "Error: MCP server stopped"};
     }
 
-    return {true, cmd->result};
+    return {cmd->success, cmd->result};
 }
 
 int MCPServer::start(int port, QueryCallback query_cb,
@@ -179,12 +178,16 @@ void MCPServer::wait() {
         if (cmd) {
             try {
                 if (cmd->type == MCPPendingCommand::Type::Query && query_cb_) {
-                    cmd->result = query_cb_(cmd->input);
+                    MCPQueryOutcome outcome = query_cb_(cmd->input);
+                    cmd->result = std::move(outcome.text);
+                    cmd->success = outcome.success;
                 } else {
                     cmd->result = "Error: No handler for command type";
+                    cmd->success = false;
                 }
             } catch (const std::exception& e) {
                 cmd->result = std::string("Error: ") + e.what();
+                cmd->success = false;
             }
 
             {
@@ -264,7 +267,7 @@ std::string format_mcp_info(
     ss << "  # Execute SQL query\n";
     ss << "  curl -X POST " << url << "/messages \\\n";
     ss << "    -H \"Content-Type: application/json\" \\\n";
-    ss << "    -d '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"sql_query\",\"arguments\":{\"query\":\"SELECT name FROM functions LIMIT 5\"}}}'\n";
+    ss << "    -d '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"sql_query\",\"arguments\":{\"query\":\"SELECT name FROM funcs LIMIT 5\"}}}'\n";
 
     return ss.str();
 }

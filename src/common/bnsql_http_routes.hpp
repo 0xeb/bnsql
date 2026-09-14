@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -17,8 +16,11 @@
 #ifdef BNSQL_HAS_HTTP
 
 #include <bnsql/bnsql.hpp>
+#include <bnsql/num_parse.hpp>
 #include <bnsql/runtime_settings.hpp>
+#include "bnsql_version.hpp"
 #include <httplib.h>
+#include <xsql/json.hpp>
 #include <xsql/thinclient/json_helpers.hpp>
 
 #include <atomic>
@@ -102,34 +104,50 @@ Endpoints:
   POST /shutdown  - Stop server
 
 Tables:
-  funcs          - Functions (address, name, prototype, size, comment)
-  strings        - String literals (address, content, length)
-  imports        - Imported functions (address, name, module)
-  xrefs          - Cross-references (from_ea, to_ea, is_code)
-  segments       - Memory segments (start_ea, end_ea, name, perm)
-  blocks         - Basic blocks (func_ea, start_ea, end_ea)
-  instructions   - Instructions (address, func_addr, mnemonic, disasm)
-  instruction_operands - Token-level operand metadata (func_addr, insn_addr, operand_index, ...)
+  funcs          - Functions (addr, name, prototype, size, comment)
+  strings        - String literals (addr, content, length)
+  imports        - Imported functions (addr, name, module)
+  xrefs          - Cross-references (from_addr, to_addr, is_code)
+  segments       - Memory segments (start_addr, end_addr, name, class, perm) [writable: INSERT/DELETE/UPDATE]
+  blocks         - Basic blocks (func_addr, start_addr, end_addr)
+  cfg_edges      - Control-flow edges (func_addr, from_addr, to_addr, edge_type)
+  switch_tables  - Reconstructed switch metadata
+  function_frames - Per-function stack-frame summaries
+  data_items     - Defined data variables and best-effort values
+  dominators     - Dominator-tree nodes
+  post_dominators - Post-dominator-tree nodes
+  loops          - Natural-loop summaries
+  instructions   - Instructions (addr, func_addr, mnemonic, disasm)
+  instruction_operands - One row per disassembly operand (addr, func_addr, operand_index, ...)
+  bytes          - Memory bytes
+  byte_search    - Pattern search (requires hidden pattern input)
   comments       - Address comments
+  bookmarks      - Binary Ninja user-data tags [read-write]
   names          - Named locations
   entries        - Entry points and exports
-  db_info        - Database metadata
+  binary         - Database metadata
   entities       - Unified discovery (functions/symbols/segments/imports/strings/types)
   capabilities   - Runtime feature/capability matrix
-  pseudocode     - Decompiled code lines (func_addr, line_num, line, ea, comment)
+  pseudocode     - Decompiled code lines (func_addr, line_num, line, addr, comment)
   hlil_vars      - HLIL variables (name/type writable, filter by func_addr!)
   hlil_calls     - HLIL function calls (filter by func_addr!)
+  mlil           - Six-rung LLIL/MLIL/HLIL operation stream (filter by func_addr!)
+  mlil_operands  - Value operands for mlil rows (filter by func_addr!)
   types          - Defined types (id, name, kind, size, is_struct, is_enum, ...)
   type_members   - Struct/union member fields (type_id, member_name, offset, type)
   type_enum_values - Enum constant values (type_id, value_name, value)
   func_signatures  - Function parameter/return types (func_addr, arg_index, arg_type)
-  patches        - Patched bytes (address, original_byte, patched_byte, status) [read-write]
+  patches        - Patched bytes (addr, original_byte, patched_byte, status) [read-write]
 
 Views:
-  disasm_calls     - Call sites with callee info (func_addr, ea, callee_name)
+  disasm_calls     - Call sites with callee info (func_addr, addr, callee_name)
   function_chunks  - Function address ranges (func_addr, chunk_start, chunk_end)
   types_v_structs  - Struct types only
   types_v_enums    - Enum types only
+  ir_ops            - Canonical low-level IR operations
+  ir_operands       - Canonical IR value operands
+  ir_maturities     - Discover the six Binary Ninja IL rungs
+  ir_v_calls / ir_v_mem_reads / ir_v_mem_writes / ir_v_branches / ir_v_arith
 
 SQL Functions:
   hex(addr)           - Format address as hex
@@ -140,29 +158,31 @@ SQL Functions:
   xrefs_from(addr)    - JSON array of xrefs from address
   entities_search(p,l,o) - JSON entity discovery (pattern/limit/offset)
 
-Runtime Controls (PRAGMA):
-  PRAGMA bnsql.query_timeout_ms          - Get/set query timeout (0=disabled, max 3600000)
-  PRAGMA bnsql.queue_admission_timeout_ms - Get/set HTTP queue wait timeout
-  PRAGMA bnsql.max_queue                 - Get/set max queued HTTP requests (0=unbounded)
-  PRAGMA bnsql.hints_enabled             - Get/set query hint warnings (1/0)
+Runtime Controls (runtime_settings table — read via SELECT, change via UPDATE):
+  UPDATE runtime_settings SET value='<v>' WHERE key='query_timeout_ms'          - query timeout (0=disabled, max 3600000)
+  UPDATE runtime_settings SET value='<v>' WHERE key='queue_admission_timeout_ms' - HTTP queue wait timeout
+  UPDATE runtime_settings SET value='<v>' WHERE key='max_queue'                 - max queued HTTP requests (0=unbounded)
+  UPDATE runtime_settings SET value='<v>' WHERE key='hints_enabled'             - query hint warnings (1/0)
+  SELECT value FROM runtime_settings WHERE key='<key>'                          - read a runtime value
   PRAGMA bnsql.timeout_push = <ms>       - Push timeout onto stack
   PRAGMA bnsql.timeout_pop               - Pop timeout from stack
 
 Writable Columns:
   funcs.name / funcs.prototype / funcs.comment
   names.name
+  segments.start_addr (rebase) / segments.end_addr (resize) / segments.perm (INSERT/DELETE supported)
   pseudocode.comment / pseudocode.comment_placement
   hlil_vars.name / hlil_vars.type / hlil_vars.comment
   patches.patched_byte (INSERT/DELETE supported)
 
 Example Queries:
-  SELECT name, hex(address), size FROM funcs ORDER BY size DESC LIMIT 10;
+  SELECT name, hex(addr), size FROM funcs ORDER BY size DESC LIMIT 10;
   SELECT content FROM strings WHERE content LIKE '%password%';
   SELECT module, COUNT(*) FROM imports GROUP BY module;
   SELECT name, kind FROM entities WHERE name LIKE '%main%' LIMIT 20;
   SELECT entities_search('DName', 20, 0);
-  SELECT decompile(address) FROM funcs WHERE name = 'main';
-  PRAGMA bnsql.query_timeout_ms = 5000;
+  SELECT decompile(addr) FROM funcs WHERE name = 'main';
+  UPDATE runtime_settings SET value='5000' WHERE key='query_timeout_ms';
 
 Response Format (canonical script envelope, single = array of one):
   {
@@ -196,7 +216,7 @@ Example:
 )";
 }
 
-// Build JSON from RuntimeSettingsSnapshot
+// Build JSON from the shared snapshot plus bnsql's live tool-specific settings.
 inline std::string settings_to_json(const RuntimeSettingsSnapshot& snap) {
     std::ostringstream json;
     json << "{"
@@ -205,8 +225,40 @@ inline std::string settings_to_json(const RuntimeSettingsSnapshot& snap) {
          << ",\"max_queue\":" << snap.max_queue
          << ",\"hints_enabled\":" << (snap.hints_enabled ? "true" : "false")
          << ",\"timeout_stack_depth\":" << snap.timeout_stack_depth
+         << ",\"enable_python\":"
+         << (runtime_settings().python_enabled() ? "true" : "false")
+         // enable_python is the GATE; python_available is whether execution can
+         // actually happen. They are independent: the gate can be on while the
+         // provider is missing (e.g. a copied binaryninjacore.dll beside the
+         // executable splitting the provider registry). Reporting only the gate
+         // forced a client to run a probe snippet and parse the error to find out.
+         << ",\"python_available\":"
+         << (python_provider_available() ? "true" : "false")
+         << ",\"python_output_max\":"
+         << runtime_settings().python_output_max()
          << "}";
     return json.str();
+}
+
+// Build the /status extra-fields object: tool name, function count, and the
+// full runtime-settings snapshot. Shared by the CLI --http, the REPL `.http`
+// server, and the plugin server so /status is identical on all three (the
+// non-CLI servers previously dropped `functions` and `settings`). `func_count`
+// is pre-queried and cached by the caller — status_fn runs on a worker thread
+// where touching the non-concurrency-safe engine would race /query — and is
+// reported as null when the string is empty.
+inline xsql::json status_extra_json(const std::string& func_count) {
+    xsql::json j;
+    j["tool"] = "bnsql";
+    j["tool_version"] = BNSQL_VERSION_STRING;
+    // func_count is normally a clean COUNT(*) string, but parse defensively:
+    // a non-numeric/overflowing value must not throw out of /status. Report null
+    // rather than 500 the whole endpoint (parse_strict_ll never throws).
+    long long n = 0;
+    j["functions"] = bnsql::parse_strict_ll(func_count, n) ? xsql::json(n)
+                                                           : xsql::json(nullptr);
+    j["settings"] = xsql::json::parse(settings_to_json(runtime_settings().snapshot()));
+    return j;
 }
 
 

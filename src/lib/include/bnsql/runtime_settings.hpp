@@ -1,142 +1,152 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
+#include <xsql/runtime_settings.hpp>
+
+#include <atomic>
 #include <cstddef>
-#include <mutex>
+#include <limits>
+#include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace bnsql {
 
-struct RuntimeSettingsSnapshot {
-    int query_timeout_ms = 60000;
-    int queue_admission_timeout_ms = 120000;
-    size_t max_queue = 64;
-    bool hints_enabled = true;
-    size_t timeout_stack_depth = 0;
+// bnsql adds no snapshot fields beyond the shared core, so the snapshot IS the
+// core snapshot (inherited RuntimeSettingsCore::snapshot()).
+using RuntimeSettingsSnapshot = xsql::runtime::RuntimeSettingsSnapshot;
+
+namespace detail {
+
+// libxsql's registry-backed runtime settings replace the former virtual
+// enumerate/apply extension points. bnsql is also built standalone by fetching
+// public libxsql main, so keep source compatibility across that transition:
+// the old backend overrides the virtual hooks, while the new backend registers
+// the product keys directly in RuntimeSettingsCore.
+template <typename Core, typename = void>
+struct has_runtime_setting_registry : std::false_type {};
+
+template <typename Core>
+struct has_runtime_setting_registry<
+    Core,
+    std::void_t<decltype(std::declval<Core&>().register_bool_setting(
+        std::declval<const std::string&>(), false,
+        std::declval<const std::string&>()))>> : std::true_type {};
+
+template <typename Core, bool HasRegistry = has_runtime_setting_registry<Core>::value>
+class RuntimeSettingsBackend;
+
+template <typename Core>
+class RuntimeSettingsBackend<Core, false> : public Core {
+public:
+    RuntimeSettingsBackend()
+        : Core(xsql::runtime::RuntimeSettingsCoreOptions{64}) {}
+
+    bool python_enabled() const { return python_enabled_.load(); }
+    void set_python_enabled(bool value) { python_enabled_.store(value); }
+    size_t python_output_max() const { return python_output_max_.load(); }
+    void set_python_output_max(size_t value) {
+        python_output_max_.store(value);
+    }
+
+    std::vector<xsql::runtime::RuntimeSettingEntry> enumerate() const override {
+        auto rows = Core::enumerate();
+        rows.push_back({"enable_python",
+                        python_enabled() ? "1" : "0", "bool", "bnsql"});
+        rows.push_back({"python_output_max",
+                        std::to_string(python_output_max()), "int", "bnsql"});
+        return rows;
+    }
+
+    xsql::runtime::RuntimePragmaReply apply(
+            const std::string& key, const std::string& value,
+            const std::string& prefix) override {
+        if (key == "enable_python") {
+            bool enabled = false;
+            if (!xsql::runtime::parse_bool_value(value, enabled)) {
+                return xsql::runtime::pragma_error(
+                    "runtime_settings: invalid value for enable_python "
+                    "(expected a boolean)");
+            }
+            set_python_enabled(enabled);
+            return xsql::runtime::pragma_result(
+                "enable_python", python_enabled() ? "1" : "0");
+        }
+        if (key == "python_output_max") {
+            int n = 0;
+            if (!xsql::runtime::parse_int_value(value, n) || n < 0) {
+                return xsql::runtime::pragma_error(
+                    "runtime_settings: invalid value for python_output_max "
+                    "(bytes; 0 = unbounded)");
+            }
+            set_python_output_max(static_cast<size_t>(n));
+            return xsql::runtime::pragma_result(
+                "python_output_max", std::to_string(python_output_max()));
+        }
+        return Core::apply(key, value, prefix);
+    }
+
+private:
+    std::atomic<bool> python_enabled_{false};
+    std::atomic<size_t> python_output_max_{0};
 };
 
-class RuntimeSettings {
+template <typename Core>
+class RuntimeSettingsBackend<Core, true> : public Core {
+public:
+    RuntimeSettingsBackend()
+        : Core(xsql::runtime::RuntimeSettingsCoreOptions{64}) {
+        (void)this->register_bool_setting(
+            "enable_python", false, "bnsql");
+        (void)this->register_integer_setting(
+            "python_output_max", 0, 0,
+            (std::numeric_limits<int>::max)(), "bnsql");
+    }
+
+    bool python_enabled() const {
+        return this->bool_value("enable_python", false);
+    }
+    void set_python_enabled(bool value) {
+        (void)this->apply("enable_python", value ? "1" : "0", "bnsql");
+    }
+    size_t python_output_max() const {
+        return static_cast<size_t>(
+            this->integer_value("python_output_max", 0));
+    }
+    void set_python_output_max(size_t value) {
+        (void)this->apply(
+            "python_output_max", std::to_string(value), "bnsql");
+    }
+};
+
+}  // namespace detail
+
+// bnsql's runtime-settings singleton IS-A shared RuntimeSettingsCore (common keys +
+// validated setters + timeout stack for free), plus the two bnsql-only Python knobs.
+// The shared writable `runtime_settings` table
+// (xsql::runtime::define_runtime_settings_table) drives both.
+class RuntimeSettings
+    : public detail::RuntimeSettingsBackend<
+          xsql::runtime::RuntimeSettingsCore> {
 public:
     static RuntimeSettings& instance() {
         static RuntimeSettings settings;
         return settings;
     }
 
-    RuntimeSettingsSnapshot snapshot() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        RuntimeSettingsSnapshot snap;
-        snap.query_timeout_ms = query_timeout_ms_;
-        snap.queue_admission_timeout_ms = queue_admission_timeout_ms_;
-        snap.max_queue = max_queue_;
-        snap.hints_enabled = hints_enabled_;
-        snap.timeout_stack_depth = timeout_stack_.size();
-        return snap;
-    }
-
-    int query_timeout_ms() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return query_timeout_ms_;
-    }
-
-    int queue_admission_timeout_ms() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_admission_timeout_ms_;
-    }
-
-    size_t max_queue() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return max_queue_;
-    }
-
-    bool hints_enabled() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return hints_enabled_;
-    }
-
-    bool set_query_timeout_ms(int value) {
-        if (!is_valid_timeout(value)) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        query_timeout_ms_ = value;
-        return true;
-    }
-
-    bool set_queue_admission_timeout_ms(int value) {
-        if (!is_valid_timeout(value)) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_admission_timeout_ms_ = value;
-        return true;
-    }
-
-    bool set_max_queue(size_t value) {
-        // 0 means "unbounded".
-        if (value > kMaxQueueLimit) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        max_queue_ = value;
-        return true;
-    }
-
-    void set_hints_enabled(bool enabled) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        hints_enabled_ = enabled;
-    }
-
-    bool timeout_push(int timeout_ms, int* effective_timeout_ms = nullptr) {
-        if (!is_valid_timeout(timeout_ms)) {
-            return false;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (timeout_stack_.size() >= 64) {
-            return false;
-        }
-        timeout_stack_.push_back(query_timeout_ms_);
-        query_timeout_ms_ = timeout_ms;
-        if (effective_timeout_ms != nullptr) {
-            *effective_timeout_ms = query_timeout_ms_;
-        }
-        return true;
-    }
-
-    bool timeout_pop(int* effective_timeout_ms = nullptr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (timeout_stack_.empty()) {
-            return false;
-        }
-        query_timeout_ms_ = timeout_stack_.back();
-        timeout_stack_.pop_back();
-        if (effective_timeout_ms != nullptr) {
-            *effective_timeout_ms = query_timeout_ms_;
-        }
-        return true;
-    }
+    // The object IS the core; kept so callers passing a RuntimeSettingsCore& are
+    // unchanged.
+    xsql::runtime::RuntimeSettingsCore& common_settings() { return *this; }
+    const xsql::runtime::RuntimeSettingsCore& common_settings() const { return *this; }
 
 private:
-    static constexpr int kMaxTimeoutMs = 3600 * 1000;  // 1 hour
-    static constexpr size_t kMaxQueueLimit = 10000;
-
-    static bool is_valid_timeout(int value) {
-        return value >= 0 && value <= kMaxTimeoutMs;
-    }
-
     RuntimeSettings() = default;
-
-    mutable std::mutex mutex_;
-    int query_timeout_ms_ = 60000;
-    int queue_admission_timeout_ms_ = 120000;
-    size_t max_queue_ = 64;
-    bool hints_enabled_ = true;
-    std::vector<int> timeout_stack_;
 };
 
 inline RuntimeSettings& runtime_settings() {

@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * bnsql/bnsql.hpp - Master include for bnsql
@@ -22,27 +21,28 @@
  *
  *   void my_plugin(Ref<BinaryView> bv) {
  *       bnsql::QueryEngine qe(bv);
- *       auto result = qe.query("SELECT name, address FROM funcs LIMIT 10");
+ *       auto result = qe.query("SELECT name, addr FROM funcs LIMIT 10");
  *       for (const auto& row : result) {
  *           LogInfo("%s: %s", row[0].c_str(), row[1].c_str());
  *       }
  *   }
  *
  * Table compatibility with idasql:
- *   - funcs: Functions (address, name, size, end_ea, flags)
- *   - segments: Memory segments (start_ea, end_ea, name, class, perm)
- *   - names: Symbols (address, name, is_public, is_weak)
- *   - entries: Entry points (ordinal, address, name)
- *   - imports: Imports (address, name, ordinal, module, module_idx)
- *   - strings: Strings (address, length, type, type_name, content)
- *   - xrefs: Cross-references (from_ea, to_ea, type, is_code)
- *   - blocks: Basic blocks (func_ea, start_ea, end_ea, size)
- *   - instructions: Instructions (address, mnemonic, operands, disasm, func_addr)
- *   - db_info: Binary metadata (key, value, type)
+ *   - funcs: Functions (addr, name, size, end_addr, flags)
+ *   - segments: Memory segments (start_addr, end_addr, name, class, perm)
+ *   - names: Symbols (addr, name, is_public, is_weak)
+ *   - entries: Entry points / exports (ordinal, addr, name)
+ *   - imports: Imports (addr, name, ordinal, module, module_idx)
+ *   - strings: Strings (addr, length, type, type_name, content)
+ *   - xrefs: Cross-references (from_addr, to_addr, type, is_code)
+ *   - blocks: Basic blocks (func_addr, start_addr, end_addr, size)
+ *   - cfg_edges: Control-flow edges (func_addr, from_addr, to_addr, edge_type)
+ *   - instructions: Instructions (addr, mnemonic, operands, disasm, func_addr)
+ *   - binary: Binary metadata (key, value, type)
  *
  * Decompiler tables (HLIL):
  *   - pseudocode: Line-by-line decompiled output (func_addr, line_num, line, indent)
- *   - hlil: HLIL AST nodes (func_addr, expr_id, op_name, ea, parent_id, depth, ...)
+ *   - hlil: HLIL AST nodes (func_addr, expr_id, op_name, addr, parent_id, depth, ...)
  *   - hlil_vars: Local variables (func_addr, var_idx, name, type, is_arg, storage, ...)
  *   - hlil_calls: Function calls with args (func_addr, callee_name, arg_idx, arg_const, ...)
  *
@@ -51,7 +51,7 @@
  *   - type_members: Struct/union member fields (type_id, member_name, offset, member_type)
  *   - type_enum_values: Enum constant values (type_id, value_name, value)
  *   - func_signatures: Function parameter/return types (func_addr, arg_index, arg_type)
- *   - patches: Patched bytes (address, original_byte, patched_byte, status)
+ *   - patches: Patched bytes (addr, original_byte, patched_byte, status)
  *
  * Decompiler views:
  *   - hlil_v_calls: All function calls
@@ -79,9 +79,24 @@
 
 #pragma once
 
+// Public engine surface. The table/UDF definitions are compiled into the bnsql
+// library; consumers only need the QueryEngine API (database.hpp) and the vtable
+// re-exports. (entities/functions/decompiler/types headers are now private to
+// the library under src/lib/src/.)
 #include "vtable.hpp"
-#include "entities.hpp"
-#include "functions.hpp"
-#include "decompiler.hpp"
-#include "types.hpp"
 #include "database.hpp"
+
+namespace bnsql {
+
+// True when a Binary Ninja Python ScriptingProvider is registered in THIS process,
+// i.e. bnsql_python() can actually execute.
+//
+// Deliberately distinct from the enable_python runtime setting. The gate being on
+// does not mean execution will work: the provider registers during InitPlugins()
+// (headless included) but a process holding a second binaryninjacore.dll copy
+// never sees it (split registry). Exposed publicly so /status and other callers
+// can answer "can I use Python here?" without executing a probe snippet and
+// parsing the error.
+bool python_provider_available();
+
+}  // namespace bnsql

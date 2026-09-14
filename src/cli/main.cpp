@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * main.cpp - BNSQL command-line SQL interface to Binary Ninja databases
@@ -32,6 +31,7 @@
 #include <bnsql/config.hpp>
 #include "binaryninjaapi.h"
 
+#include "bnsql_version.hpp"
 #include "bnsql_commands.hpp"
 
 #ifdef BNSQL_HAS_MCP
@@ -39,7 +39,6 @@
 #endif
 
 #ifdef BNSQL_HAS_HTTP
-#include <xsql/thinclient/server.hpp>
 #include <xsql/thinclient/http_query_server.hpp>
 #include "bnsql_http_routes.hpp"
 #endif
@@ -62,7 +61,8 @@
 using namespace BinaryNinja;
 namespace fs = std::filesystem;
 
-static const char* g_version = "0.0.11";
+static const char* g_version = BNSQL_VERSION_STRING;
+static const char* g_copyright = BNSQL_COPYRIGHT_STRING;
 
 // ============================================================================
 // Utilities
@@ -152,10 +152,47 @@ static void quit_signal_handler(int) {
 static xsql::thinclient::http_query_server* g_http_server = nullptr;
 static std::unique_ptr<xsql::thinclient::http_query_server> g_repl_http_server;
 
+// Set by the SIGINT/SIGBREAK handler. The handler must do nothing but set this
+// flag: calling http_query_server::stop() from signal context can self-deadlock
+// (stop() -> drain_pending_commands() locks queue_mutex_, which the interrupted
+// main thread may already hold in process_one_command_internal), and locking a
+// std::mutex in a signal handler is not async-signal-safe. run_until_stopped()
+// polls this via set_interrupt_check() and stops from the main thread instead.
+static volatile std::sig_atomic_t g_http_interrupt = 0;
+
 static void http_signal_handler(int) {
-    if (g_http_server) {
-        g_http_server->stop();
+    g_http_interrupt = 1;
+}
+
+// Build the single-statement executor that fills a ScriptStatementResult from
+// the BN QueryEngine. Shared by the CLI --http server, the REPL `.http` server,
+// and the plugin server so the three cannot drift.
+static xsql::thinclient::http_query_server_config::statement_executor_t
+make_statement_executor(bnsql::QueryEngine& qe) {
+    return [&qe](const std::string& stmt, xsql::ScriptStatementResult& out) {
+        auto r = qe.query(stmt);
+        out.columns = std::move(r.columns);
+        out.rows.reserve(r.rows.size());
+        for (auto& row : r.rows) out.rows.push_back(std::move(row.values));
+        out.elapsed_ms = r.elapsed_ms;
+        out.success = r.success;
+        out.error = std::move(r.error);
+    };
+}
+
+// Build the /status extra-fields callback: tool name, cached function count, and
+// the full runtime settings snapshot. The function count is queried once now (on
+// the calling thread, before the server serves) and cached, because status_fn
+// runs on a worker thread where touching the non-concurrency-safe engine would
+// race /query. Shared by all three servers so /status is uniform everywhere.
+static xsql::thinclient::http_query_server_config::status_fn_t
+make_status_fn(bnsql::QueryEngine& qe) {
+    std::string func_count;
+    {
+        auto r = qe.query("SELECT COUNT(*) FROM funcs");
+        if (r.success && !r.empty()) func_count = r.rows[0][0];
     }
+    return [func_count]() { return bnsql::status_extra_json(func_count); };
 }
 
 // Wire HTTP callbacks for .http REPL command
@@ -171,18 +208,18 @@ static void setup_http_callbacks(bnsql::CommandCallbacks& callbacks, bnsql::Quer
         cfg.port = 0;  // Random port
         cfg.bind_address = "127.0.0.1";
         // Background server (no main-thread queue), so serialize requests:
-        // BN's QueryEngine is not concurrency-safe.
+        // BN's QueryEngine is not concurrency-safe. The serialize path now honors
+        // the same admission limits as the queue path (503/408), so wire the
+        // runtime-settings callbacks just like run_http_mode.
         cfg.use_queue = false;
         cfg.serialize_requests = true;
-        cfg.statement_executor = [&qe](const std::string& stmt, xsql::ScriptStatementResult& out) {
-            auto r = qe.query(stmt);
-            out.columns = r.columns;
-            out.rows.reserve(r.rows.size());
-            for (const auto& row : r.rows) out.rows.push_back(row.values);
-            out.elapsed_ms = r.elapsed_ms;
-            out.success = r.success;
-            out.error = r.error;
+        cfg.queue_admission_timeout_ms_fn = []() {
+            return bnsql::runtime_settings().queue_admission_timeout_ms();
         };
+        cfg.max_queue_fn = []() { return bnsql::runtime_settings().max_queue(); };
+        cfg.statement_executor = make_statement_executor(qe);
+        cfg.status_fn = make_status_fn(qe);
+        cfg.status_requires_auth = true;
         cfg.extra_routes = [](httplib::Server& svr) {
             svr.Get("/settings", [](const httplib::Request&, httplib::Response& res) {
                 res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
@@ -226,11 +263,17 @@ static void setup_http_callbacks(bnsql::CommandCallbacks& callbacks, bnsql::Quer
 }
 
 static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bind_addr, const std::string& auth_token) {
-    if (!bind_addr.empty() && bind_addr != "127.0.0.1" && bind_addr != "localhost"
-        && auth_token.empty()) {
-        std::cerr << "WARNING: Binding to non-loopback address " << bind_addr << "\n";
-        std::cerr << "WARNING: No authentication token set. Server is accessible without authentication.\n";
-        std::cerr << "         Consider using --token <secret> for remote access.\n";
+    // Always announce a non-loopback bind; only the no-auth exposure warning is
+    // gated on the token being absent. (Previously the whole notice was gated on
+    // auth_token.empty(), so a non-loopback bind WITH a token printed nothing.)
+    const bool non_loopback = !bind_addr.empty() && bind_addr != "127.0.0.1"
+                           && bind_addr != "localhost";
+    if (non_loopback) {
+        std::cerr << "NOTICE: Binding to non-loopback address " << bind_addr << "\n";
+        if (auth_token.empty()) {
+            std::cerr << "WARNING: No authentication token set. Server is accessible without authentication.\n";
+            std::cerr << "         Consider using --token <secret> for remote access.\n";
+        }
     }
 
     xsql::thinclient::http_query_server_config cfg;
@@ -246,32 +289,9 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
         return bnsql::runtime_settings().queue_admission_timeout_ms();
     };
     cfg.max_queue_fn = []() { return bnsql::runtime_settings().max_queue(); };
-    cfg.statement_executor = [&qe](const std::string& stmt, xsql::ScriptStatementResult& out) {
-        auto r = qe.query(stmt);
-        out.columns = r.columns;
-        out.rows.reserve(r.rows.size());
-        for (const auto& row : r.rows) out.rows.push_back(row.values);
-        out.elapsed_ms = r.elapsed_ms;
-        out.success = r.success;
-        out.error = r.error;
-    };
-
-    // Function count is static after load; query once (main thread) and report
-    // the cached value from status_fn (which runs off the main thread).
-    std::string func_count;
-    {
-        auto r = qe.query("SELECT COUNT(*) FROM funcs");
-        if (r.success && !r.empty()) func_count = r.rows[0][0];
-    }
-    cfg.status_fn = [func_count]() -> xsql::json {
-        xsql::json j;
-        j["tool"] = "bnsql";
-        j["functions"] = func_count.empty() ? xsql::json(nullptr)
-                                            : xsql::json(std::stoll(func_count));
-        j["settings"] = xsql::json::parse(
-            bnsql::settings_to_json(bnsql::runtime_settings().snapshot()));
-        return j;
-    };
+    cfg.statement_executor = make_statement_executor(qe);
+    cfg.status_fn = make_status_fn(qe);
+    cfg.status_requires_auth = true;
     // Preserve bnsql's auth-gated GET /settings (thinclient extra routes are raw).
     cfg.extra_routes = [auth_token](httplib::Server& svr) {
         svr.Get("/settings", [auth_token](const httplib::Request& req, httplib::Response& res) {
@@ -296,9 +316,14 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
     auto server = std::make_unique<xsql::thinclient::http_query_server>(cfg);
     g_http_server = server.get();
 
+    // Signal-safe shutdown: the handler only sets g_http_interrupt; the main
+    // thread's run_until_stopped() loop polls it and calls stop() itself.
+    g_http_interrupt = 0;
+    server->set_interrupt_check([]() { return g_http_interrupt != 0; });
+
     auto old_handler = std::signal(SIGINT, http_signal_handler);
 #ifdef _WIN32
-    std::signal(SIGBREAK, http_signal_handler);
+    auto old_break_handler = std::signal(SIGBREAK, http_signal_handler);
 #endif
 
     int actual_port = server->start();
@@ -319,6 +344,9 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
     server->stop();
 
     std::signal(SIGINT, old_handler);
+#ifdef _WIN32
+    std::signal(SIGBREAK, old_break_handler);
+#endif
     g_http_server = nullptr;
     std::cout << "\nHTTP server stopped.\n";
     return 0;
@@ -366,18 +394,28 @@ Commands:
   .schema TABLE      Show table schema
   .quit              Exit
 
-Tables: funcs, segments, names, entries, strings, xrefs, blocks, imports, instructions, comments, db_info, pseudocode, hlil_vars, hlil_calls
+Tables: binary, capabilities, runtime_settings, funcs, segments, blocks, cfg_edges,
+        switch_tables, function_frames, data_items, dominators, post_dominators,
+        loops, instructions, instruction_operands, bytes, byte_search, entries,
+        imports, names, comments, bookmarks, xrefs, strings, patches, pseudocode,
+        hlil_vars, hlil_calls, mlil, mlil_operands, _hlil_ast, types, type_members,
+        type_enum_values, func_signatures
 
-SQL Functions: disasm(addr), bytes(addr,n), name_at(addr), func_at(addr), hex(val), xrefs_to(addr), decompile(addr)
+IR Views: ir_ops, ir_operands, ir_maturities, ir_v_calls, ir_v_mem_reads,
+          ir_v_mem_writes, ir_v_branches, ir_v_arith
 
-Writable Columns:
-  funcs.name, funcs.prototype, names.name
-  pseudocode.comment, pseudocode.comment_placement
-  hlil_vars.name, hlil_vars.type
+SQL Functions: disasm(addr), name_at(addr), func_at(addr), hex(val), xrefs_to(addr),
+               decompile(addr), search_first(pattern), save()
+Bounded bytes: SELECT addr,value FROM bytes WHERE start_addr=<addr> AND n=<count>;
+
+Writable Tables (SELECT save() to persist analysis edits):
+  funcs (create/delete; name/prototype/comment), segments, names, comments,
+  bookmarks, patches, pseudocode.comment, hlil_vars (name/type/comment/delete-clear),
+  types, type_members, type_enum_values; runtime_settings.value is session-only
 
 Examples:
   SELECT COUNT(*) FROM funcs;
-  SELECT hex(address), name, size FROM funcs ORDER BY size DESC LIMIT 10;
+  SELECT hex(addr), name, size FROM funcs ORDER BY size DESC LIMIT 10;
   SELECT content FROM strings WHERE content LIKE '%error%';
   SELECT module, COUNT(*) as cnt FROM imports GROUP BY module ORDER BY cnt DESC;
   UPDATE pseudocode SET comment='check bounds' WHERE func_addr=0x401000 AND line_num=12;
@@ -395,6 +433,30 @@ static std::string resolve_bn_bundled_plugin_dir() {
         }
     }
     return GetBundledPluginDirectory();
+}
+
+// Pin the INSTALL-dir binaryninjacore.dll before the first Binary Ninja call.
+//
+// bnsql.exe delay-loads the core, so the instance is chosen at the first BN API
+// call by the default search order -- application directory first. If a copied
+// core sits beside the executable, the exe binds that copy while Binary Ninja's
+// Python side (_binaryninjacore.py) always binds the install-dir core by
+// absolute ctypes path: TWO same-basename modules from different paths load as
+// two instances (the Windows loader does not dedupe this), each with its own
+// provider registry -- and the Python scripting provider registers into the one
+// this process never reads, making headless bnsql_python() silently
+// unavailable. Loading the install-dir core by full path first means every
+// later by-name resolution (delay-load included) binds this same instance, so
+// the process holds exactly one core in ANY layout.
+static void pin_install_core() {
+#ifdef _WIN32
+    if (const char* bn_install_dir = std::getenv("BN_INSTALL_DIR")) {
+        fs::path core_path = fs::path(bn_install_dir) / "binaryninjacore.dll";
+        std::error_code ec;
+        if (fs::exists(core_path, ec) && !ec)
+            LoadLibraryW(core_path.wstring().c_str());
+    }
+#endif
 }
 
 static void show_tables(bnsql::QueryEngine& qe) {
@@ -505,7 +567,8 @@ static void run_interactive(bnsql::QueryEngine& qe) {
 // ============================================================================
 
 static void print_usage(const char* prog) {
-    std::cout << "bnsql v" << g_version << " - SQL interface for Binary Ninja" << std::endl << std::endl;
+    std::cout << "bnsql v" << g_version << " - SQL interface for Binary Ninja" << std::endl;
+    std::cout << g_copyright << std::endl << std::endl;
     std::cout << "Usage:" << std::endl;
     std::cout << "  " << prog << " <file>                                 Interactive mode" << std::endl;
     std::cout << "  " << prog << " <file> -c <query>                      Execute query and exit" << std::endl;
@@ -529,6 +592,8 @@ static void print_usage(const char* prog) {
     std::cout << "  --bind <addr>          Bind address for server (default: 127.0.0.1)" << std::endl;
     std::cout << "  --token <token>        Auth token for HTTP/MCP mode" << std::endl;
     std::cout << "  -q, --quiet            Suppress banner" << std::endl;
+    std::cout << "  --log-file <path>      Write Binary Ninja log output (Info+) to a file" << std::endl;
+    std::cout << "  -V, --verbose          Raise log level to Debug and echo to stdout" << std::endl;
     std::cout << "  -h, --help             Show this help" << std::endl;
     std::cout << "  -v, --version          Show version" << std::endl;
     std::cout << std::endl;
@@ -539,18 +604,52 @@ static void print_usage(const char* prog) {
     std::cout << "  " << prog << " firmware.bin -c \"SELECT COUNT(*) FROM funcs\"" << std::endl;
 }
 
+#ifdef _WIN32
+// Return true when the Binary Ninja core DLL is discoverable before the
+// delay-loaded imports are triggered. It resolves if it sits in BN_INSTALL_DIR,
+// next to bnsql.exe (the documented "install next to Binary Ninja" layout), or
+// anywhere on the standard search path (PATH). This is the actual precondition
+// for loading — the old check required BN_INSTALL_DIR even when the DLL was
+// already reachable next to the executable or on PATH.
+static bool bn_core_dll_discoverable() {
+    constexpr const char* kCoreDll = "binaryninjacore.dll";
+    std::error_code ec;
+
+    if (const char* dir = std::getenv(bnsql::ENV_BN_INSTALL_DIR)) {
+        if (fs::exists(fs::path(dir) / kCoreDll, ec)) {
+            return true;
+        }
+    }
+
+    wchar_t exe_buf[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        if (fs::exists(fs::path(exe_buf).parent_path() / kCoreDll, ec)) {
+            return true;
+        }
+    }
+
+    char found[MAX_PATH];
+    if (SearchPathA(nullptr, kCoreDll, nullptr, MAX_PATH, found, nullptr) > 0) {
+        return true;
+    }
+    return false;
+}
+#endif
+
 // ============================================================================
 // Main
 // ============================================================================
 
-int main(int argc, char* argv[]) {
+static int run_cli(int argc, char* argv[]) {
 #ifdef _WIN32
-    // Check for BN_INSTALL_DIR before delay-loaded DLLs are triggered
-    if (!std::getenv(bnsql::ENV_BN_INSTALL_DIR)) {
-        std::cerr << "Error: " << bnsql::ENV_BN_INSTALL_DIR << " environment variable not set.\n\n"
-                  << "Please set it to your Binary Ninja installation directory:\n"
-                  << "  set " << bnsql::ENV_BN_INSTALL_DIR << "=C:\\Program Files\\Binary Ninja\n"
-                  << "  set PATH=%" << bnsql::ENV_BN_INSTALL_DIR << "%;%PATH%\n";
+    // The BN core DLL must be discoverable before delay-loaded imports fire.
+    if (!bn_core_dll_discoverable()) {
+        std::cerr << "Error: Binary Ninja core library (binaryninjacore.dll) was not found.\n\n"
+                  << "Make it discoverable in any one of these ways:\n"
+                  << "  - install bnsql next to Binary Ninja (bnsql.exe beside binaryninjacore.dll)\n"
+                  << "  - add the Binary Ninja directory to PATH\n"
+                  << "  - set " << bnsql::ENV_BN_INSTALL_DIR << "=C:\\Program Files\\Binary Ninja\n";
         return 1;
     }
 
@@ -568,16 +667,16 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
-    std::string database, query, query_file, auth_token, bind_addr;
+    std::string database, query, query_file, auth_token, bind_addr, log_file_path;
     int http_port = 8080, mcp_port = 9998;
-    bool interactive = false, quiet = false, http_mode = false, mcp_mode = false;
+    bool interactive = false, quiet = false, http_mode = false, mcp_mode = false, verbose = false;
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
 
         if (arg == "-h" || arg == "--help") { print_usage(argv[0]); return 0; }
-        if (arg == "-v" || arg == "--version") { std::cout << "bnsql v" << g_version << std::endl; return 0; }
+        if (arg == "-v" || arg == "--version") { std::cout << "bnsql v" << g_version << std::endl << g_copyright << std::endl; return 0; }
         if (arg == "-q" || arg == "--quiet") { quiet = true; continue; }
         if (arg == "-i" || arg == "--interactive") { interactive = true; continue; }
         if ((arg == "-s" || arg == "--source") && i + 1 < argc) { database = argv[++i]; continue; }
@@ -613,6 +712,8 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--bind" && i + 1 < argc) { bind_addr = argv[++i]; continue; }
         if (arg == "--token" && i + 1 < argc) { auth_token = argv[++i]; continue; }
+        if (arg == "--log-file" && i + 1 < argc) { log_file_path = argv[++i]; continue; }
+        if (arg == "-V" || arg == "--verbose") { verbose = true; continue; }
 
         // Positional argument = database
         if (arg[0] != '-' && database.empty()) { database = arg; continue; }
@@ -635,12 +736,33 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Must precede every BN API call (LogToFile below is the first): the core
+    // instance is fixed at the first delay-load resolution.
+    pin_install_core();
+
+    // Route Binary Ninja log output. Wired BEFORE InitPlugins() so plugin-load
+    // messages (e.g. the headless "plugin skipped" line) are captured. --verbose
+    // raises the level to Debug and echoes to stdout; --log-file writes Info+ (Debug
+    // with --verbose) to a file. Nothing is routed when neither flag is given.
+    BNLogLevel log_level = verbose ? DebugLog : InfoLog;
+    bool log_file_opened = false;
+    if (!log_file_path.empty()) {
+        log_file_opened = LogToFile(log_level, log_file_path, /*append=*/false);
+        if (!log_file_opened)
+            std::cerr << "warning: could not open log file: " << log_file_path << "\n";
+    }
+    if (verbose)
+        LogToStdout(log_level);
+    // Flush/close BN log files on every exit path (normal, error, /shutdown, Ctrl+C,
+    // exception) via a main-scope RAII guard.
+    struct LogGuard { bool active; ~LogGuard() { if (active) CloseLogs(); } } log_guard{ log_file_opened };
+
     // Initialize Binary Ninja
     SetBundledPluginDirectory(resolve_bn_bundled_plugin_dir());
     InitPlugins();
 
     // Load binary with auto-save support
-    if (!quiet) std::cout << "bnsql v" << g_version << "\n";
+    if (!quiet) std::cout << "bnsql v" << g_version << "\n" << g_copyright << "\n";
 
     bnsql::loader::LoadOptions load_opts;
     load_opts.auto_save = true;
@@ -697,12 +819,12 @@ int main(int argc, char* argv[]) {
 
         bnsql::MCPServer mcp_server;
 
-        bnsql::QueryCallback query_cb = [&qe](const std::string& sql) -> std::string {
+        bnsql::QueryCallback query_cb = [&qe](const std::string& sql) -> bnsql::MCPQueryOutcome {
             auto result = qe.query(sql);
             if (!result.success) {
-                return "Error: " + result.error;
+                return {"Error: " + result.error, false};
             }
-            return result.to_string();
+            return {result.to_string(), true};
         };
 
         int actual_port = mcp_server.start(mcp_port, query_cb, bind_addr);
@@ -713,7 +835,7 @@ int main(int argc, char* argv[]) {
         url = "http://" + bind_addr + ":" + std::to_string(actual_port);
 
         size_t func_count = 0;
-        auto count_result = qe.query("SELECT COUNT(*) FROM functions");
+        auto count_result = qe.query("SELECT COUNT(*) FROM funcs");
         if (count_result.success && !count_result.rows.empty()) {
             try { func_count = std::stoul(count_result.rows[0][0]); } catch (...) {}
         }
@@ -760,4 +882,14 @@ int main(int argc, char* argv[]) {
     run_interactive(qe);
 
     return 0;
+}
+
+int main(int argc, char* argv[]) {
+    int rc = run_cli(argc, argv);
+    // On x86_64 Linux, Binary Ninja's core hangs (deadlocks in a static
+    // destructor tearing down its Rust runtime) when the process exits normally.
+    // All CLI work — including any --write save — has completed by here, so exit
+    // immediately with the real status instead of hanging on teardown.
+    std::fflush(nullptr);
+    std::_Exit(rc);
 }

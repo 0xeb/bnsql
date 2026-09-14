@@ -1,3 +1,11 @@
+#
+# Copyright (c) 2024-2026 Elias Bachaalany
+# SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+#
+# This file is licensed under the Human-Origin Source License v1.0.
+# See LICENSE.
+#
+
 # examples/CMakeLists.txt - BNSQL Example Programs
 #
 # Build standalone:
@@ -9,8 +17,11 @@
 #   cmake --build build --config Release
 #
 # Run:
-#   Windows: set PATH=%BN_INSTALL_DIR%;%PATH%
-#            build\Release\example_basic.exe database.bndb
+#   Windows: build\Release\example_basic.exe database.bndb
+#            (binaryninjacore.dll is staged next to the exe at build time, so no
+#             PATH setup is needed when running from the build directory; if you
+#             copy the exe elsewhere, put %BN_INSTALL_DIR% on PATH or keep the DLL
+#             beside it)
 #   Linux:   LD_LIBRARY_PATH=$BN_INSTALL_DIR ./build/example_basic database.bndb
 
 cmake_minimum_required(VERSION 3.20)
@@ -87,6 +98,17 @@ function(add_bnsql_example name)
             set_target_properties(bnsql_${name} PROPERTIES
                 VS_DEBUGGER_ENVIRONMENT "PATH=${BN_NATIVE};%PATH%"
             )
+            # Deliberately NO copy of binaryninjacore.dll next to the example.
+            # The example links the core as a regular (non-delay-loaded) import,
+            # so at process start the loader must find it -- put ${BN_INSTALL_DIR}
+            # on PATH (the VS debugger environment above does this; command-line
+            # runs need it too, else 0xc0000135 STATUS_DLL_NOT_FOUND before
+            # main()). A local copy is NOT an acceptable convenience: the exe
+            # would bind the copy while Binary Ninja's Python side binds the
+            # INSTALL-dir core by absolute ctypes path, loading TWO core
+            # instances with split registries -- which silently hides the Python
+            # scripting provider from the process, and poisons every other
+            # binary sharing this output directory (bnsql.exe included).
         endif()
     elseif(APPLE)
         set_target_properties(bnsql_${name} PROPERTIES

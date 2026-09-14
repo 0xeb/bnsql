@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 #pragma once
 
@@ -17,8 +16,15 @@
 
 namespace bnsql {
 
+// Result of running a query through the callback: the rendered text plus whether
+// the query actually succeeded (so tools/call can set MCP `isError` correctly).
+struct MCPQueryOutcome {
+    std::string text;
+    bool success = true;
+};
+
 // Callback for SQL query execution
-using QueryCallback = std::function<std::string(const std::string& sql)>;
+using QueryCallback = std::function<MCPQueryOutcome(const std::string& sql)>;
 
 // Internal command structure for cross-thread execution
 struct MCPPendingCommand {
@@ -26,6 +32,7 @@ struct MCPPendingCommand {
     Type type;
     std::string input;
     std::string result;
+    bool success = true;
     bool completed = false;
     std::mutex done_mutex;
     std::condition_variable done_cv;

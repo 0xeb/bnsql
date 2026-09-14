@@ -1,64 +1,22 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
-/**
- * bytes_table.hpp - Pure mapped-byte virtual table for Binary Ninja.
- *
- * One row per mapped byte address. Backed by `bv->ReadBuffer(...)` /
- * `bv->IsValidOffset(...)`. Read-only; byte patching lives in the
- * existing `patches` table (see types.hpp).
- *
- * Pushdown:
- *   - `WHERE address = X`                    point lookup
- *   - `WHERE start_address = X AND n = N`    bounded read (N consecutive bytes from X)
- *   - `WHERE address BETWEEN A AND B`        two-sided range
- *
- * Bulk reads compose with libxsql's `blob_concat` aggregate:
- *   SELECT hex(blob_concat(value))
- *     FROM bytes WHERE start_address = X AND n = N ORDER BY address;   -- hex string
- *   SELECT blob_concat(value)
- *     FROM bytes WHERE start_address = X AND n = N ORDER BY address;   -- BLOB
- *
- * The hidden `start_address` and `n` columns are input-only — they do
- * NOT appear in `SELECT *`. Keeping `start_address` distinct from the
- * visible `address` ensures any user predicate on `address` (e.g.
- * inside a JOIN) stays enforceable by SQLite. Unbounded
- * `WHERE address > X` without an upper bound or LIMIT walks every
- * mapped byte from X to end-of-image.
- */
+#include "memory_bytes.hpp"
 
-#pragma once
-
-#include <bnsql/vtable.hpp>
-
-#include "binaryninjaapi.h"
-
-#include <cstdint>
-#include <memory>
-#include <vector>
+#include <algorithm>
+#include <limits>
 
 namespace bnsql {
+namespace memory {
 
-// Forward declaration: implemented in entities.hpp as
-// bnsql::entities::get_bv(). Returns the current thread/session
-// BinaryView reference; may be null when no session is active. Declared
-// here (not included) to keep bytes_table.hpp free of the entities.hpp
-// dependency cycle (entities.hpp pulls bytes_table.hpp in).
-namespace entities {
-BinaryNinja::Ref<BinaryNinja::BinaryView> get_bv();
-}
-
-struct ByteRow {
-    uint64_t address = 0;
-};
+using namespace BinaryNinja;
 
 namespace bytes_detail {
 
-inline uint8_t read_one_byte(BinaryNinja::Ref<BinaryNinja::BinaryView>& bv, uint64_t addr) {
+uint8_t read_one_byte(const BinaryNinja::Ref<BinaryNinja::BinaryView>& bv, uint64_t addr) {
     if (!bv) return 0;
     BinaryNinja::DataBuffer buf = bv->ReadBuffer(addr, 1);
     if (buf.GetLength() < 1) return 0;
@@ -69,9 +27,28 @@ inline uint8_t read_one_byte(BinaryNinja::Ref<BinaryNinja::BinaryView>& bv, uint
 enum BytesColumn {
     kBytesAddress = 0,
     kBytesValue = 1,
-    kBytesStartAddress = 2,
-    kBytesN = 3,
+    kBytesIsInitialized = 2,
+    kBytesStartAddress = 3,
+    kBytesN = 4,
 };
+
+void populate_byte_row(const BinaryNinja::Ref<BinaryNinja::BinaryView>& bv,
+                       ByteRow& row, uint64_t addr) {
+    row.address = addr;
+    row.value = 0;
+    row.is_initialized = false;
+    if (!bv) return;
+
+    // Use BN's canonical segment lookup for overlaps and compute initialization
+    // once per row. The column getters then reuse the snapshot instead of each
+    // rebuilding the complete segment list.
+    auto seg = bv->GetSegmentAt(addr);
+    if (!seg) return;
+    const uint64_t start = seg->GetStart();
+    if (addr < start || addr - start >= seg->GetDataLength()) return;
+    row.is_initialized = true;
+    row.value = read_one_byte(bv, addr);
+}
 
 struct ByteBounds {
     bool has_lower = false;
@@ -82,7 +59,7 @@ struct ByteBounds {
     bool upper_inclusive = true;
 };
 
-inline void tighten_lower(ByteBounds& b, uint64_t ea, bool inclusive) {
+void tighten_lower(ByteBounds& b, uint64_t ea, bool inclusive) {
     if (!b.has_lower || ea > b.lower ||
         (ea == b.lower && !inclusive && b.lower_inclusive)) {
         b.has_lower = true;
@@ -91,7 +68,7 @@ inline void tighten_lower(ByteBounds& b, uint64_t ea, bool inclusive) {
     }
 }
 
-inline void tighten_upper(ByteBounds& b, uint64_t ea, bool inclusive) {
+void tighten_upper(ByteBounds& b, uint64_t ea, bool inclusive) {
     if (!b.has_upper || ea < b.upper ||
         (ea == b.upper && !inclusive && b.upper_inclusive)) {
         b.has_upper = true;
@@ -100,7 +77,7 @@ inline void tighten_upper(ByteBounds& b, uint64_t ea, bool inclusive) {
     }
 }
 
-inline bool within_bounds(uint64_t ea, const ByteBounds& b) {
+bool within_bounds(uint64_t ea, const ByteBounds& b) {
     if (b.has_lower &&
         (ea < b.lower || (ea == b.lower && !b.lower_inclusive))) {
         return false;
@@ -133,19 +110,45 @@ public:
         }
         for (auto& seg : bv_->GetSegments()) {
             uint64_t s = seg->GetStart();
-            uint64_t e = s + seg->GetLength();
+            const uint64_t length = seg->GetLength();
+            uint64_t e = length > std::numeric_limits<uint64_t>::max() - s
+                             ? std::numeric_limits<uint64_t>::max()
+                             : s + length;
             if (e <= s) continue;
             // Apply bounds to the segment span.
             if (bounds_.has_lower) {
-                uint64_t lo = bounds_.lower_inclusive ? bounds_.lower : bounds_.lower + 1;
+                if (!bounds_.lower_inclusive &&
+                    bounds_.lower == std::numeric_limits<uint64_t>::max()) {
+                    continue;
+                }
+                uint64_t lo = bounds_.lower_inclusive
+                                  ? bounds_.lower
+                                  : bounds_.lower + 1;
                 if (lo > s) s = lo;
             }
             if (bounds_.has_upper) {
-                uint64_t hi = bounds_.upper_inclusive ? bounds_.upper + 1 : bounds_.upper;
+                uint64_t hi = bounds_.upper;
+                if (bounds_.upper_inclusive &&
+                    bounds_.upper != std::numeric_limits<uint64_t>::max()) {
+                    ++hi;
+                } else if (bounds_.upper_inclusive) {
+                    hi = std::numeric_limits<uint64_t>::max();
+                }
                 if (hi < e) e = hi;
             }
             if (e > s) spans_.emplace_back(s, e);
         }
+        std::sort(spans_.begin(), spans_.end());
+        std::vector<std::pair<uint64_t, uint64_t>> merged;
+        merged.reserve(spans_.size());
+        for (const auto& span : spans_) {
+            if (merged.empty() || span.first > merged.back().second) {
+                merged.push_back(span);
+            } else if (span.second > merged.back().second) {
+                merged.back().second = span.second;
+            }
+        }
+        spans_ = std::move(merged);
     }
 
     bool next() override {
@@ -164,7 +167,7 @@ public:
             }
         }
         if (!within_bounds(current_, bounds_)) { ended_ = true; return false; }
-        row_.address = current_;
+        populate_byte_row(bv_, row_, current_);
         return true;
     }
 
@@ -196,7 +199,7 @@ public:
             ++current_;
         }
         --remaining_;
-        row_.address = current_;
+        populate_byte_row(core::get_bv(), row_, current_);
         return true;
     }
 
@@ -204,7 +207,7 @@ public:
     int64_t rowid() const override { return static_cast<int64_t>(current_); }
 };
 
-inline std::unique_ptr<xsql::Generator<ByteRow>>
+std::unique_ptr<xsql::Generator<ByteRow>>
 make_bytes_range_generator(const std::vector<xsql::GeneratorConstraintArg>& args) {
     ByteBounds bounds;
     for (const auto& arg : args) {
@@ -229,10 +232,10 @@ make_bytes_range_generator(const std::vector<xsql::GeneratorConstraintArg>& args
                 break;
         }
     }
-    return std::make_unique<BytesRangeGenerator>(entities::get_bv(), bounds);
+    return std::make_unique<BytesRangeGenerator>(core::get_bv(), bounds);
 }
 
-inline std::unique_ptr<xsql::Generator<ByteRow>>
+std::unique_ptr<xsql::Generator<ByteRow>>
 make_bytes_n_generator(const std::vector<xsql::GeneratorConstraintArg>& args) {
     uint64_t start = 0;
     int64_t n = 0;
@@ -249,55 +252,67 @@ make_bytes_n_generator(const std::vector<xsql::GeneratorConstraintArg>& args) {
 
 } // namespace bytes_detail
 
-inline GeneratorTableDef<ByteRow> define_bytes_table() {
+GeneratorTableDef<ByteRow> define_bytes_table() {
     using namespace bytes_detail;
     return generator_table<ByteRow>("bytes")
         .estimate_rows([]() -> size_t {
-            auto bv = entities::get_bv();
+            auto bv = core::get_bv();
             if (!bv) return 0;
             uint64_t total = 0;
             for (auto& seg : bv->GetSegments()) total += seg->GetLength();
             return static_cast<size_t>(total);
         })
         .generator([]() -> std::unique_ptr<xsql::Generator<ByteRow>> {
-            return std::make_unique<BytesRangeGenerator>(entities::get_bv(), ByteBounds{});
+            return std::make_unique<BytesRangeGenerator>(core::get_bv(), ByteBounds{});
         })
-        .column_int64("address", [](const ByteRow& r) -> int64_t {
+        .column_int64("addr", [](const ByteRow& r) -> int64_t {
             return static_cast<int64_t>(r.address);
         })
-        .column_int("value", [](const ByteRow& r) -> int {
-            auto bv = entities::get_bv();
-            return static_cast<int>(read_one_byte(bv, r.address));
+        // Canonical byte surface: value is NULL for a mapped-but-uninitialized byte
+        // (e.g. BSS), preserving the "unknown" vs "real 0" distinction. This is the
+        // ratified cross-tool decision (uninitialized => NULL, not 0), matching
+        // ghidrasql; is_initialized carries the 0/1 flag.
+        .column("value", xsql::ColumnType::Integer,
+                [](xsql::FunctionContext& ctx, const ByteRow& r) {
+                    if (r.is_initialized)
+                        ctx.result_int64(static_cast<int64_t>(r.value));
+                    else
+                        ctx.result_null();
+                })
+        .column_int("is_initialized", [](const ByteRow& r) -> int {
+            return r.is_initialized ? 1 : 0;
         })
-        // Hidden input columns for bounded reads: WHERE start_address = X
-        // AND n = N. Both are HIDDEN (input-only); keeping start_address
-        // distinct from the visible `address` keeps any user predicate on
-        // `address` enforceable by SQLite (joins stay correct).
-        .hidden_column_int64("start_address")
+        // Hidden input columns for bounded reads: WHERE start_addr = X
+        // AND n = N. Both are HIDDEN (input-only); keeping start_addr
+        // distinct from the visible `addr` keeps any user predicate on
+        // `addr` enforceable by SQLite (joins stay correct).
+        .hidden_column_int64("start_addr")
         .hidden_column_int64("n")
         .row_lookup([](ByteRow& row, int64_t addr_val) -> bool {
-            row.address = static_cast<uint64_t>(addr_val);
+            auto bv = core::get_bv();
+            populate_byte_row(bv, row, static_cast<uint64_t>(addr_val));
             return true;
         })
-        // Bounded read: start_address = X AND n = N.
+        // Bounded read: start_addr = X AND n = N.
         .constraint_filter(
-            {xsql::required_eq("start_address", ""), xsql::required_eq("n", "")},
+            {xsql::required_eq("start_addr", ""), xsql::required_eq("n", "")},
             make_bytes_n_generator,
             1.0, 1.0)
-        .order_by_consumed("address")
+        .order_by_consumed("addr")
         // Point read.
         .constraint_filter(
-            {xsql::required_eq("address", "")},
+            {xsql::required_eq("addr", "")},
             make_bytes_range_generator,
             1.0, 1.0)
         // Range scan.
         .constraint_filter(
-            {xsql::optional_ge("address"), xsql::optional_gt("address"),
-             xsql::optional_lt("address"), xsql::optional_le("address")},
+            {xsql::optional_ge("addr"), xsql::optional_gt("addr"),
+             xsql::optional_lt("addr"), xsql::optional_le("addr")},
             make_bytes_range_generator,
             10.0, 100.0)
-        .order_by_consumed("address")
+        .order_by_consumed("addr")
         .build();
 }
 
+} // namespace memory
 } // namespace bnsql

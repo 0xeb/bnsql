@@ -1,9 +1,8 @@
 // Copyright (c) 2024-2026 Elias Bachaalany
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
 /**
  * example_basic.cpp - Basic BNSQL usage with QueryEngine
@@ -84,7 +83,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n=== Top 5 Largest Functions ===\n";
 
     auto result = qe.query(
-        "SELECT printf('0x%X', address) as addr, name, size "
+        "SELECT printf('0x%X', addr) as addr, name, size "
         "FROM funcs ORDER BY size DESC LIMIT 5"
     );
 
@@ -111,8 +110,8 @@ int main(int argc, char* argv[]) {
     std::cout << "\n=== Segments ===\n";
 
     auto segments = qe.query(
-        "SELECT name, printf('0x%X', start_ea) as start, "
-        "       printf('0x%X', end_ea) as end, perm "
+        "SELECT name, printf('0x%X', start_addr) as start, "
+        "       printf('0x%X', end_addr) as end, perm "
         "FROM segments"
     );
 
@@ -129,7 +128,7 @@ int main(int argc, char* argv[]) {
 
     // Get first function using SQL
     auto first_func = qe.query(
-        "SELECT printf('0x%X', address) as addr, name "
+        "SELECT printf('0x%X', addr) as addr, name "
         "FROM funcs LIMIT 1"
     );
     if (!first_func.empty()) {
@@ -138,11 +137,11 @@ int main(int argc, char* argv[]) {
     }
 
     // Database info
-    auto db_info = qe.query(
-        "SELECT key, value FROM db_info WHERE key IN ('filename', 'arch', 'platform')"
+    auto binary_info = qe.query(
+        "SELECT key, value FROM binary WHERE key IN ('filename', 'processor', 'platform')"
     );
     std::cout << "\nDatabase info:\n";
-    for (const auto& row : db_info) {
+    for (const auto& row : binary_info) {
         std::cout << "  " << row[0] << ": " << row[1] << "\n";
     }
 
