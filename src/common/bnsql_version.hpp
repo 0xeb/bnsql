@@ -19,6 +19,6 @@
 
 #pragma once
 
-#define BNSQL_VERSION_STRING "0.0.12"
+#define BNSQL_VERSION_STRING "0.0.13"
 
 #define BNSQL_COPYRIGHT_STRING "Copyright (c) 2024-2026 Elias Bachaalany"

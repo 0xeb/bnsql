@@ -201,6 +201,24 @@ inline const char* hlil_op_name(BNHighLevelILOperation op) {
         case HLIL_UNIMPL: return "HLIL_UNIMPL";
         case HLIL_UNIMPL_MEM: return "HLIL_UNIMPL_MEM";
 
+        // Added in BN 6.0 (core ABI 187)
+        case HLIL_ABS: return "HLIL_ABS";
+        case HLIL_BSWAP: return "HLIL_BSWAP";
+        case HLIL_CLS: return "HLIL_CLS";
+        case HLIL_CLZ: return "HLIL_CLZ";
+        case HLIL_CTZ: return "HLIL_CTZ";
+        case HLIL_MAXS: return "HLIL_MAXS";
+        case HLIL_MAXU: return "HLIL_MAXU";
+        case HLIL_MINS: return "HLIL_MINS";
+        case HLIL_MINU: return "HLIL_MINU";
+        case HLIL_PASS_BY_REF: return "HLIL_PASS_BY_REF";
+        case HLIL_POPCNT: return "HLIL_POPCNT";
+        case HLIL_RBIT: return "HLIL_RBIT";
+        case HLIL_RETURN_BY_REF: return "HLIL_RETURN_BY_REF";
+        case HLIL_STRUCT_INIT: return "HLIL_STRUCT_INIT";
+        case HLIL_STRUCT_INIT_FIELD: return "HLIL_STRUCT_INIT_FIELD";
+        case HLIL_VAR_SSA_PARTIAL: return "HLIL_VAR_SSA_PARTIAL";
+
         default: return "";
     }
 }
@@ -264,7 +282,12 @@ inline const char* mlil_op_name(BNMediumLevelILOperation op) {
         case MLIL_RET_HINT: return "MLIL_RET_HINT";
         case MLIL_CALL: return "MLIL_CALL";
         case MLIL_CALL_UNTYPED: return "MLIL_CALL_UNTYPED";
-        case MLIL_CALL_OUTPUT: return "MLIL_CALL_OUTPUT";
+        // The non-SSA call-output op was removed in BN 6.0; only the SSA-form
+        // spelling survives (mapped further down with the other SSA ops).
+        // Do NOT name the removed enumerator here: the compliance test scrapes
+        // every prefixed token out of this region, comments included, and
+        // compares the set against the core enum -- naming a dead enumerator
+        // reintroduces it and fails coverage.
         case MLIL_CALL_PARAM: return "MLIL_CALL_PARAM";
         case MLIL_SEPARATE_PARAM_LIST: return "MLIL_SEPARATE_PARAM_LIST";
         case MLIL_SHARED_PARAM_SLOT: return "MLIL_SHARED_PARAM_SLOT";
@@ -348,6 +371,32 @@ inline const char* mlil_op_name(BNMediumLevelILOperation op) {
         case MLIL_FREE_VAR_SLOT_SSA: return "MLIL_FREE_VAR_SLOT_SSA";
         case MLIL_VAR_PHI: return "MLIL_VAR_PHI";
         case MLIL_MEM_PHI: return "MLIL_MEM_PHI";
+
+        // Added in BN 6.0 (core ABI 187). The same release removed the non-SSA
+        // call-output op, whose role the var-output / store-output family below
+        // now covers.
+        case MLIL_ABS: return "MLIL_ABS";
+        case MLIL_BLOCK_TO_EXPAND: return "MLIL_BLOCK_TO_EXPAND";
+        case MLIL_BSWAP: return "MLIL_BSWAP";
+        case MLIL_CLS: return "MLIL_CLS";
+        case MLIL_CLZ: return "MLIL_CLZ";
+        case MLIL_CTZ: return "MLIL_CTZ";
+        case MLIL_MAXS: return "MLIL_MAXS";
+        case MLIL_MAXU: return "MLIL_MAXU";
+        case MLIL_MINS: return "MLIL_MINS";
+        case MLIL_MINU: return "MLIL_MINU";
+        case MLIL_PASS_BY_REF: return "MLIL_PASS_BY_REF";
+        case MLIL_POPCNT: return "MLIL_POPCNT";
+        case MLIL_RBIT: return "MLIL_RBIT";
+        case MLIL_RETURN_BY_REF: return "MLIL_RETURN_BY_REF";
+        case MLIL_STORE_OUTPUT: return "MLIL_STORE_OUTPUT";
+        case MLIL_VAR_OUTPUT: return "MLIL_VAR_OUTPUT";
+        case MLIL_VAR_OUTPUT_ALIASED: return "MLIL_VAR_OUTPUT_ALIASED";
+        case MLIL_VAR_OUTPUT_ALIASED_FIELD: return "MLIL_VAR_OUTPUT_ALIASED_FIELD";
+        case MLIL_VAR_OUTPUT_FIELD: return "MLIL_VAR_OUTPUT_FIELD";
+        case MLIL_VAR_OUTPUT_SSA: return "MLIL_VAR_OUTPUT_SSA";
+        case MLIL_VAR_OUTPUT_SSA_FIELD: return "MLIL_VAR_OUTPUT_SSA_FIELD";
+
         default: return "";
     }
 }
@@ -581,6 +630,20 @@ inline const char* llil_op_name(BNLowLevelILOperation op) {
         case LLIL_UNIMPL_MEM: return "LLIL_UNIMPL_MEM";
         case LLIL_XOR: return "LLIL_XOR";
         case LLIL_ZX: return "LLIL_ZX";
+
+        // Added in BN 6.0 (core ABI 187)
+        case LLIL_ABS: return "LLIL_ABS";
+        case LLIL_BSWAP: return "LLIL_BSWAP";
+        case LLIL_CLS: return "LLIL_CLS";
+        case LLIL_CLZ: return "LLIL_CLZ";
+        case LLIL_CTZ: return "LLIL_CTZ";
+        case LLIL_MAXS: return "LLIL_MAXS";
+        case LLIL_MAXU: return "LLIL_MAXU";
+        case LLIL_MINS: return "LLIL_MINS";
+        case LLIL_MINU: return "LLIL_MINU";
+        case LLIL_POPCNT: return "LLIL_POPCNT";
+        case LLIL_RBIT: return "LLIL_RBIT";
+
         default: return "";
     }
 }

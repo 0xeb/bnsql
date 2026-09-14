@@ -6,7 +6,7 @@ Structurally aligned with idasql's own agent guide where the underlying
 analysis concepts overlap, with BN-specific deltas (HLIL/MLIL surfaces,
 explicit-save model, no Hex-Rays, no IDAPython).
 
-Current target: bnsql v0.0.12+ (explicit-save model, type intelligence,
+Current target: bnsql v0.0.13+ (explicit-save model, type intelligence,
 patches, binary search, callers/callees views).
 
 ---
