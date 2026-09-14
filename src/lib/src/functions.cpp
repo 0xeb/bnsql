@@ -34,8 +34,6 @@
  *   - func_at_index(n)          - Get function address at index n
  */
 
-#pragma once
-
 #include <xsql/database.hpp>
 #include <xsql/functions.hpp>
 #include <string>

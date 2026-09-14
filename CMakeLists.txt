@@ -126,6 +126,19 @@ else()
     FetchContent_MakeAvailable(libxsql)
 endif()
 
+# libxsql's thin client pulls cpp-httplib, which since libxsql v1.0.15 fetches
+# zlib for gzip response compression. zlib's own CMakeLists does not mark
+# zlibstatic position-independent, so linking that archive into bnsql.so fails
+# on ELF x86_64 with "relocation R_X86_64_PC32 against symbol `_length_code'
+# can not be used when making a shared object". Windows (PE) and macOS do not
+# care, which is why this only ever breaks the Linux plugin build. zlibstatic
+# is third-party, so set the property here rather than patching the fetched
+# tree; it is a no-op where the target does not exist (thin client disabled, or
+# an httplib supplied by the parent project).
+if(TARGET zlibstatic)
+    set_target_properties(zlibstatic PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
 # ============================================================================
 # MCP Server Support (optional, uses fastmcpp)
 # ============================================================================
