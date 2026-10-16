@@ -25,6 +25,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
+#else
+#include <netdb.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #endif
 
 #include <bnsql/bnsql.hpp>
@@ -225,6 +229,42 @@ static std::shared_ptr<xsql::thinclient::http_query_server> CreateHTTPServer(
     return server;
 }
 
+// True if nothing else is bound to bind_address:port. The server itself binds
+// with SO_REUSEADDR, which on Windows lets a bind succeed on a port another
+// process also opened with SO_REUSEADDR -- both would then listen on it. An
+// exclusive probe bind fails in that case too, so an automatic pick never shares
+// a port with another program.
+static bool PortIsFree(const std::string& bind_address, int port) {
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
+    addrinfo* res = nullptr;
+    const std::string service = std::to_string(port);
+    if (getaddrinfo(bind_address.c_str(), service.c_str(), &hints, &res) != 0 || !res)
+        return true;  // can't resolve: let the real bind decide
+    bool free_port = true;
+    for (addrinfo* ai = res; ai; ai = ai->ai_next) {
+#ifdef _WIN32
+        SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == INVALID_SOCKET) continue;
+        int yes = 1;
+        setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&yes),
+                   sizeof(yes));
+        if (bind(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) != 0) free_port = false;
+        closesocket(s);
+#else
+        int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0) continue;
+        if (bind(s, ai->ai_addr, ai->ai_addrlen) != 0) free_port = false;
+        close(s);
+#endif
+        break;
+    }
+    freeaddrinfo(res);
+    return free_port;
+}
+
 // Starts a server for `view` on the first free port at or above
 // kDefaultHTTPPort, skipping ports held by other bnsql servers and ports another
 // process has bound. Registers the entry. Caller holds g_http_server_mutex.
@@ -236,7 +276,7 @@ static std::shared_ptr<xsql::thinclient::http_query_server> StartHTTPServerAutoP
         bool taken = false;
         for (const auto& [key, e] : g_http_servers)
             if (e.server && e.server->port() == port) { taken = true; break; }
-        if (taken) continue;
+        if (taken || !PortIsFree(bind_address, port)) continue;
         if (auto server = CreateHTTPServer(view, bind_address, port, auth_token)) {
             g_http_servers[view->GetObject()] =
                 HttpServerEntry{server, view, ViewLabel(view), false};
@@ -322,6 +362,13 @@ static void StartHTTPServer(BinaryView* bv) {
             return;
         }
     } else {
+        if (port != 0 && !PortIsFree(bind_address, port)) {
+            const std::string err = "Port " + std::to_string(port) +
+                " is already in use by another program.\n"
+                "Leave the port empty to pick a free one automatically.";
+            ShowMessageBox("Error", err.c_str(), OKButtonSet, ErrorIcon);
+            return;
+        }
         server = CreateHTTPServer(server_view, bind_address, port, auth_token);
         if (!server) {
             ShowMessageBox("Error", "Failed to start HTTP server (port in use?)", OKButtonSet, ErrorIcon);
