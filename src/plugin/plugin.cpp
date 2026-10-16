@@ -6,7 +6,8 @@
 //
 // Modified (contribution-purpose, proposed upstream): HTTP server support was
 // changed from one process-wide server to one server per BinaryView, so several
-// open files/tabs can each be served on their own port.
+// open files/tabs can each be served on their own port; an empty port picks
+// the first free one, and "Start HTTP Servers for All Tabs" serves every tab.
 
 /**
  * plugin.cpp - Binary Ninja plugin for bnsql
@@ -32,10 +33,14 @@
 #include "bnsql_http_routes.hpp"
 #endif
 #include "binaryninjaapi.h"
+#include "bnsql_python_exec.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <vector>
 #include <atomic>
 
 using namespace BinaryNinja;
@@ -150,6 +155,97 @@ static std::string DescribeHTTPServers() {
     return out;
 }
 
+// First port tried when the user leaves the port empty (and for "All Tabs").
+static constexpr int kDefaultHTTPPort = 8080;
+// How many consecutive ports to try before giving up on an automatic pick.
+static constexpr int kAutoPortAttempts = 200;
+
+// Creates and starts a server bound to `view`. Returns nullptr if the port
+// could not be bound. Caller holds g_http_server_mutex and registers the entry.
+static std::shared_ptr<xsql::thinclient::http_query_server> CreateHTTPServer(
+    const Ref<BinaryView>& view, const std::string& bind_address, int port,
+    const std::string& auth_token) {
+    xsql::thinclient::http_query_server_config cfg;
+    cfg.tool_name = "bnsql";
+    cfg.help_text = bnsql::http_help_text();
+    cfg.port = port;
+    cfg.bind_address = bind_address;
+    if (!auth_token.empty()) cfg.auth_token = auth_token;
+    // Background server (no main-thread queue); serialize concurrent requests
+    // since a per-request QueryEngine over the shared BinaryView isn't
+    // concurrency-safe (matches the prior timed_mutex behavior).
+    cfg.use_queue = false;
+    cfg.serialize_requests = true;
+    // The serialize path honors these admission limits (503/408), same as the
+    // CLI servers — previously the plugin server dropped queue backpressure.
+    cfg.queue_admission_timeout_ms_fn = []() {
+        return bnsql::runtime_settings().queue_admission_timeout_ms();
+    };
+    cfg.max_queue_fn = []() { return bnsql::runtime_settings().max_queue(); };
+    // Capture this server's BinaryView by value into the executor. The lambda
+    // runs on httplib worker threads; a captured Ref keeps the view alive for the
+    // executor's lifetime, independent of the server registry.
+    cfg.statement_executor =
+        [view](const std::string& stmt, xsql::ScriptStatementResult& out) {
+        if (!view) {
+            out.success = false;
+            out.error = "No binary loaded";
+            return;
+        }
+        std::lock_guard<std::mutex> exec_lock(g_http_exec_mutex);
+        bnsql::QueryEngine qe(view);
+        auto r = qe.query(stmt);
+        out.columns = std::move(r.columns);
+        out.rows.reserve(r.rows.size());
+        for (auto& row : r.rows) out.rows.push_back(std::move(row.values));
+        out.elapsed_ms = r.elapsed_ms;
+        out.success = r.success;
+        out.error = std::move(r.error);
+    };
+    // /status must carry `functions` + `settings` like the CLI servers. Cache the
+    // function count once now so status_fn never touches the engine on a worker
+    // thread. Read it straight from the view (same source as the funcs table):
+    // other servers may be executing queries, and the GUI thread must not wait
+    // on g_http_exec_mutex.
+    {
+        const std::string func_count =
+            std::to_string(view->GetAnalysisFunctionList().size());
+        cfg.status_fn = [func_count]() { return bnsql::status_extra_json(func_count); };
+    }
+    cfg.status_requires_auth = true;
+    cfg.extra_routes = [](httplib::Server& svr) {
+        svr.Get("/settings", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
+                            "application/json");
+        });
+    };
+
+    auto server = std::make_shared<xsql::thinclient::http_query_server>(cfg);
+    if (server->start() < 0) return nullptr;
+    return server;
+}
+
+// Starts a server for `view` on the first free port at or above
+// kDefaultHTTPPort, skipping ports held by other bnsql servers and ports another
+// process has bound. Registers the entry. Caller holds g_http_server_mutex.
+static std::shared_ptr<xsql::thinclient::http_query_server> StartHTTPServerAutoPort(
+    const Ref<BinaryView>& view, const std::string& bind_address,
+    const std::string& auth_token) {
+    for (int port = kDefaultHTTPPort; port < kDefaultHTTPPort + kAutoPortAttempts && port <= 65535;
+         ++port) {
+        bool taken = false;
+        for (const auto& [key, e] : g_http_servers)
+            if (e.server && e.server->port() == port) { taken = true; break; }
+        if (taken) continue;
+        if (auto server = CreateHTTPServer(view, bind_address, port, auth_token)) {
+            g_http_servers[view->GetObject()] =
+                HttpServerEntry{server, view, ViewLabel(view), false};
+            return server;
+        }
+    }
+    return nullptr;
+}
+
 static void StartHTTPServer(BinaryView* bv) {
     std::lock_guard<std::mutex> lock(g_http_server_mutex);
     PruneStoppedHTTPServers();
@@ -166,14 +262,16 @@ static void StartHTTPServer(BinaryView* bv) {
     // Accept "port" or "host:port". The CLI has --bind and --token; the plugin
     // prompt used to hardcode loopback, so a GUI user had no way to expose the
     // server to another machine (or to protect it if they could). One field keeps
-    // the common case a single keystroke.
+    // the common case a single keystroke. An empty port picks the first free port
+    // from 8080, so starting a server per tab needs no port bookkeeping.
     std::string input;
     if (!GetTextLineInput(input, "HTTP Server Port",
                           "Enter port, or host:port to bind elsewhere\n"
-                          "(0 = random port, default: 8080, default host: 127.0.0.1):"))
+                          "(empty = first free port from 8080, 0 = random port,\n"
+                          "default host: 127.0.0.1):"))
         return;
 
-    int port = 8080;
+    int port = -1;  // -1 = automatic
     std::string bind_address = "127.0.0.1";
     if (!input.empty()) {
         std::string port_part = input;
@@ -187,8 +285,10 @@ static void StartHTTPServer(BinaryView* bv) {
                 bind_address = bind_address.substr(1, bind_address.size() - 2);
             if (bind_address.empty()) bind_address = "127.0.0.1";
         }
-        try { port = std::stoi(port_part); if (port < 0 || port > 65535) throw 0; }
-        catch (...) { ShowMessageBox("Error", "Invalid port", OKButtonSet, ErrorIcon); return; }
+        if (!port_part.empty()) {
+            try { port = std::stoi(port_part); if (port < 0 || port > 65535) throw 0; }
+            catch (...) { ShowMessageBox("Error", "Invalid port", OKButtonSet, ErrorIcon); return; }
+        }
     }
 
     // A non-loopback bind exposes a SQL endpoint that can execute Python (once
@@ -213,72 +313,25 @@ static void StartHTTPServer(BinaryView* bv) {
     }
 
     Ref<BinaryView> server_view = bv;
-
-    xsql::thinclient::http_query_server_config cfg;
-    cfg.tool_name = "bnsql";
-    cfg.help_text = bnsql::http_help_text();
-    cfg.port = port;
-    cfg.bind_address = bind_address;
-    if (!auth_token.empty()) cfg.auth_token = auth_token;
-    // Background server (no main-thread queue); serialize concurrent requests
-    // since a per-request QueryEngine over the shared BinaryView isn't
-    // concurrency-safe (matches the prior timed_mutex behavior).
-    cfg.use_queue = false;
-    cfg.serialize_requests = true;
-    // The serialize path honors these admission limits (503/408), same as the
-    // CLI servers — previously the plugin server dropped queue backpressure.
-    cfg.queue_admission_timeout_ms_fn = []() {
-        return bnsql::runtime_settings().queue_admission_timeout_ms();
-    };
-    cfg.max_queue_fn = []() { return bnsql::runtime_settings().max_queue(); };
-    // Capture this server's BinaryView by value into the executor. The lambda
-    // runs on httplib worker threads; a captured Ref keeps the view alive for the
-    // executor's lifetime, independent of the server registry.
-    cfg.statement_executor =
-        [view = server_view](const std::string& stmt, xsql::ScriptStatementResult& out) {
-        if (!view) {
-            out.success = false;
-            out.error = "No binary loaded";
+    std::shared_ptr<xsql::thinclient::http_query_server> server;
+    if (port < 0) {
+        server = StartHTTPServerAutoPort(server_view, bind_address, auth_token);
+        if (!server) {
+            ShowMessageBox("Error", "Failed to start HTTP server: no free port found from 8080",
+                           OKButtonSet, ErrorIcon);
             return;
         }
-        std::lock_guard<std::mutex> exec_lock(g_http_exec_mutex);
-        bnsql::QueryEngine qe(view);
-        auto r = qe.query(stmt);
-        out.columns = std::move(r.columns);
-        out.rows.reserve(r.rows.size());
-        for (auto& row : r.rows) out.rows.push_back(std::move(row.values));
-        out.elapsed_ms = r.elapsed_ms;
-        out.success = r.success;
-        out.error = std::move(r.error);
-    };
-    // /status must carry `functions` + `settings` like the CLI servers. Cache the
-    // function count once now so status_fn never touches the engine on a worker
-    // thread. Read it straight from the view (same source as the funcs table):
-    // other servers may be executing queries, and the GUI thread must not wait
-    // on g_http_exec_mutex.
-    {
-        const std::string func_count =
-            std::to_string(server_view->GetAnalysisFunctionList().size());
-        cfg.status_fn = [func_count]() { return bnsql::status_extra_json(func_count); };
-    }
-    cfg.status_requires_auth = true;
-    cfg.extra_routes = [](httplib::Server& svr) {
-        svr.Get("/settings", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
-                            "application/json");
-        });
-    };
-
-    auto server = std::make_shared<xsql::thinclient::http_query_server>(cfg);
-    int actual_port_check = server->start();
-    if (actual_port_check < 0) {
-        ShowMessageBox("Error", "Failed to start HTTP server (port in use?)", OKButtonSet, ErrorIcon);
-        return;
+    } else {
+        server = CreateHTTPServer(server_view, bind_address, port, auth_token);
+        if (!server) {
+            ShowMessageBox("Error", "Failed to start HTTP server (port in use?)", OKButtonSet, ErrorIcon);
+            return;
+        }
+        g_http_servers[bv->GetObject()] =
+            HttpServerEntry{server, server_view, ViewLabel(bv), false};
     }
 
     const std::string label = ViewLabel(bv);
-    g_http_servers[bv->GetObject()] = HttpServerEntry{server, server_view, label, false};
-
     int actual_port = server->port();
     // Echo the ACTUAL bind address in the examples. Hardcoding 127.0.0.1 handed a
     // user who bound elsewhere a copy-pasteable command that cannot work.
@@ -303,6 +356,116 @@ static void StartHTTPServer(BinaryView* bv) {
     LogInfo("[bnsql] HTTP server started on %s:%d for %s", bind_address.c_str(), actual_port,
             label.c_str());
     ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
+}
+
+// Lists the BinaryView of every open tab through Binary Ninja's bundled Python
+// (the core API has no "open views" query and this plugin does not link the Qt
+// UI layer -- same approach as the ui-context capture). Prints one
+// "__BNSQL_VIEW__<hex handle>" line per view. The views are parked in a
+// sandbox global until ReleaseTabViewsHold() so the handles stay valid while
+// C++ takes its own references.
+static const char* const k_list_tab_views_py = R"PY(
+import binaryninja, ctypes
+def _bnsql_collect():
+    global _bnsql_tab_views
+    _bnsql_tab_views = []
+    seen = set()
+    from binaryninjaui import UIContext
+    for ctx in UIContext.allContexts() or []:
+        for tab in ctx.getTabs() or []:
+            frame = ctx.getViewFrameForTab(tab)
+            if frame is None:
+                continue
+            bv = frame.getCurrentBinaryView()
+            if bv is None:
+                continue
+            handle = ctypes.cast(bv.handle, ctypes.c_void_p).value
+            if handle in seen:
+                continue
+            seen.add(handle)
+            _bnsql_tab_views.append(bv)
+            print('__BNSQL_VIEW__%x' % handle)
+binaryninja.execute_on_main_thread_and_wait(_bnsql_collect)
+)PY";
+
+static void ReleaseTabViewsHold() {
+    bnsql::python::execute_snippet("_bnsql_tab_views = []", "bnsql_tabs");
+}
+
+// Returns the views of all open tabs, or sets `error`.
+static std::vector<Ref<BinaryView>> ListTabViews(std::string& error) {
+    std::vector<Ref<BinaryView>> views;
+    if (!bnsql::python::provider_available()) {
+        error = "Binary Ninja Python is not available in this process";
+        return views;
+    }
+    auto r = bnsql::python::execute_snippet(k_list_tab_views_py, "bnsql_tabs");
+    if (!r.success) {
+        error = r.error.empty() ? std::string("listing tabs failed") : r.error;
+        ReleaseTabViewsHold();
+        return views;
+    }
+    static const std::string marker = "__BNSQL_VIEW__";
+    size_t pos = 0;
+    while ((pos = r.output.find(marker, pos)) != std::string::npos) {
+        pos += marker.size();
+        const size_t end = r.output.find_first_not_of("0123456789abcdef", pos);
+        const std::string hex = r.output.substr(pos, end == std::string::npos ? end : end - pos);
+        pos = end == std::string::npos ? r.output.size() : end;
+        const uintptr_t handle = static_cast<uintptr_t>(std::stoull(hex, nullptr, 16));
+        if (!handle) continue;
+        views.push_back(new BinaryView(
+            BNNewViewReference(reinterpret_cast<BNBinaryView*>(handle))));
+    }
+    ReleaseTabViewsHold();
+    if (views.empty()) error = "No open tabs with a binary view were found";
+    return views;
+}
+
+// Starts a loopback server, on an automatically chosen free port, for every open
+// tab that does not have one yet. No prompts.
+static void StartHTTPServersForAllTabs(BinaryView*) {
+    // Listing tabs runs Python that marshals to the GUI thread, so it must not
+    // run on the GUI thread itself (same reason RunSQLQuery uses a worker).
+    WorkerEnqueue([]() {
+        std::string error;
+        std::vector<Ref<BinaryView>> views = ListTabViews(error);
+        std::string started, existing, failed;
+        int started_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_http_server_mutex);
+            PruneStoppedHTTPServers();
+            for (const auto& view : views) {
+                auto it = g_http_servers.find(view->GetObject());
+                if (it != g_http_servers.end()) {
+                    existing += "  port " + std::to_string(it->second.server->port()) + "  " +
+                                it->second.label + "\n";
+                    continue;
+                }
+                if (auto server = StartHTTPServerAutoPort(view, "127.0.0.1", std::string())) {
+                    ++started_count;
+                    started += "  port " + std::to_string(server->port()) + "  " +
+                               ViewLabel(view) + "\n";
+                    LogInfo("[bnsql] HTTP server started on 127.0.0.1:%d for %s",
+                            server->port(), ViewLabel(view).c_str());
+                } else {
+                    failed += "  " + ViewLabel(view) + "\n";
+                }
+            }
+        }
+        std::string msg;
+        if (views.empty()) {
+            msg = "Could not start servers for all tabs:\n" + error;
+        } else {
+            msg = "Started " + std::to_string(started_count) + " HTTP server(s) on 127.0.0.1";
+            if (!started.empty()) msg += ":\n" + started;
+            if (!existing.empty()) msg += "\nAlready running:\n" + existing;
+            if (!failed.empty()) msg += "\nNo free port found for:\n" + failed;
+        }
+        ExecuteOnMainThread([msg]() {
+            ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
+        });
+    }, "BNSQL start servers for all tabs");
 }
 
 // Stops the server bound to the current view; servers for other views keep running.
@@ -408,6 +571,9 @@ BINARYNINJAPLUGIN bool CorePluginInit() {
     PluginCommand::Register("BNSQL\\Show Tables", "Show available SQL tables", ShowTables);
 #ifdef BNSQL_HAS_HTTP
     PluginCommand::Register("BNSQL\\Start HTTP Server...", "Start HTTP REST API server", StartHTTPServer);
+    PluginCommand::Register("BNSQL\\Start HTTP Servers for All Tabs",
+                            "Start a loopback HTTP server on a free port for every open tab",
+                            StartHTTPServersForAllTabs);
     PluginCommand::Register("BNSQL\\Stop HTTP Server", "Stop HTTP server", StopHTTPServer);
     PluginCommand::Register("BNSQL\\HTTP Server Status", "Show HTTP server status", HTTPServerStatus);
 #endif
