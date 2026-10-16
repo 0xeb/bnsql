@@ -338,7 +338,10 @@ Open a binary, then use the **`BNSQL`** menu:
 - **Show Tables** — list the available SQL tables
 - **Start HTTP Server…** / **Stop HTTP Server** / **HTTP Server Status** —
   serve the REST API (default port 8080) against the binary open in your GUI session, then
-  query it exactly like the CLI's [`--http` mode](#http-rest-server-recommended)
+  query it exactly like the CLI's [`--http` mode](#http-rest-server-recommended).
+  Each server is bound to the tab it was started from, so with several files open you can
+  start one server per tab on different ports (e.g. 8881, 8882, …). **Stop** acts on the
+  current tab's server; **Status** lists every running server with its port and file.
 
 The plugin is GUI-only. For headless or scripted use, run the **CLI** (`bnsql <file> …`)
 instead — it does not need the plugin (the plugin detects a headless host and skips itself,
