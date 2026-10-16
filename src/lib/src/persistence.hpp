@@ -108,6 +108,13 @@ inline bool save_binary_view_on_current_thread(
         return false;
     }
 
+    // Database writes go through the file's Raw view, as Binary Ninja's own
+    // save and the Python FileMetadata.save_auto_snapshot()/create_database() do.
+    // Passing the analysed view (e.g. PE) made the GUI report "Unable to read
+    // file contents to store into database".
+    Ref<BinaryView> db_view = file->GetViewOfType("Raw");
+    if (!db_view) db_view = bv;
+
     auto current_database_path = [&]() -> std::string {
         std::string filename = file->GetFilename();
         if (filename.empty()) filename = file->GetOriginalFilename();
@@ -130,14 +137,14 @@ inline bool save_binary_view_on_current_thread(
             return false;
         }
 
-        if (!bv->CreateDatabase(created_path)) {
+        if (!db_view->CreateDatabase(created_path)) {
             set_error("Failed to create database: " + created_path);
             return false;
         }
         created_database_this_call = true;
     }
 
-    if (!bv->SaveAutoSnapshot()) {
+    if (!db_view->SaveAutoSnapshot()) {
         // Some BN runtime/config combinations do not expose autosnapshot writes
         // reliably. Fall back to full DB save on the actively opened path.
         std::string save_path;
@@ -153,7 +160,7 @@ inline bool save_binary_view_on_current_thread(
             return false;
         }
 
-        if (!bv->CreateDatabase(save_path)) {
+        if (!db_view->CreateDatabase(save_path)) {
             set_error("SaveAutoSnapshot failed for: " + save_path + " (CreateDatabase fallback failed)");
             return false;
         }
