@@ -88,10 +88,10 @@ inline std::string derive_bndb_path(const std::string& source_path) {
     return source_path.substr(0, dot) + ".bndb";
 }
 
-inline bool save_binary_view(
+inline bool save_binary_view_on_current_thread(
     const Ref<BinaryView>& bv,
-    std::string* error_out = nullptr,
-    std::string* saved_path_out = nullptr)
+    std::string* error_out,
+    std::string* saved_path_out)
 {
     auto set_error = [&](const std::string& msg) {
         if (error_out) *error_out = msg;
@@ -107,6 +107,13 @@ inline bool save_binary_view(
         set_error("No FileMetadata for BinaryView");
         return false;
     }
+
+    // Database writes go through the file's Raw view, as Binary Ninja's own
+    // save and the Python FileMetadata.save_auto_snapshot()/create_database() do.
+    // Passing the analysed view (e.g. PE) made the GUI report "Unable to read
+    // file contents to store into database".
+    Ref<BinaryView> db_view = file->GetViewOfType("Raw");
+    if (!db_view) db_view = bv;
 
     auto current_database_path = [&]() -> std::string {
         std::string filename = file->GetFilename();
@@ -130,14 +137,14 @@ inline bool save_binary_view(
             return false;
         }
 
-        if (!bv->CreateDatabase(created_path)) {
+        if (!db_view->CreateDatabase(created_path)) {
             set_error("Failed to create database: " + created_path);
             return false;
         }
         created_database_this_call = true;
     }
 
-    if (!bv->SaveAutoSnapshot()) {
+    if (!db_view->SaveAutoSnapshot()) {
         // Some BN runtime/config combinations do not expose autosnapshot writes
         // reliably. Fall back to full DB save on the actively opened path.
         std::string save_path;
@@ -153,7 +160,7 @@ inline bool save_binary_view(
             return false;
         }
 
-        if (!bv->CreateDatabase(save_path)) {
+        if (!db_view->CreateDatabase(save_path)) {
             set_error("SaveAutoSnapshot failed for: " + save_path + " (CreateDatabase fallback failed)");
             return false;
         }
@@ -168,6 +175,31 @@ inline bool save_binary_view(
     }
 
     return true;
+}
+
+// Persist the view's database. In the GUI, the save runs on Binary Ninja's main
+// thread, the same thread File > Save uses. Saving from an HTTP worker thread
+// while the GUI has the database open makes Binary Ninja show "Error while
+// saving database snapshot: Unable to read file contents to store into
+// database", even though the snapshot itself is written. Headless hosts (CLI)
+// have no GUI thread to collide with and save in place as before. The caller
+// must not hold anything the GUI thread may wait on.
+inline bool save_binary_view(
+    const Ref<BinaryView>& bv,
+    std::string* error_out = nullptr,
+    std::string* saved_path_out = nullptr)
+{
+    if (!IsUIEnabled() || IsMainThread())
+        return save_binary_view_on_current_thread(bv, error_out, saved_path_out);
+
+    bool ok = false;
+    std::string error, saved_path;
+    ExecuteOnMainThreadAndWait([&]() {
+        ok = save_binary_view_on_current_thread(bv, &error, &saved_path);
+    });
+    if (error_out) *error_out = error;
+    if (saved_path_out) *saved_path_out = saved_path;
+    return ok;
 }
 
 } // namespace persistence
