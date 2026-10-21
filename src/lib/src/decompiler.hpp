@@ -826,6 +826,10 @@ struct HLILVar {
     BNVariableSourceType source_type = RegisterVariableSourceType;
     int64_t storage_id = 0;
     Ref<Function> function;  // exact same-start/platform function for this row
+    // The hlil_vars rowid: the variable's global position (GetAnalysisFunctionList
+    // order, then GetVariables order), the key lookup_hlil_var_by_rowid resolves.
+    // Set by the table's producers; -1 elsewhere.
+    int64_t rowid = -1;
 };
 
 /**

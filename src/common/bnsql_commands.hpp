@@ -133,8 +133,11 @@ inline CommandResult handle_command(
                 std::string host;
                 int actual_port = 0;
                 if (xsql::thinclient::extract_http_start_endpoint(output, host, actual_port)) {
+                    // The REPL server is loopback-only and never authenticated
+                    // (http_start takes no token), so no Authorization header.
                     const std::string clipboard_text =
-                        xsql::thinclient::build_http_clipboard_payload("bnsql", host, actual_port);
+                        xsql::thinclient::build_http_clipboard_payload(
+                            "bnsql", host, actual_port, "SELECT * FROM binary", "");
                     (void)xsql::thinclient::try_copy_text_to_clipboard_windows(clipboard_text);
                 }
             } else {
@@ -162,7 +165,7 @@ inline CommandResult handle_command(
                      "  POST /shutdown   Stop server\n"
                      "\n"
                      "Example:\n"
-                     "  curl -X POST http://127.0.0.1:<port>/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
+                     "  curl -X POST http://127.0.0.1:<port>/query --data-binary \"SELECT name FROM funcs LIMIT 5\"\n";
         }
         else {
             output = "Unknown HTTP command: " + subargs + "\nUse '.http help' for available commands.";

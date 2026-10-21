@@ -211,7 +211,7 @@ Authentication (if enabled):
 
 Example:
   curl http://localhost:8080/help
-  curl -X POST http://localhost:8080/query -d "SELECT name FROM funcs LIMIT 5"
+  curl -X POST http://localhost:8080/query --data-binary "SELECT name FROM funcs LIMIT 5"
   curl http://localhost:8080/settings
 )";
 }

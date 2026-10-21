@@ -235,7 +235,7 @@ static void setup_http_callbacks(bnsql::CommandCallbacks& callbacks, bnsql::Quer
         }
         return "HTTP server started on port " + std::to_string(port) + "\n"
                "  curl http://127.0.0.1:" + std::to_string(port) + "/help\n"
-               "  curl -X POST http://127.0.0.1:" + std::to_string(port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"";
+               "  curl -X POST http://127.0.0.1:" + std::to_string(port) + "/query --data-binary \"SELECT name FROM funcs LIMIT 5\"";
     };
 
     callbacks.http_stop = []() -> std::string {
@@ -302,7 +302,7 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
                     auto a = req.get_header_value("Authorization");
                     if (a.rfind("Bearer ", 0) == 0) tok = a.substr(7);
                 }
-                if (tok != auth_token) {
+                if (!xsql::thinclient::detail::timing_safe_equal(tok, auth_token)) {
                     res.status = 401;
                     res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
                     return;
@@ -333,9 +333,18 @@ static int run_http_mode(bnsql::QueryEngine& qe, int port, const std::string& bi
         return 1;
     }
 
-    std::cout << "HTTP server listening on http://" << cfg.bind_address << ":" << actual_port << "\n";
+    // The example is dialed, so a wildcard bind is shown through its loopback;
+    // with --token it carries the header (the secret itself is not echoed).
+    const std::string base_url = "http://"
+        + xsql::thinclient::format_connect_url_host(cfg.bind_address) + ":"
+        + std::to_string(actual_port);
+    std::cout << "HTTP server listening on http://"
+              << xsql::thinclient::format_url_host(cfg.bind_address) << ":" << actual_port << "\n";
     std::cout << "Endpoints: /help /query /status /settings /shutdown\n";
-    std::cout << "  curl -X POST http://localhost:" << actual_port << "/query -d \"SELECT name FROM funcs LIMIT 5\"\n";
+    std::cout << "  curl " << base_url << "/help\n";
+    std::cout << "  curl -X POST " << base_url << "/query"
+              << (auth_token.empty() ? "" : " -H \"Authorization: Bearer <token>\"")
+              << " --data-binary \"SELECT name FROM funcs LIMIT 5\"\n";
     std::cout << "\nPress Ctrl+C to stop.\n\n";
     std::cout.flush();
 
@@ -811,10 +820,11 @@ static int run_cli(int argc, char* argv[]) {
 #ifdef BNSQL_HAS_MCP
     if (mcp_mode) {
         if (bind_addr.empty()) bind_addr = "127.0.0.1";
-        std::string url = "http://" + bind_addr + ":" + std::to_string(mcp_port);
 
         if (!quiet) {
-            std::cout << "Starting MCP server on " << url << "..." << std::endl;
+            std::cout << "Starting MCP server on http://"
+                      << xsql::thinclient::format_url_host(bind_addr) << ":" << mcp_port
+                      << "..." << std::endl;
         }
 
         bnsql::MCPServer mcp_server;
@@ -832,7 +842,11 @@ static int run_cli(int argc, char* argv[]) {
             std::cerr << "Error: Failed to start MCP server on port " << mcp_port << std::endl;
             return 1;
         }
-        url = "http://" + bind_addr + ":" + std::to_string(actual_port);
+        // format_mcp_info prints the endpoints and a client config, all dialed:
+        // a wildcard bind is shown through its loopback, IPv6 bracketed.
+        const std::string url = "http://"
+            + xsql::thinclient::format_connect_url_host(bind_addr) + ":"
+            + std::to_string(actual_port);
 
         size_t func_count = 0;
         auto count_result = qe.query("SELECT COUNT(*) FROM funcs");

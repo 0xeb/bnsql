@@ -101,6 +101,10 @@ static std::unique_ptr<xsql::thinclient::http_query_server> g_http_server;
 static std::mutex g_http_server_mutex;
 static Ref<BinaryView> g_http_server_bv;
 static bool g_http_server_stopping = false;
+// The running server's dialable base URL and whether it requires a token, so the
+// status box shows examples that work (guarded by g_http_server_mutex).
+static std::string g_http_server_base_url;
+static bool g_http_server_auth = false;
 
 static void StartHTTPServer(BinaryView* bv) {
     std::lock_guard<std::mutex> lock(g_http_server_mutex);
@@ -217,8 +221,23 @@ static void StartHTTPServer(BinaryView* bv) {
         cfg.status_fn = [func_count]() { return bnsql::status_extra_json(func_count); };
     }
     cfg.status_requires_auth = true;
-    cfg.extra_routes = [](httplib::Server& svr) {
-        svr.Get("/settings", [](const httplib::Request&, httplib::Response& res) {
+    // GET /settings is auth-gated like the CLI servers' (thinclient extra routes
+    // are raw, so the route checks the token itself).
+    cfg.extra_routes = [auth_token](httplib::Server& svr) {
+        svr.Get("/settings", [auth_token](const httplib::Request& req, httplib::Response& res) {
+            if (!auth_token.empty()) {
+                std::string tok;
+                if (req.has_header("X-XSQL-Token")) tok = req.get_header_value("X-XSQL-Token");
+                else if (req.has_header("Authorization")) {
+                    auto a = req.get_header_value("Authorization");
+                    if (a.rfind("Bearer ", 0) == 0) tok = a.substr(7);
+                }
+                if (!xsql::thinclient::detail::timing_safe_equal(tok, auth_token)) {
+                    res.status = 401;
+                    res.set_content("{\"success\":false,\"error\":\"Unauthorized\"}", "application/json");
+                    return;
+                }
+            }
             res.set_content(bnsql::settings_to_json(bnsql::runtime_settings().snapshot()),
                             "application/json");
         });
@@ -235,13 +254,16 @@ static void StartHTTPServer(BinaryView* bv) {
 
     int actual_port = g_http_server->port();
     // Echo the ACTUAL bind address in the examples. Hardcoding 127.0.0.1 handed a
-    // user who bound elsewhere a copy-pasteable command that cannot work.
-    const std::string host_for_url =
-        (bind_address == "0.0.0.0" || bind_address == "::") ? "127.0.0.1" : bind_address;
+    // user who bound elsewhere a copy-pasteable command that cannot work; a
+    // wildcard bind is dialed through its loopback.
+    const std::string base_url = "http://"
+        + xsql::thinclient::format_connect_url_host(bind_address) + ":"
+        + std::to_string(actual_port);
     const std::string auth_hdr = auth_token.empty()
         ? std::string()
         : " -H \"Authorization: Bearer " + auth_token + "\"";
-    std::string msg = "HTTP server started on " + bind_address + ":" + std::to_string(actual_port) +
+    std::string msg = "HTTP server started on "
+        + xsql::thinclient::format_url_host(bind_address) + ":" + std::to_string(actual_port) +
         (auth_token.empty() ? "" : "\nAuth: bearer token required") +
         "\n\nEndpoints:\n"
         "  GET  /help     - API documentation\n"
@@ -250,10 +272,13 @@ static void StartHTTPServer(BinaryView* bv) {
         "  GET  /settings - Runtime settings\n"
         "  POST /shutdown - Stop server\n\n"
         "Example:\n"
-        "  curl" + auth_hdr + " http://" + host_for_url + ":" + std::to_string(actual_port) + "/help\n"
-        "  curl" + auth_hdr + " -X POST http://" + host_for_url + ":" + std::to_string(actual_port) +
-        "/query -d \"SELECT name FROM funcs LIMIT 5\"";
-    LogInfo("[bnsql] HTTP server started on %s:%d", bind_address.c_str(), actual_port);
+        "  curl " + base_url + "/help\n"
+        "  curl -X POST " + base_url + "/query" + auth_hdr +
+        " --data-binary \"SELECT name FROM funcs LIMIT 5\"";
+    g_http_server_base_url = base_url;
+    g_http_server_auth = !auth_token.empty();
+    LogInfo("[bnsql] HTTP server started on %s:%d",
+            xsql::thinclient::format_url_host(bind_address).c_str(), actual_port);
     ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
 }
 
@@ -312,8 +337,10 @@ static void HTTPServerStatus(BinaryView*) {
         int port = g_http_server->port();
         msg = "HTTP server is RUNNING on port " + std::to_string(port) +
             "\n\nExample:\n"
-            "  curl http://127.0.0.1:" + std::to_string(port) + "/help\n"
-            "  curl -X POST http://127.0.0.1:" + std::to_string(port) + "/query -d \"SELECT name FROM funcs LIMIT 5\"";
+            "  curl " + g_http_server_base_url + "/help\n"
+            "  curl -X POST " + g_http_server_base_url + "/query" +
+            (g_http_server_auth ? " -H \"Authorization: Bearer <token>\"" : "") +
+            " --data-binary \"SELECT name FROM funcs LIMIT 5\"";
     } else {
         msg = "HTTP server is STOPPED\n\nUse Start HTTP Server to enable REST API access.";
     }

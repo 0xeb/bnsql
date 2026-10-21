@@ -68,7 +68,7 @@ If you're building an AI agent or tool that needs to query Binary Ninja database
 bnsql database.bndb --http 8080
 
 # Query from your agent (simple curl)
-curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs LIMIT 10"
+curl -X POST http://localhost:8080/query --data-binary "SELECT name, size FROM funcs LIMIT 10"
 ```
 
 See [Server Modes](#server-modes) for full HTTP API documentation, authentication, and MCP protocol support.
@@ -245,7 +245,7 @@ bnsql database.bndb --http 8080 --token mysecret
 curl http://localhost:8080/help
 
 # Execute SQL query
-curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs LIMIT 5"
+curl -X POST http://localhost:8080/query --data-binary "SELECT name, size FROM funcs LIMIT 5"
 
 # With authentication
 curl -X POST http://localhost:8080/query \

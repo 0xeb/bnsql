@@ -118,10 +118,10 @@ elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../libxsql/CMakeLists.txt")
 else()
     message(STATUS "bnsql: Fetching libxsql from GitHub...")
     include(FetchContent)
-    # Pinned to the libxsql release this bnsql was built and tested against.
+    # Keep standalone builds on the released API used for this version.
     FetchContent_Declare(libxsql
         GIT_REPOSITORY https://github.com/0xeb/libxsql.git
-        GIT_TAG        v1.0.18
+        GIT_TAG        v1.0.25
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(libxsql)

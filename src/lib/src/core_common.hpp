@@ -43,5 +43,26 @@ struct BNContext {
 
 Ref<BinaryView> get_bv();
 
+// ============================================================================
+// Initialized (loaded) bytes
+// ============================================================================
+// A byte is initialized when a segment holds it and Binary Ninja reports it
+// loaded (IsOffsetBackedByFile): file-backed segment data and data memory
+// regions are; a BSS tail, an unbacked user segment and an unbacked (fill)
+// memory region are not, although all of them read (as zeros or the fill).
+// GetDataLength() alone does not decide it: the segment Binary Ninja derives from
+// a data memory region (MemoryMap::AddDataMemoryRegion) reports data length 0.
+// Measured on Binary Ninja 6.0: a segment is one resolved memory range, so the
+// answer is the same for every byte of it, and where GetDataLength() is not 0
+// it covers the whole segment and agrees with IsOffsetBackedByFile.
+
+// The number of initialized bytes from the segment's start: GetDataLength()
+// when it is not 0 (no extra call), otherwise the whole segment when its
+// first byte is backed, otherwise 0.
+uint64_t segment_initialized_length(const Ref<BinaryView>& bv, const Ref<Segment>& seg);
+
+// True when addr is in a segment and within its initialized bytes.
+bool is_initialized_at(const Ref<BinaryView>& bv, uint64_t addr);
+
 } // namespace core
 } // namespace bnsql

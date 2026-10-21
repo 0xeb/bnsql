@@ -284,7 +284,9 @@ CachedTableDef<TypeInfo> define_types() {
         // instead of rendering every type's full definition (Finding #1). Names
         // are unique in the type namespace, so at most one row. cost=0.5 keeps it
         // preferred over the full scan; est_rows=1.
-        .filter_eq_text("name", [](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+        .filter_eq_text("name", [](const std::string& full_name) -> std::unique_ptr<xsql::RowIterator> {
+            if (full_name.find('\0') != std::string::npos) return nullptr;
+            const char* name = full_name.c_str();
             return std::make_unique<TypeByNameIterator>(name ? name : "");
         }, 0.5, 1.0)
         // Stable rowid = the enumeration `id`. Required for write correctness once

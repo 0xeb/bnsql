@@ -344,7 +344,9 @@ CachedTableDef<TypeMemberInfo> define_type_members() {
         // cache_builder (GetTypes() copy + GetMembers()+GetString() per member of
         // every struct). cost=1.0 keeps it well below the full-scan estimate.
         .filter_eq_text("type_name",
-            [](const char* name) -> std::unique_ptr<xsql::RowIterator> {
+            [](const std::string& full_name) -> std::unique_ptr<xsql::RowIterator> {
+                if (full_name.find('\0') != std::string::npos) return nullptr;
+                const char* name = full_name.c_str();
                 return std::make_unique<TypeMembersByNameIterator>(
                     name ? name : "");
             }, 1.0, 8.0)

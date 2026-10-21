@@ -6,6 +6,11 @@
 
 #include "decompiler.hpp"
 
+#include <mutex>
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
 namespace bnsql {
 namespace decompiler {
 
@@ -14,7 +19,7 @@ using namespace BinaryNinja;
 namespace {
 
 // ----------------------------------------------------------------------------
-// Pseudocode stable rowid: pack (func_addr, same-start variant, line_num).
+// Pseudocode stable rowid: pack (function key, same-start variant, line_num).
 //
 // The `func_addr` filter iterator AND the DELETE row_lookup must agree on each
 // row's rowid WITHOUT counting pseudocode lines in the functions that precede
@@ -22,21 +27,65 @@ namespace {
 // eliminating). Binary Ninja can expose multiple platform functions with the
 // same entry, so the row identity also carries that function's ordinal among
 // GetAnalysisFunctionsForAddress() results. line_num occupies the low bits,
-// followed by the variant ordinal; func_addr occupies the high bits.
+// followed by the variant ordinal; the function key occupies the high bits.
+//
+// The function key is a dense per-process ordinal for the function's address,
+// not the address itself: an address needs all 64 bits (a kernel function sits
+// above 2^63, and anything above 2^40 would lose its top bits), and the row id
+// must also carry the line and the variant. Keys are never reused, so a row id
+// stays valid for the life of the process.
 constexpr int PSEUDO_LINE_BITS = 16;
 constexpr uint64_t PSEUDO_LINE_MASK = (uint64_t{1} << PSEUDO_LINE_BITS) - 1;
 constexpr int PSEUDO_VARIANT_BITS = 8;
 constexpr uint64_t PSEUDO_VARIANT_MASK =
     (uint64_t{1} << PSEUDO_VARIANT_BITS) - 1;
 constexpr int PSEUDO_KEY_BITS = PSEUDO_LINE_BITS + PSEUDO_VARIANT_BITS;
+// Keys stay below 2^39, so a row id is never negative.
+constexpr uint64_t PSEUDO_MAX_FUNC_KEYS = uint64_t{1} << (63 - PSEUDO_KEY_BITS);
+
+class PseudocodeFuncKeys {
+    std::mutex mutex_;
+    std::unordered_map<uint64_t, uint64_t> key_of_;
+    std::vector<uint64_t> addr_of_;
+
+public:
+    // The key for func_addr, assigned on first use; nullopt when the key space
+    // is exhausted (2^39 distinct function addresses in one process).
+    std::optional<uint64_t> key_for(uint64_t func_addr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = key_of_.find(func_addr);
+        if (it != key_of_.end()) return it->second;
+        if (addr_of_.size() >= PSEUDO_MAX_FUNC_KEYS) return std::nullopt;
+        const uint64_t key = addr_of_.size();
+        key_of_.emplace(func_addr, key);
+        addr_of_.push_back(func_addr);
+        return key;
+    }
+
+    std::optional<uint64_t> addr_for(uint64_t key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (key >= addr_of_.size()) return std::nullopt;
+        return addr_of_[key];
+    }
+};
+
+PseudocodeFuncKeys& pseudocode_func_keys() {
+    static PseudocodeFuncKeys keys;
+    return keys;
+}
 
 inline int64_t encode_pseudocode_rowid(
         uint64_t func_addr, uint16_t func_variant, int line_num) {
+    const std::optional<uint64_t> key = pseudocode_func_keys().key_for(func_addr);
+    if (!key) {
+        xsql::set_vtab_error("pseudocode: too many functions for stable rowids");
+        return -1;
+    }
     const uint64_t line = static_cast<uint64_t>(line_num) & PSEUDO_LINE_MASK;
     const uint64_t variant =
         static_cast<uint64_t>(func_variant) & PSEUDO_VARIANT_MASK;
     return static_cast<int64_t>(
-        (func_addr << PSEUDO_KEY_BITS) | (variant << PSEUDO_LINE_BITS) | line);
+        (*key << PSEUDO_KEY_BITS) | (variant << PSEUDO_LINE_BITS) | line);
 }
 
 // True if SQLite's colUsed bitmask marks column `col` as read by the query.
@@ -472,6 +521,7 @@ bool lookup_hlil_var_by_rowid(HLILVar& out, int64_t rowid) {
             if (local < 0 || local >= static_cast<int64_t>(vars.size()))
                 return false;
             out = std::move(vars[static_cast<size_t>(local)]);
+            out.rowid = rowid;
             return true;
         }
         current += n;
@@ -595,7 +645,10 @@ constexpr size_t INTERRUPT_POLL_STRIDE = 16;
 bool lookup_pseudocode_by_rowid(PseudocodeLine& out, int64_t rowid) {
     if (rowid < 0) return false;
     const uint64_t key = static_cast<uint64_t>(rowid);
-    const uint64_t func_addr = key >> PSEUDO_KEY_BITS;
+    const std::optional<uint64_t> func_key =
+        pseudocode_func_keys().addr_for(key >> PSEUDO_KEY_BITS);
+    if (!func_key) return false;
+    const uint64_t func_addr = *func_key;
     const uint16_t func_variant = static_cast<uint16_t>(
         (key >> PSEUDO_LINE_BITS) & PSEUDO_VARIANT_MASK);
     const int line_num = static_cast<int>(key & PSEUDO_LINE_MASK);
@@ -1507,13 +1560,19 @@ static void parse_mlil_constraints(const std::vector<xsql::GeneratorConstraintAr
                                    int func_addr_col, int maturity_col,
                                    uint64_t& target, bool& has_target, ILForm& form, bool& valid) {
     target = 0; has_target = false; form = ILForm::MLIL_SSA; valid = true;
+    // Both constraints are omit=1: a func_addr no integer equals (4096.5,
+    // NULL, 'a') or a NULL/blob maturity matches no row.
     for (const auto& arg : args) {
         if (arg.op != xsql::ConstraintOp::Eq) continue;
         if (arg.column_index == func_addr_col) {
-            target = static_cast<uint64_t>(arg.value.as_int64()); has_target = true;
+            const std::optional<int64_t> key = xsql::exact_int64(arg.value);
+            if (!key) { valid = false; continue; }
+            target = static_cast<uint64_t>(*key); has_target = true;
         } else if (arg.column_index == maturity_col) {
+            const std::optional<std::string> name = xsql::exact_text(arg.value);
             ILForm f;
-            if (name_to_form(arg.value.as_c_str(), f)) form = f;
+            if (name && name->find('\0') == std::string::npos &&
+                name_to_form(name->c_str(), f)) form = f;
             else valid = false;  // unknown maturity -> yield nothing
         }
     }
@@ -1823,6 +1882,7 @@ public:
                 std::vector<HLILVar> vars;
                 collect_hlil_vars_for_function(vars, func);
                 for (auto& var : vars) {
+                    var.rowid = current;
                     rowids_.push_back(current++);
                     rows_.push_back(std::move(var));
                 }
@@ -1909,7 +1969,15 @@ CachedTableDef<HLILVar> define_hlil_vars() {
                 }
                 collect_hlil_vars_for_function(cache, func);
             }
+            // The cache position IS the global positional rowid (same function
+            // and variable order as lookup_hlil_var_by_rowid).
+            for (size_t pos = 0; pos < cache.size(); ++pos) {
+                cache[pos].rowid = static_cast<int64_t>(pos);
+            }
         })
+        // Full and index scans report the same key the iterator reports and
+        // row_lookup resolves (libxsql requires rowid() with row_lookup()).
+        .rowid([](const HLILVar& r) -> int64_t { return r.rowid; })
         .row_lookup([](HLILVar& row, int64_t rowid) -> bool {
             return lookup_hlil_var_by_rowid(row, rowid);
         })
@@ -2450,6 +2518,10 @@ static void sql_decompile(xsql::FunctionContext& ctx, int argc, xsql::FunctionAr
     if (refresh) {
         funcs[0]->Reanalyze(BNFunctionUpdateType::UserFunctionUpdate);
         bv->UpdateAnalysisAndWait();
+        // Re-analysis can change what almost every table reads, and libxsql
+        // keeps a query-scoped table's rows for the life of a cursor: without
+        // this a later probe of the same statement serves pre-refresh rows.
+        ctx.invalidate_cached_tables();
         // Re-fetch function list after re-analysis
         funcs = bv->GetAnalysisFunctionsContainingAddress(ea);
         if (funcs.empty()) {

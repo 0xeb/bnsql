@@ -16,5 +16,21 @@ void set_context(BNContext* ctx) { g_context = ctx; }
 BNContext* get_context() { return g_context; }
 Ref<BinaryView> get_bv() { return g_context ? g_context->bv : nullptr; }
 
+uint64_t segment_initialized_length(const Ref<BinaryView>& bv, const Ref<Segment>& seg) {
+    if (!bv || !seg) return 0;
+    const uint64_t length = seg->GetLength();
+    const uint64_t data_length = seg->GetDataLength();
+    if (data_length != 0) return data_length < length ? data_length : length;
+    return length != 0 && bv->IsOffsetBackedByFile(seg->GetStart()) ? length : 0;
+}
+
+bool is_initialized_at(const Ref<BinaryView>& bv, uint64_t addr) {
+    if (!bv) return false;
+    Ref<Segment> seg = bv->GetSegmentAt(addr);
+    if (!seg) return false;
+    const uint64_t start = seg->GetStart();
+    return addr >= start && addr - start < segment_initialized_length(bv, seg);
+}
+
 } // namespace core
 } // namespace bnsql

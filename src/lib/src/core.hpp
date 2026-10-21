@@ -48,7 +48,7 @@ namespace core {
 // Owns every core virtual table and registers it (plus the helper SQL views).
 struct CoreRegistry {
     CachedTableDef<code::FuncInfo> funcs;
-    VTableDef segments;
+    CachedTableDef<memory::SegmentRow> segments;
     CachedTableDef<symbols::SymbolInfo> names;
     CachedTableDef<symbols::ExportInfo> exports;
     CachedTableDef<memory::StringInfo> strings;

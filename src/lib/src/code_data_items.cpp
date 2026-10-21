@@ -20,15 +20,11 @@ using core::get_bv;
 
 namespace {
 
-// 1 when addr lies in a segment's raw-backed data (GetDataLength), 0 for a
-// mapped-but-uninitialized byte (BSS tail) or an unmapped address. Mirrors the
-// bytes-table ruling (canonical byte surface).
+// 1 when addr is an initialized byte (file data or a data memory region), 0
+// for a mapped-but-uninitialized byte (BSS tail) or an unmapped address. The
+// same rule as the bytes table (core::is_initialized_at).
 int data_is_initialized(Ref<BinaryView>& bv, uint64_t addr) {
-    if (!bv) return 0;
-    auto seg = bv->GetSegmentAt(addr);
-    if (!seg) return 0;
-    const uint64_t start = seg->GetStart();
-    return addr >= start && addr - start < seg->GetDataLength() ? 1 : 0;
+    return core::is_initialized_at(bv, addr) ? 1 : 0;
 }
 
 // BN segments are unnamed; the human-facing region name is the section.

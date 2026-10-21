@@ -6,7 +6,7 @@ Structurally aligned with idasql's own agent guide where the underlying
 analysis concepts overlap, with BN-specific deltas (HLIL/MLIL surfaces,
 explicit-save model, no Hex-Rays, no IDAPython).
 
-Current target: bnsql v0.0.13+ (explicit-save model, type intelligence,
+Current target: bnsql v0.0.14+ (explicit-save model, type intelligence,
 patches, binary search, callers/callees views).
 
 ---
@@ -78,7 +78,7 @@ bnsql sample.exe                                            # raw binary
 **4. HTTP REST Server**
 ```bash
 bnsql database.bndb --http 8080
-# Then: curl -X POST http://localhost:8080/query -d "SELECT * FROM funcs"
+# Then: curl -X POST http://localhost:8080/query --data-binary "SELECT * FROM funcs"
 ```
 
 **5. MCP Server (for Claude Desktop and other MCP clients)**
@@ -273,6 +273,33 @@ WHERE func_addr = (SELECT addr FROM funcs WHERE name LIKE '%main%' LIMIT 1);
 ### Addresses
 Everything in a binary has an **address** - a memory location where code or data lives. SQL shows these as integers; use `hex(addr)` for hex display.
 
+#### High addresses (>= 2^63)
+SQLite integers are signed, so an address at or above `0x8000000000000000`
+(kernel images: `0xFFFFF800...`, `0xFFFFFFFF8...`) is a **negative INTEGER** in
+every `addr`-like column, and `ORDER BY addr` puts the high half **first**
+(most negative first), then `0`, then the low half. Every table returns and
+orders such rows the way SQLite would.
+
+- Write a high address as a **hex literal** (`0xFFFFF80000100000`) or its
+  negative decimal (`-8796091973632`). **Never** as a decimal >= 2^63
+  (`18446735277617577984`): SQLite reads that as a REAL, which no address
+  equals, so the query silently matches nothing (`segments` INSERT refuses it).
+- `addr >= 0xFFFFF80000000000` also matches **every low-half address**
+  (they are signed-greater). For the high half only, write
+  `addr BETWEEN 0xFFFFF80000000000 AND -1` (or add `AND addr < 0`).
+- `hex(addr)` and `printf('0x%X', addr)` print the unsigned form.
+- A Binary Ninja segment cannot reach 2^64: the highest `end_addr` is
+  `0xFFFFFFFFFFFFFFFF` (`-1`), so the last byte in a segment is
+  `0xFFFFFFFFFFFFFFFE`.
+- A `bytes WHERE start_addr = X AND n = N ... ORDER BY addr` read that crosses
+  `0x7FFFFFFFFFFFFFFF` lists the part at or above 2^63 first. To concatenate it
+  in memory order, sort unsigned: `ORDER BY addr < 0, addr`.
+
+```sql
+SELECT hex(addr), name, size FROM funcs
+WHERE addr BETWEEN 0xFFFFF80000000000 AND -1 ORDER BY addr LIMIT 20;
+```
+
 ### Functions
 Binary Ninja groups code into **functions** with:
 - `addr` - Where the function begins
@@ -320,12 +347,19 @@ SELECT name, hex(addr) as addr FROM funcs WHERE name LIKE 'sub_%';
 ```
 
 ### segments
-Memory segments. **Writable**: INSERT a region (BN user segment), DELETE it, and
-UPDATE `start_addr` (rebase/move), `end_addr` (resize), `perm`.
+Memory segments, one row per Binary Ninja segment. **Writable**: INSERT a user
+segment, DELETE a row, and UPDATE `start_addr` (move), `end_addr` (resize),
+`perm`. What a write does depends on what the row is:
+
+| Row is | DELETE | UPDATE `perm` | UPDATE `start_addr` / `end_addr` |
+|--------|--------|---------------|----------------------------------|
+| a user segment (INSERT, or added by a script) | removes it | sets R/W/X | moves / resizes it |
+| a memory region added to the view (e.g. `add_memory_region`) | removes the region | sets the region's R/W/X | refused, naming the region |
+| a segment the loader defined (a PE/ELF section, a raw image's mapping, a section's unbacked tail) | refused | sets R/W/X (the row's own loader region) | refused |
 
 | Column | Type | RW | Description |
 |--------|------|----|-------------|
-| `start_addr` | INT | RW | Segment start; UPDATE rebases (moves) the segment |
+| `start_addr` | INT | RW | Segment start; UPDATE moves the segment |
 | `end_addr` | INT | RW | Segment end; UPDATE resizes the segment |
 | `name` | TEXT | R | Synthesized `seg_<addr>` (BN segments are unnamed) |
 | `class` | TEXT | R | CODE/DATA (derived from perm) |
@@ -335,16 +369,32 @@ UPDATE `start_addr` (rebase/move), `end_addr` (resize), `perm`.
 -- Find executable segments
 SELECT name, hex(start_addr) as start FROM segments WHERE perm & 1 = 1;
 
--- Add a region (e.g. SRAM for a raw firmware image), then rebase a segment.
+-- Add an unbacked region (e.g. SRAM for a raw firmware image), then move it.
 -- Only start_addr/end_addr/perm are stored; the name is synthesized (seg_<addr>)
 -- and the class is derived from perm — passing name/class has no effect.
 INSERT INTO segments(start_addr, end_addr, perm)
   VALUES (0x20000000, 0x20005000, 6);
-UPDATE segments SET start_addr = 0x08000000 WHERE start_addr = 0x0;  -- rebase
+UPDATE segments SET start_addr = 0x20010000 WHERE start_addr = 0x20000000;  -- move
 ```
 
-Note: BN segments are addressed (no native name/move), so move/resize/perm UPDATEs
-remove and re-add the underlying user segment. Operate on user segments.
+A write never reports success without its effect; a refusal says why and
+changes nothing. A write never changes a row it did not name: a region's perm
+or DELETE is refused when that region backs other rows too (e.g. a segment laid
+over its middle). A section and its unbacked tail are separate rows with
+separate loader regions, so `perm` on one leaves the other. Segments never overlap: an INSERT, move or resize onto another
+segment is refused (delete or shrink that one first). A `perm` change keeps the
+segment's code/data flags. When a user segment is only partly file-backed,
+Binary Ninja shows it as two rows (backed, then unbacked); a write on one row
+leaves the other. Removing a region or segment does not undefine what is in
+it (Binary Ninja's behaviour): a function there stays in `funcs` until the
+database is reopened, and data variables, names and comments at its addresses
+stay after that too.
+
+Segment bounds are unsigned addresses: a segment may sit at, or cross,
+`0x8000000000000000` (write the bounds as hex literals, see "High addresses").
+`end_addr` must be above `start_addr` in unsigned terms; `-1`
+(`0xFFFFFFFFFFFFFFFF`) is the highest end Binary Ninja can hold, and an
+`end_addr` of `0` is refused rather than wrapped to 2^64.
 
 ### names
 All named locations (functions, labels, data).
@@ -493,8 +543,8 @@ register). Canonical cross-tool schema. Read-only. One row per function.
 | `stack_base_reg` | TEXT | Architecture stack-pointer register (e.g. `rsp`) |
 | `has_frame_pointer` | INT | **Always NULL** — no clean per-function flag in BN |
 
-(idasql populates saved_reg_size/has_frame_pointer but not stack_base_reg; ghidra/r2
-differ — the NULLs above are BN limitations, not gaps.)
+(idasql fills saved_reg_size, stack_base_reg and has_frame_pointer; the NULLs above are
+BN limitations, not gaps.)
 
 ```sql
 SELECT func_addr, frame_size, local_size, stack_base_reg FROM function_frames
@@ -514,7 +564,7 @@ full-scan cached table; one row per DataVariable.
 | `value_repr` | TEXT | String contents for strlits, target-endian hex for 1/2/4/8-byte scalars, else NULL |
 | `segment_name` | TEXT | Containing **section** name (BN segments are unnamed), or NULL |
 | `is_string` | INT | 1 when a string reference starts at `addr` |
-| `is_initialized` | INT | 0 for BSS / unmapped bytes, 1 otherwise |
+| `is_initialized` | INT | 1 when `addr` holds loaded data (file bytes or a data memory region), 0 for BSS / unbacked / unmapped bytes |
 
 ```sql
 -- All defined strings, largest first
@@ -1118,9 +1168,11 @@ Always pair the read with one of `WHERE start_addr = X AND n = N`,
 `AND addr < B`, or an outer `LIMIT` to bound the output.
 
 Visible columns: `addr`, `value` (0–255 when initialized, NULL when not),
-and `is_initialized` — 1 for loaded bytes, 0 for uninitialized/BSS bytes
-(whose `value` reads back NULL, preserving the unknown-vs-real-0
-distinction). `WHERE is_initialized = 1` is the initialized-only view (the
+and `is_initialized` — 1 for loaded bytes (file data, and data memory regions
+added through Binary Ninja's memory map, whose segment reports data length 0),
+0 for uninitialized bytes: a BSS tail, an unbacked segment or an unbacked (fill)
+memory region (their `value` reads back NULL, preserving the unknown-vs-real-0
+distinction). `byte_search` searches exactly the initialized bytes. `WHERE is_initialized = 1` is the initialized-only view (the
 canonical cross-tool byte-surface flag, matching idasql/ghidrasql/r2sql).
 
 ### Byte Patches via the `patches` Table
@@ -1147,9 +1199,17 @@ Canonical columns — visible: `addr`, `matched_hex` (spaced lowercase, e.g. `48
 | Surface | Description |
 |---------|-------------|
 | `byte_search('<pat>')` / `... WHERE pattern = '<pat>'` | All matches over initialized mapped bytes (lazy bounded-page scan) |
-| `byte_search('<pat>', start_addr, end_addr)` | Matches within `[start_addr, end_addr)` |
+| `byte_search('<pat>', start_addr, end_addr)` | Matches starting in `[start_addr, end_addr)` (unsigned scan bounds) |
 | `... WHERE pattern = '<pat>' AND max_results = N` | Cap the result set |
 | `search_first(pattern)` (scalar) | First match address (INTEGER) or NULL |
+
+**Order and high addresses:** matches come back in `addr` order as SQL sorts
+it, so a match at or above `0x8000000000000000` (a negative `addr`) comes
+before the low-half matches, and `ORDER BY addr LIMIT n` is free. `start_addr`
+/ `end_addr` are plain unsigned scan bounds; to keep only kernel-half matches
+filter on `addr` (`AND addr BETWEEN 0xFFFFF80000000000 AND -1`), since
+`addr >= <high hex>` includes the low half too. `search_first` returns the
+lowest match in unsigned address order.
 
 **Pattern syntax (FlexHex; whitespace between bytes optional):**
 - `"48 8B 05"` - Exact bytes (hex)
@@ -1187,7 +1247,7 @@ WHERE func_start(addr) IS NOT NULL;
 ```
 
 This is **much faster** than scanning all disassembly lines because:
-- `byte_search` scans mapped segment bytes directly (no JSON)
+- `byte_search` scans the initialized segment bytes directly (no JSON)
 - `func_start()` is O(1) lookup in function index
 
 ### Names & Functions
@@ -1658,7 +1718,7 @@ bnsql database.bndb --http 8080 --token mysecret
 curl http://localhost:8080/help
 
 # Execute SQL query
-curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs LIMIT 5"
+curl -X POST http://localhost:8080/query --data-binary "SELECT name, size FROM funcs LIMIT 5"
 
 # With authentication
 curl -X POST http://localhost:8080/query \

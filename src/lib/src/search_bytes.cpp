@@ -23,8 +23,9 @@
  *   SELECT addr FROM byte_search('48 8B', 0x140001000, 0x140002000); -- range-limited
  *   SELECT printf('0x%X', search_first('CC CC CC'));                 -- scalar
  *
- * Implementation note: the search reads mapped segment bytes directly
- * (bv->GetSegments() + bv->ReadBuffer(), the same source the `bytes` table uses)
+ * Implementation note: the search reads the initialized segment bytes directly
+ * (bv->GetSegments() + bv->ReadBuffer(), the same source and the same
+ * initialized check the `bytes` table uses)
  * and matches a parsed byte+mask pattern. It deliberately does NOT use
  * BinaryView::Search(): that (ABS/FlexHex) path yields zero matches on a headless
  * raw-binary session, whereas the segment bytes are always readable here.
@@ -43,6 +44,7 @@
 #include <cstdint>
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 namespace bnsql {
 namespace search {
@@ -197,13 +199,16 @@ class SearchBytesScanGenerator : public xsql::Generator<SearchResult> {
     }
 
 public:
+    // `windows` are inclusive ranges of candidate START addresses, searched in
+    // the order given (the caller passes them in SQL order). A match must fit
+    // inside one initialized span; it may run past its window's upper end.
     SearchBytesScanGenerator(Ref<BinaryView> bv, std::vector<PatternByte> pattern,
-                             uint64_t start, uint64_t end_inclusive,
-                             bool empty = false, size_t max_results = 0)
+                             const std::vector<xsql::U64Span>& windows,
+                             size_t max_results = 0)
         : bv_(std::move(bv)),
           pattern_(std::move(pattern)),
           max_results_(max_results) {
-        if (empty || !bv_ || pattern_.empty()) return;
+        if (!bv_ || pattern_.empty() || windows.empty()) return;
         const uint64_t plen = static_cast<uint64_t>(pattern_.size());
 
         auto segments = bv_->GetSegments();
@@ -215,16 +220,19 @@ public:
         spans.reserve(segments.size());
         for (auto& seg : segments) {
             const uint64_t segment_start = seg->GetStart();
-            const uint64_t data_length = seg->GetDataLength();
-            if (data_length == 0) continue;  // do not search an uninitialized BSS tail
-            if (data_length - 1 >
+            // Only initialized bytes are searched: file data and data memory
+            // regions (whose segment reports data length 0), not a BSS tail
+            // or an unbacked segment (core::segment_initialized_length).
+            const uint64_t initialized = core::segment_initialized_length(bv_, seg);
+            if (initialized == 0) continue;
+            if (initialized - 1 >
                 std::numeric_limits<uint64_t>::max() - segment_start) {
                 xsql::set_vtab_error("byte_search: segment address range overflows uint64");
                 regions_.clear();
                 return;
             }
             const InitializedSpan span{
-                segment_start, segment_start + data_length - 1};
+                segment_start, segment_start + initialized - 1};
             if (spans.empty() ||
                 (spans.back().end_inclusive !=
                      std::numeric_limits<uint64_t>::max() &&
@@ -237,16 +245,21 @@ public:
 
         // Search the union of initialized virtual addresses. Adjacent segments
         // are one readable span, so a pattern starting at the end of one segment
-        // may legitimately finish in the next.
+        // may legitimately finish in the next -- including across 2^63, which is
+        // no boundary to Binary Ninja. A match belongs to the window its START
+        // falls in, so the last candidate of a region is min(window end, span
+        // end - (pattern length - 1)): widening by the pattern length never
+        // steps past the span, and so never past the top of the space.
         const uint64_t pattern_tail = plen - 1;
-        for (const auto& span : spans) {
-            if (span.end_inclusive - span.start < pattern_tail) continue;
-            uint64_t region_start = std::max(span.start, start);
-            uint64_t region_end = std::min(
-                span.end_inclusive - pattern_tail, end_inclusive);
-            if (region_end < region_start) continue;
-
-            regions_.push_back({region_start, region_end});
+        for (const xsql::U64Span& window : windows) {
+            for (const auto& span : spans) {
+                if (span.end_inclusive - span.start < pattern_tail) continue;
+                const uint64_t region_start = std::max(span.start, window.lo);
+                const uint64_t region_end = std::min(
+                    span.end_inclusive - pattern_tail, window.hi);
+                if (region_end < region_start) continue;
+                regions_.push_back({region_start, region_end});
+            }
         }
     }
 
@@ -299,81 +312,75 @@ enum SearchColumn {
     kMaxResults = 7,   // hidden: optional result cap
 };
 
-struct SearchWindow {
-    uint64_t lo = 0;
-    uint64_t hi = std::numeric_limits<uint64_t>::max();
-    bool empty = false;
-};
-
-inline void apply_lower(SearchWindow& window, int64_t value, bool exclusive) {
-    if (value < 0) return;
-    uint64_t lower = static_cast<uint64_t>(value);
-    if (exclusive) {
-        if (lower == std::numeric_limits<uint64_t>::max()) {
-            window.empty = true;
-            return;
-        }
-        ++lower;
-    }
-    window.lo = std::max(window.lo, lower);
-}
-
-inline void apply_upper(SearchWindow& window, int64_t value, bool inclusive) {
-    if (value < 0 || (!inclusive && value == 0)) {
-        window.empty = true;
-        return;
-    }
-    uint64_t upper = static_cast<uint64_t>(value);
-    if (!inclusive) --upper;
-    window.hi = std::min(window.hi, upper);
-}
-
 inline std::unique_ptr<xsql::Generator<SearchResult>>
 make_search_generator(const std::vector<xsql::GeneratorConstraintArg>& args) {
+    // Every constraint is omit=1. The hidden inputs take a value only when a
+    // native column of their type would equal it (pattern = NULL, start_addr =
+    // 4096.5 and max_results = 1.5 request nothing), and the addr bounds are
+    // compared the way SQLite compares the INTEGER addr column.
+    //
+    // start_addr / end_addr are unsigned scan bounds (a match starts at or
+    // after start_addr and before end_addr), bit-cast from SQL like every
+    // address. The addr window is walked as its unsigned spans in SQL order
+    // (xsql::Int64KeyRange::unsigned_spans): an address >= 2^63 is a negative
+    // INTEGER, so the part of the window at or above 2^63 is searched first
+    // and the plan's ORDER BY addr claim holds.
     std::string pattern;
-    SearchWindow window;
+    uint64_t scan_lo = 0;
+    uint64_t scan_hi = std::numeric_limits<uint64_t>::max();  // inclusive
+    bool scan_empty = false;
     size_t max_results = 0;
+    xsql::Int64KeyRange addr_range;
     for (const auto& arg : args) {
+        if (arg.column_index == kAddr) {
+            if (arg.op == xsql::ConstraintOp::Like) continue;
+            addr_range.constrain(arg.op, arg.value);
+            continue;
+        }
+        if (arg.op != xsql::ConstraintOp::Eq) continue;
         if (arg.column_index == kPattern) {
-            if (arg.op == xsql::ConstraintOp::Eq) {
-                const char* p = arg.value.as_c_str();
-                if (p) pattern = p;
-            }
-        } else if (arg.column_index == kStartAddr) {
-            if (arg.op == xsql::ConstraintOp::Eq)
-                apply_lower(window, arg.value.as_int64(), false);
+            std::optional<std::string> text = xsql::exact_text(arg.value);
+            if (!text) return nullptr;
+            pattern = std::move(*text);
+            continue;
+        }
+        if (arg.column_index != kStartAddr && arg.column_index != kEndAddr &&
+            arg.column_index != kMaxResults) {
+            continue;
+        }
+        const std::optional<int64_t> value = xsql::exact_int64(arg.value);
+        if (!value) return nullptr;
+        if (arg.column_index == kStartAddr) {
+            scan_lo = std::max(scan_lo, static_cast<uint64_t>(*value));
         } else if (arg.column_index == kEndAddr) {
-            if (arg.op == xsql::ConstraintOp::Eq)
-                apply_upper(window, arg.value.as_int64(), false);
-        } else if (arg.column_index == kMaxResults) {
-            if (arg.op == xsql::ConstraintOp::Eq) {
-                const int64_t v = arg.value.as_int64();
-                if (v > 0) max_results = static_cast<size_t>(v);
-            }
-        } else if (arg.column_index == kAddr) {
-            const int64_t v = arg.value.as_int64();
-            if (arg.op == xsql::ConstraintOp::Ge) apply_lower(window, v, false);
-            else if (arg.op == xsql::ConstraintOp::Gt) apply_lower(window, v, true);
-            else if (arg.op == xsql::ConstraintOp::Lt) apply_upper(window, v, false);
-            else if (arg.op == xsql::ConstraintOp::Le) apply_upper(window, v, true);
+            const uint64_t end = static_cast<uint64_t>(*value);  // exclusive
+            if (end == 0) scan_empty = true;
+            else scan_hi = std::min(scan_hi, end - 1);
+        } else if (*value > 0) {
+            max_results = static_cast<size_t>(*value);
         }
     }
-    if (window.lo > window.hi) window.empty = true;
+
+    std::vector<xsql::U64Span> windows;
+    if (!scan_empty && scan_lo <= scan_hi) {
+        for (const xsql::U64Span& span : addr_range.unsigned_spans()) {
+            const uint64_t lo = std::max(span.lo, scan_lo);
+            const uint64_t hi = std::min(span.hi, scan_hi);
+            if (lo <= hi) windows.push_back({lo, hi});
+        }
+    }
 
     std::vector<PatternByte> parsed;
     if (!parse_pattern(pattern, parsed)) {
         xsql::set_vtab_error("byte_search: invalid byte pattern");
         parsed.clear();
-        window.empty = true;
     } else if (parsed.size() >
         std::numeric_limits<size_t>::max() - kSearchPageCandidates + 1) {
         xsql::set_vtab_error("byte_search: pattern is too large");
         parsed.clear();
-        window.empty = true;
     }
     return std::make_unique<SearchBytesScanGenerator>(
-        core::get_bv(), std::move(parsed), window.lo, window.hi,
-        window.empty, max_results);
+        core::get_bv(), std::move(parsed), windows, max_results);
 }
 
 } // namespace detail
@@ -436,9 +443,11 @@ static void sql_search_first_1(xsql::FunctionContext& ctx, int argc, xsql::Funct
     std::vector<detail::PatternByte> parsed;
     if (!detail::parse_pattern(pattern, parsed)) { ctx.result_error("Invalid byte pattern"); return; }
 
+    // The lowest match in unsigned address order: one window over the whole
+    // space (SQL order does not apply to a scalar).
     detail::SearchBytesScanGenerator gen(
-        bv, std::move(parsed), 0, std::numeric_limits<uint64_t>::max(),
-        false, 1);
+        bv, std::move(parsed),
+        {xsql::U64Span{0, std::numeric_limits<uint64_t>::max()}}, 1);
     if (gen.next()) ctx.result_int64(static_cast<int64_t>(gen.current().address));
     else ctx.result_null();
 }

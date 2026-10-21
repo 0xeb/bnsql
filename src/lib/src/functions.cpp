@@ -640,6 +640,31 @@ static void sql_hex(xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* arg
         return;
     }
 
+    // hex() replaces SQLite's built-in, so a BLOB or TEXT argument keeps the
+    // built-in's meaning -- its bytes as uppercase hex digits, the documented
+    // `hex(blob_concat(value))` byte-read recipe -- and NULL stays NULL. A
+    // number is an address: 0x-prefixed lowercase, printed unsigned, so an
+    // address >= 2^63 (a negative INTEGER in SQL) reads as 0xfffff800...
+    const int type = argv[0].type();
+    if (type == SQLITE_NULL) {
+        ctx.result_null();
+        return;
+    }
+    if (type == SQLITE_BLOB || type == SQLITE_TEXT) {
+        const auto* data = static_cast<const unsigned char*>(
+            type == SQLITE_BLOB ? argv[0].as_blob()
+                                : static_cast<const void*>(argv[0].as_c_str()));
+        const int len = argv[0].bytes();
+        static const char kDigits[] = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(static_cast<size_t>(len > 0 ? len : 0) * 2);
+        for (int i = 0; i < len && data; ++i) {
+            out += kDigits[data[i] >> 4];
+            out += kDigits[data[i] & 0x0F];
+        }
+        ctx.result_text(out);
+        return;
+    }
     int64_t val = argv[0].as_int64();
     char buf[32];
     snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)val);
@@ -1082,6 +1107,19 @@ static void sql_bnsql_python_file(xsql::FunctionContext& ctx, int argc, xsql::Fu
 // Registration
 // ============================================================================
 
+// Register an ENGINE-mutating function. libxsql keeps a query-scoped table's
+// rows for the life of a SQLite cursor, rebuilding only after a write through
+// the table; a function that changes the BinaryView behind the tables (defining
+// a symbol, setting a comment, running arbitrary Python) is not such a write.
+// Invalidating every cached table on the connection after it runs keeps a later
+// probe of the same statement from serving pre-change rows.
+static xsql::ScalarFn mutating(void (*fn)(xsql::FunctionContext&, int, xsql::FunctionArg*)) {
+    return [fn](xsql::FunctionContext& ctx, int argc, xsql::FunctionArg* argv) {
+        fn(ctx, argc, argv);
+        ctx.invalidate_cached_tables();
+    };
+}
+
 bool register_sql_functions(xsql::Database& db) {
     // Disassembly
     db.register_function("disasm", 1, xsql::ScalarFn(sql_disasm));
@@ -1098,7 +1136,7 @@ bool register_sql_functions(xsql::Database& db) {
     db.register_function("func_at", 1, xsql::ScalarFn(sql_func_at));
     db.register_function("func_start", 1, xsql::ScalarFn(sql_func_start));
     db.register_function("func_end", 1, xsql::ScalarFn(sql_func_end));
-    db.register_function("set_name", 2, xsql::ScalarFn(sql_set_name));
+    db.register_function("set_name", 2, mutating(sql_set_name));
 
     // Function index (O(1) access)
     db.register_function("func_qty", 0, xsql::ScalarFn(sql_func_qty));
@@ -1109,7 +1147,7 @@ bool register_sql_functions(xsql::Database& db) {
 
     // Comments
     db.register_function("comment_at", 1, xsql::ScalarFn(sql_comment_at));
-    db.register_function("set_comment", 2, xsql::ScalarFn(sql_set_comment));
+    db.register_function("set_comment", 2, mutating(sql_set_comment));
 
     // Cross-references
     db.register_function("xrefs_to", 1, xsql::ScalarFn(sql_xrefs_to));
@@ -1137,10 +1175,10 @@ bool register_sql_functions(xsql::Database& db) {
     db.register_function("get_ui_context_json", 0, xsql::ScalarFn(sql_get_ui_context_json));
 
     // Python execution (gated by the enable_python runtime setting)
-    db.register_function("bnsql_python", 1, xsql::ScalarFn(sql_bnsql_python));
-    db.register_function("bnsql_python", 2, xsql::ScalarFn(sql_bnsql_python));
-    db.register_function("bnsql_python_file", 1, xsql::ScalarFn(sql_bnsql_python_file));
-    db.register_function("bnsql_python_file", 2, xsql::ScalarFn(sql_bnsql_python_file));
+    db.register_function("bnsql_python", 1, mutating(sql_bnsql_python));
+    db.register_function("bnsql_python", 2, mutating(sql_bnsql_python));
+    db.register_function("bnsql_python_file", 1, mutating(sql_bnsql_python_file));
+    db.register_function("bnsql_python_file", 2, mutating(sql_bnsql_python_file));
 
     return true;
 }

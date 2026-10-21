@@ -41,13 +41,13 @@ CoreRegistry::CoreRegistry()
 
 void CoreRegistry::register_all(xsql::Database& db) {
         // Index-based tables
-        register_index_table(db, "segments", &segments);
         register_index_table(db, "binary", &binary);
         register_index_table(db, "capabilities", &capabilities);
 
         // Cached tables
         register_cached_table(db, "runtime_settings", &runtime_settings);
         register_cached_table(db, "funcs", &funcs);
+        register_cached_table(db, "segments", &segments);
         register_cached_table(db, "names", &names);
         register_cached_table(db, "entries", &exports);
         register_cached_table(db, "comments", &comments);
