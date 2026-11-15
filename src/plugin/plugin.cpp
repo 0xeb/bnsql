@@ -29,8 +29,11 @@
 #endif
 #include "binaryninjaapi.h"
 
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <atomic>
 
 using namespace BinaryNinja;
@@ -97,25 +100,68 @@ static void ShowTables(BinaryView* bv) {
 // ============================================================================
 
 #ifdef BNSQL_HAS_HTTP
-static std::unique_ptr<xsql::thinclient::http_query_server> g_http_server;
+// One HTTP server per BinaryView. A server is bound to the view it was started
+// from (the active tab at "Start HTTP Server..."), so several open files can be
+// served at the same time, each on its own port.
+struct HttpServerEntry {
+    std::shared_ptr<xsql::thinclient::http_query_server> server;
+    Ref<BinaryView> view;
+    std::string label;     // file name, for status messages
+    std::string base_url;  // dialable base URL for status examples
+    int port = 0;          // bound port, cached so stopping entries stay readable
+    bool auth = false;     // whether bearer token is required
+    bool stopping = false;
+};
+static std::map<BNBinaryView*, HttpServerEntry> g_http_servers;
 static std::mutex g_http_server_mutex;
-static Ref<BinaryView> g_http_server_bv;
-static bool g_http_server_stopping = false;
-// The running server's dialable base URL and whether it requires a token, so the
-// status box shows examples that work (guarded by g_http_server_mutex).
-static std::string g_http_server_base_url;
-static bool g_http_server_auth = false;
+// Requests are serialized per server (serialize_requests), but with several
+// servers, statements for different views could run concurrently. Runtime
+// settings and the timeout stack are process-wide, so serialize statement
+// execution across all servers -- the same guarantee the single server gave.
+// Only taken on HTTP worker threads, never on the GUI thread: an executor can
+// wait on the GUI thread (UI-context capture) while holding it.
+static std::mutex g_http_exec_mutex;
+
+static std::string ViewLabel(BinaryView* bv) {
+    if (!bv) return "<no view>";
+    Ref<FileMetadata> file = bv->GetFile();
+    std::string name = file ? file->GetFilename() : std::string();
+    return name.empty() ? "<unnamed view>" : name;
+}
+
+// Drop entries whose server is no longer running (e.g. stopped remotely via
+// POST /shutdown). Caller holds g_http_server_mutex.
+static void PruneStoppedHTTPServers() {
+    for (auto it = g_http_servers.begin(); it != g_http_servers.end();) {
+        const HttpServerEntry& e = it->second;
+        if (!e.stopping && (!e.server || !e.server->is_running()))
+            it = g_http_servers.erase(it);
+        else
+            ++it;
+    }
+}
+
+// Caller holds g_http_server_mutex.
+static std::string DescribeHTTPServers() {
+    std::string out;
+    for (const auto& [key, e] : g_http_servers) {
+        (void)key;
+        out += "  port " + std::to_string(e.port) +
+               (e.stopping ? " (stopping)" : "") + "  " + e.label + "\n";
+    }
+    return out;
+}
 
 static void StartHTTPServer(BinaryView* bv) {
+    if (!bv) return;
     std::lock_guard<std::mutex> lock(g_http_server_mutex);
-    if (g_http_server_stopping) {
-        ShowMessageBox(
-            "BNSQL HTTP Server", "HTTP server is still stopping",
-            OKButtonSet, InformationIcon);
-        return;
-    }
-    if (g_http_server && g_http_server->is_running()) {
-        std::string msg = "HTTP server already running on port " + std::to_string(g_http_server->port());
+    PruneStoppedHTTPServers();
+    auto existing = g_http_servers.find(bv->GetObject());
+    if (existing != g_http_servers.end()) {
+        std::string msg = existing->second.stopping
+            ? std::string("HTTP server for this view is still stopping")
+            : "HTTP server for this view already running on port " +
+                  std::to_string(existing->second.port);
         ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
         return;
     }
@@ -169,7 +215,7 @@ static void StartHTTPServer(BinaryView* bv) {
         }
     }
 
-    g_http_server_bv = bv;
+    Ref<BinaryView> server_view = bv;
 
     xsql::thinclient::http_query_server_config cfg;
     cfg.tool_name = "bnsql";
@@ -188,17 +234,17 @@ static void StartHTTPServer(BinaryView* bv) {
         return bnsql::runtime_settings().queue_admission_timeout_ms();
     };
     cfg.max_queue_fn = []() { return bnsql::runtime_settings().max_queue(); };
-    // Capture the BinaryView by value into the executor. The lambda runs on
-    // httplib worker threads; reading the non-atomic g_http_server_bv global at
-    // call time would race StopHTTPServer() nulling it. A captured Ref keeps the
-    // view alive for the executor's lifetime regardless of the global.
+    // Capture this server's BinaryView by value into the executor. The lambda
+    // runs on httplib worker threads; a captured Ref keeps the view alive for the
+    // executor's lifetime, independent of the server registry.
     cfg.statement_executor =
-        [view = g_http_server_bv](const std::string& stmt, xsql::ScriptStatementResult& out) {
+        [view = server_view](const std::string& stmt, xsql::ScriptStatementResult& out) {
         if (!view) {
             out.success = false;
             out.error = "No binary loaded";
             return;
         }
+        std::lock_guard<std::mutex> exec_lock(g_http_exec_mutex);
         bnsql::QueryEngine qe(view);
         auto r = qe.query(stmt);
         out.columns = std::move(r.columns);
@@ -209,15 +255,13 @@ static void StartHTTPServer(BinaryView* bv) {
         out.error = std::move(r.error);
     };
     // /status must carry `functions` + `settings` like the CLI servers. Cache the
-    // function count once now (serialize mode means no /query runs concurrently
-    // during startup) so status_fn never touches the engine on a worker thread.
+    // function count once now so status_fn never touches the engine on a worker
+    // thread. Read it straight from the view (same source as the funcs table):
+    // other servers may be executing queries, and the GUI thread must not wait
+    // on g_http_exec_mutex.
     {
-        std::string func_count;
-        if (g_http_server_bv) {
-            bnsql::QueryEngine qe(g_http_server_bv);
-            auto r = qe.query("SELECT COUNT(*) FROM funcs");
-            if (r.success && !r.empty()) func_count = r.rows[0][0];
-        }
+        const std::string func_count =
+            std::to_string(server_view->GetAnalysisFunctionList().size());
         cfg.status_fn = [func_count]() { return bnsql::status_extra_json(func_count); };
     }
     cfg.status_requires_auth = true;
@@ -243,27 +287,29 @@ static void StartHTTPServer(BinaryView* bv) {
         });
     };
 
-    g_http_server = std::make_unique<xsql::thinclient::http_query_server>(cfg);
-    int actual_port_check = g_http_server->start();
-    if (actual_port_check < 0) {
-        g_http_server.reset();
-        g_http_server_bv = nullptr;
-        ShowMessageBox("Error", "Failed to start HTTP server", OKButtonSet, ErrorIcon);
+    auto server = std::make_shared<xsql::thinclient::http_query_server>(cfg);
+    if (server->start() < 0) {
+        ShowMessageBox("Error", "Failed to start HTTP server (port in use?)", OKButtonSet, ErrorIcon);
         return;
     }
 
-    int actual_port = g_http_server->port();
+    const int actual_port = server->port();
+    const std::string label = ViewLabel(bv);
     // Echo the ACTUAL bind address in the examples. Hardcoding 127.0.0.1 handed a
     // user who bound elsewhere a copy-pasteable command that cannot work; a
     // wildcard bind is dialed through its loopback.
     const std::string base_url = "http://"
         + xsql::thinclient::format_connect_url_host(bind_address) + ":"
         + std::to_string(actual_port);
+    g_http_servers[bv->GetObject()] = HttpServerEntry{
+        server, server_view, label, base_url, actual_port, !auth_token.empty(), false};
+
     const std::string auth_hdr = auth_token.empty()
         ? std::string()
         : " -H \"Authorization: Bearer " + auth_token + "\"";
     std::string msg = "HTTP server started on "
         + xsql::thinclient::format_url_host(bind_address) + ":" + std::to_string(actual_port) +
+        "\nView: " + label +
         (auth_token.empty() ? "" : "\nAuth: bearer token required") +
         "\n\nEndpoints:\n"
         "  GET  /help     - API documentation\n"
@@ -275,50 +321,56 @@ static void StartHTTPServer(BinaryView* bv) {
         "  curl " + base_url + "/help\n"
         "  curl -X POST " + base_url + "/query" + auth_hdr +
         " --data-binary \"SELECT name FROM funcs LIMIT 5\"";
-    g_http_server_base_url = base_url;
-    g_http_server_auth = !auth_token.empty();
-    LogInfo("[bnsql] HTTP server started on %s:%d",
-            xsql::thinclient::format_url_host(bind_address).c_str(), actual_port);
+    LogInfo("[bnsql] HTTP server started on %s:%d for %s",
+            xsql::thinclient::format_url_host(bind_address).c_str(), actual_port, label.c_str());
     ShowMessageBox("BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
 }
 
-static void StopHTTPServer(BinaryView*) {
+// Stops the server bound to the current view; servers for other views keep running.
+static void StopHTTPServer(BinaryView* bv) {
+    if (!bv) return;
     std::shared_ptr<xsql::thinclient::http_query_server> server;
     int port = 0;
+    BNBinaryView* key = bv->GetObject();
     {
         std::lock_guard<std::mutex> lock(g_http_server_mutex);
-        if (g_http_server_stopping) {
+        PruneStoppedHTTPServers();
+        auto it = g_http_servers.find(key);
+        if (it == g_http_servers.end()) {
+            std::string msg = "No HTTP server is running for this view";
+            if (!g_http_servers.empty())
+                msg += "\n\nServers for other views (switch to that tab to stop one):\n" +
+                       DescribeHTTPServers();
             ShowMessageBox(
-                "BNSQL HTTP Server", "HTTP server is already stopping",
-                OKButtonSet, InformationIcon);
+                "BNSQL HTTP Server", msg.c_str(), OKButtonSet, InformationIcon);
             return;
         }
-        if (!g_http_server || !g_http_server->is_running()) {
+        if (it->second.stopping) {
             ShowMessageBox(
-                "BNSQL HTTP Server", "HTTP server is not running",
+                "BNSQL HTTP Server", "HTTP server for this view is already stopping",
                 OKButtonSet, InformationIcon);
             return;
         }
 
-        port = g_http_server->port();
-        server = std::shared_ptr<xsql::thinclient::http_query_server>(
-            std::move(g_http_server));
-        g_http_server_bv = nullptr;
-        g_http_server_stopping = true;
+        port = it->second.port;
+        server = it->second.server;
+        it->second.stopping = true;
     }
 
     // stop() joins all HTTP handlers. A handler executing ui_context() can be
     // waiting for the GUI thread, so joining here on that same GUI thread forms
     // a cycle. Drain on BN's worker pool and return to the event loop so pending
     // UI-context captures can finish.
-    WorkerEnqueue([server = std::move(server), port]() {
+    WorkerEnqueue([server = std::move(server), port, key]() {
         server->stop();
         {
             std::lock_guard<std::mutex> lock(g_http_server_mutex);
-            g_http_server_stopping = false;
+            auto it = g_http_servers.find(key);
+            if (it != g_http_servers.end() && it->second.server == server)
+                g_http_servers.erase(it);
         }
         ExecuteOnMainThread([port]() {
-            LogInfo("[bnsql] HTTP server stopped");
+            LogInfo("[bnsql] HTTP server on port %d stopped", port);
             const std::string msg =
                 "HTTP server stopped (was on port " + std::to_string(port) + ")";
             ShowMessageBox(
@@ -328,19 +380,24 @@ static void StopHTTPServer(BinaryView*) {
     }, "BNSQL HTTP server stop");
 }
 
-static void HTTPServerStatus(BinaryView*) {
+static void HTTPServerStatus(BinaryView* bv) {
     std::lock_guard<std::mutex> lock(g_http_server_mutex);
+    PruneStoppedHTTPServers();
     std::string msg;
-    if (g_http_server_stopping) {
-        msg = "HTTP server is STOPPING";
-    } else if (g_http_server && g_http_server->is_running()) {
-        int port = g_http_server->port();
-        msg = "HTTP server is RUNNING on port " + std::to_string(port) +
-            "\n\nExample:\n"
-            "  curl " + g_http_server_base_url + "/help\n"
-            "  curl -X POST " + g_http_server_base_url + "/query" +
-            (g_http_server_auth ? " -H \"Authorization: Bearer <token>\"" : "") +
-            " --data-binary \"SELECT name FROM funcs LIMIT 5\"";
+    if (!g_http_servers.empty()) {
+        auto it = bv ? g_http_servers.find(bv->GetObject()) : g_http_servers.end();
+        msg = "HTTP servers (" + std::to_string(g_http_servers.size()) + "):\n" +
+              DescribeHTTPServers();
+        if (it != g_http_servers.end() && !it->second.stopping) {
+            msg += "\nThis view is served on port " + std::to_string(it->second.port) +
+                "\n\nExample:\n"
+                "  curl " + it->second.base_url + "/help\n"
+                "  curl -X POST " + it->second.base_url + "/query" +
+                (it->second.auth ? " -H \"Authorization: Bearer <token>\"" : "") +
+                " --data-binary \"SELECT name FROM funcs LIMIT 5\"";
+        } else {
+            msg += "\nThis view has no HTTP server. Use Start HTTP Server to add one.";
+        }
     } else {
         msg = "HTTP server is STOPPED\n\nUse Start HTTP Server to enable REST API access.";
     }
